@@ -1,0 +1,8 @@
+# Note: the loadsmith-lab builds this image via bollard with a tar it assembles
+# in Rust, which does NOT honor .dockerignore — the lab's tar walker applies its
+# own exclude list. This file only matters for a manual `docker build .`.
+target/
+.git/
+docs/
+definitions/
+*.jsonl

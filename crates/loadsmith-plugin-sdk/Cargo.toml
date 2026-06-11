@@ -1,0 +1,17 @@
+[package]
+name    = "loadsmith-plugin-sdk"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+tokio              = { workspace = true }
+async-trait        = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+serde_json         = { workspace = true }
+loadsmith-protocol = { path = "../loadsmith-protocol" }
+loadsmith-transport = { path = "../loadsmith-transport" }
+loadsmith-arrow    = { path = "../loadsmith-arrow" }
+arrow-array        = { workspace = true }
+arrow-schema       = { workspace = true }

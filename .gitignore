@@ -1,0 +1,6 @@
+/target
+.env
+*.jsonl
+
+# mdbook build output (generated from docs/src/)
+/docs/book/

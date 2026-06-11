@@ -1,0 +1,14 @@
+[package]
+name    = "loadsmith-arrow"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+arrow        = { workspace = true }
+arrow-ipc    = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-array  = { workspace = true }
+serde_json   = { workspace = true }
+thiserror          = { workspace = true }
+loadsmith-protocol = { path = "../loadsmith-protocol" }

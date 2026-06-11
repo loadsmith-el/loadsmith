@@ -1,0 +1,21 @@
+[package]
+name    = "loadsmith-tls"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# Generic, driver-agnostic TLS for loadsmith's network plugins (postgres, mysql,
+# s3/aws, …). It knows nothing about any specific protocol — it builds a
+# `rustls::ClientConfig` from a generic TLS config, and each plugin wraps that in
+# its own driver connector. Pure-Rust crypto (multi-arch-first): see
+# docs/src/architecture/multi-arch-and-tls.md.
+
+[dependencies]
+anyhow            = { workspace = true }
+serde             = { workspace = true }
+rustls            = { version = "0.23", default-features = false, features = ["std", "logging", "tls12"] }
+rustls-rustcrypto = "0.0.2-alpha"
+rustls-pemfile    = "2"
+
+[dev-dependencies]
+serde_json = { workspace = true }

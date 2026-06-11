@@ -1,0 +1,13 @@
+[package]
+name    = "loadsmith-transport"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+tokio            = { workspace = true }
+serde_json       = { workspace = true }
+thiserror        = { workspace = true }
+rustix           = { workspace = true }
+loadsmith-protocol = { path = "../loadsmith-protocol" }
+loadsmith-arrow    = { path = "../loadsmith-arrow" }
