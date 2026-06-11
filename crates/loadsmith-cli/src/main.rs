@@ -119,6 +119,9 @@ struct PluginInstallArgs {
     #[arg(long, conflicts_with_all = ["manifest", "name"])]
     binary: Option<PathBuf>,
 
+    #[arg(long, help = "Override the plugin index URL (for `install <name>`)")]
+    index: Option<String>,
+
     #[arg(long, help = "Plugin directory to install into")]
     plugin_dir: Option<PathBuf>,
 }
@@ -262,37 +265,38 @@ fn cmd_plugin_install(args: PluginInstallArgs) -> Result<()> {
         return Ok(());
     }
 
-    if let Some(spec) = args.manifest {
-        let manifest = plugin_install::load_manifest(&spec)?;
-        let installed = plugin_install::install_from_manifest(
-            &manifest,
-            &plugin_dir,
-            loadsmith_core::lifecycle::SUPPORTED_VERSIONS,
-        )?;
-        println!(
-            "Installed plugin '{}' v{} ({} binar{}) → {}",
-            manifest.name,
-            manifest.version,
-            installed.len(),
-            if installed.len() == 1 { "y" } else { "ies" },
-            plugin_dir.display()
-        );
-        for p in installed {
-            if let Some(name) = p.file_name().and_then(|f| f.to_str()) {
-                println!("  {name}");
-            }
+    // From a manifest spec directly, or resolved from the index by name.
+    let manifest_spec = match (args.manifest, args.name) {
+        (Some(spec), _) => spec,
+        (None, Some(name)) => {
+            let index = args.index.as_deref().unwrap_or(plugin_install::DEFAULT_INDEX_URL);
+            plugin_install::resolve_from_index(&name, index)?
         }
-        return Ok(());
-    }
+        (None, None) => {
+            anyhow::bail!("nothing to install: pass a plugin name, --manifest, or --binary")
+        }
+    };
 
-    if args.name.is_some() {
-        anyhow::bail!(
-            "installing by name from the official index isn't available yet — \
-             install with --manifest <loadsmith-plugin.yaml | URL> or --binary <path>"
-        );
+    let manifest = plugin_install::load_manifest(&manifest_spec)?;
+    let installed = plugin_install::install_from_manifest(
+        &manifest,
+        &plugin_dir,
+        loadsmith_core::lifecycle::SUPPORTED_VERSIONS,
+    )?;
+    println!(
+        "Installed plugin '{}' v{} ({} binar{}) → {}",
+        manifest.name,
+        manifest.version,
+        installed.len(),
+        if installed.len() == 1 { "y" } else { "ies" },
+        plugin_dir.display()
+    );
+    for p in installed {
+        if let Some(name) = p.file_name().and_then(|f| f.to_str()) {
+            println!("  {name}");
+        }
     }
-
-    anyhow::bail!("nothing to install: pass --manifest, --binary, or a plugin name")
+    Ok(())
 }
 
 fn cmd_plugin_uninstall(args: PluginUninstallArgs) -> Result<()> {

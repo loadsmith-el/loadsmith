@@ -7,11 +7,55 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use std::collections::HashMap;
+
 use anyhow::{anyhow, bail, Context, Result};
 use loadsmith_plugin_manifest::{current_platform, PluginManifest};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::download;
+
+/// The canonical plugin index `loadsmith install <name>` reads by default.
+pub const DEFAULT_INDEX_URL: &str =
+    "https://raw.githubusercontent.com/loadsmith-el/loadsmith-canonical-plugins/main/index.json";
+
+#[derive(Debug, Deserialize)]
+struct Index {
+    #[serde(default)]
+    plugins: HashMap<String, IndexEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IndexEntry {
+    latest: String,
+    #[serde(default)]
+    versions: HashMap<String, String>,
+}
+
+/// Resolve a `name[@version]` spec against the index, returning the published
+/// manifest URL. `index_url` defaults to [`DEFAULT_INDEX_URL`].
+pub fn resolve_from_index(spec: &str, index_url: &str) -> Result<String> {
+    let (name, version) = match spec.split_once('@') {
+        Some((n, v)) => (n, Some(v)),
+        None => (spec, None),
+    };
+
+    let bytes = download::fetch(index_url).with_context(|| format!("fetching index {index_url}"))?;
+    let index: Index = serde_json::from_slice(&bytes).context("parsing plugin index")?;
+
+    let entry = index
+        .plugins
+        .get(name)
+        .ok_or_else(|| anyhow!("plugin '{name}' not found in the index ({index_url})"))?;
+
+    let version = version.unwrap_or(&entry.latest);
+    entry.versions.get(version).cloned().ok_or_else(|| {
+        let mut available: Vec<&String> = entry.versions.keys().collect();
+        available.sort();
+        anyhow!("plugin '{name}' has no version {version:?} (available: {available:?})")
+    })
+}
 
 /// Load a manifest from a local path or a `file`/`http`/`https` URL.
 pub fn load_manifest(spec: &str) -> Result<PluginManifest> {
