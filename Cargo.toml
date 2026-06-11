@@ -5,6 +5,7 @@ members = [
     "crates/loadsmith-arrow",
     "crates/loadsmith-plugin-sdk",
     "crates/loadsmith-config",
+    "crates/loadsmith-plugin-manifest",
     "crates/loadsmith-core",
     "crates/loadsmith-cli",
     "crates/loadsmith-tls",

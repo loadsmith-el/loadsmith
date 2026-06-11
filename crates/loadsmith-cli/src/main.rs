@@ -6,6 +6,9 @@ use clap::{Args, Parser, Subcommand};
 use loadsmith_config::parse_pipeline_yaml;
 use loadsmith_core::{discovery, run_pipeline, RunOpts};
 
+mod download;
+mod plugin_install;
+
 #[derive(Parser)]
 #[command(
     name = "loadsmith",
@@ -89,8 +92,10 @@ struct StateArgs {
 enum PluginAction {
     /// List installed plugins
     List(PluginListArgs),
-    /// Install a plugin binary into the plugin directory
+    /// Install a plugin from a manifest, a local binary, or (soon) the index
     Install(PluginInstallArgs),
+    /// Remove an installed plugin's binaries (by type name, e.g. `postgres`)
+    Uninstall(PluginUninstallArgs),
 }
 
 #[derive(Args)]
@@ -101,10 +106,29 @@ struct PluginListArgs {
 
 #[derive(Args)]
 struct PluginInstallArgs {
-    /// Path to the plugin binary to install
-    binary: PathBuf,
+    /// Plugin name to resolve from the official index (not available yet —
+    /// use --manifest or --binary)
+    name: Option<String>,
+
+    /// Install from a plugin manifest (loadsmith-plugin.yaml) — a local path
+    /// or a file:// / http:// / https:// URL
+    #[arg(short = 'f', long, conflicts_with_all = ["binary", "name"])]
+    manifest: Option<String>,
+
+    /// Install a single local plugin binary directly, no manifest
+    #[arg(long, conflicts_with_all = ["manifest", "name"])]
+    binary: Option<PathBuf>,
 
     #[arg(long, help = "Plugin directory to install into")]
+    plugin_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct PluginUninstallArgs {
+    /// Plugin type name (e.g. `postgres` removes loadsmith-*-postgres)
+    name: String,
+
+    #[arg(long, help = "Plugin directory to remove from")]
     plugin_dir: Option<PathBuf>,
 }
 
@@ -131,6 +155,7 @@ async fn run(cli: Cli, color: bool) -> Result<()> {
         Commands::Plugin(cmd) => match cmd.action {
             PluginAction::List(args) => cmd_plugin_list(args),
             PluginAction::Install(args) => cmd_plugin_install(args),
+            PluginAction::Uninstall(args) => cmd_plugin_uninstall(args),
         },
         Commands::State(cmd) => match cmd.action {
             StateAction::Show(args) => cmd_state_show(args),
@@ -229,8 +254,60 @@ fn cmd_state_rm(args: StateArgs) -> Result<()> {
 
 fn cmd_plugin_install(args: PluginInstallArgs) -> Result<()> {
     let plugin_dir = args.plugin_dir.unwrap_or_else(discovery::default_plugin_dir);
-    let dest = discovery::install_plugin(&args.binary, &plugin_dir)?;
-    println!("Installed {} → {}", args.binary.display(), dest.display());
+
+    if let Some(binary) = args.binary {
+        // Direct local-binary install (no manifest).
+        let dest = discovery::install_plugin(&binary, &plugin_dir)?;
+        println!("Installed {} → {}", binary.display(), dest.display());
+        return Ok(());
+    }
+
+    if let Some(spec) = args.manifest {
+        let manifest = plugin_install::load_manifest(&spec)?;
+        let installed = plugin_install::install_from_manifest(
+            &manifest,
+            &plugin_dir,
+            loadsmith_core::lifecycle::SUPPORTED_VERSIONS,
+        )?;
+        println!(
+            "Installed plugin '{}' v{} ({} binar{}) → {}",
+            manifest.name,
+            manifest.version,
+            installed.len(),
+            if installed.len() == 1 { "y" } else { "ies" },
+            plugin_dir.display()
+        );
+        for p in installed {
+            if let Some(name) = p.file_name().and_then(|f| f.to_str()) {
+                println!("  {name}");
+            }
+        }
+        return Ok(());
+    }
+
+    if args.name.is_some() {
+        anyhow::bail!(
+            "installing by name from the official index isn't available yet — \
+             install with --manifest <loadsmith-plugin.yaml | URL> or --binary <path>"
+        );
+    }
+
+    anyhow::bail!("nothing to install: pass --manifest, --binary, or a plugin name")
+}
+
+fn cmd_plugin_uninstall(args: PluginUninstallArgs) -> Result<()> {
+    let plugin_dir = args.plugin_dir.unwrap_or_else(discovery::default_plugin_dir);
+    let removed = plugin_install::uninstall(&args.name, &plugin_dir)?;
+    if removed.is_empty() {
+        println!("No installed binaries found for plugin '{}'.", args.name);
+    } else {
+        println!("Removed {} binar{}:", removed.len(), if removed.len() == 1 { "y" } else { "ies" });
+        for p in removed {
+            if let Some(name) = p.file_name().and_then(|f| f.to_str()) {
+                println!("  {name}");
+            }
+        }
+    }
     Ok(())
 }
 

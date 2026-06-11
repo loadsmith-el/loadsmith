@@ -1,0 +1,19 @@
+[package]
+name    = "loadsmith-plugin-manifest"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# The plugin manifest (`loadsmith-plugin.yaml`) schema + validation. The stable
+# contract behind `loadsmith plugin install`: parsing, host artifact selection,
+# and protocol-range compatibility. Dependency-light on purpose so the
+# loadsmith-canonical-plugins CI tooling can reuse it.
+
+[dependencies]
+serde      = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror  = { workspace = true }
+semver     = "1"
+
+[dev-dependencies]
+serde_json = { workspace = true }

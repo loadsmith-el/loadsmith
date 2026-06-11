@@ -17,3 +17,12 @@ tracing-subscriber = { workspace = true }
 serde_yaml         = { workspace = true }
 loadsmith-core     = { path = "../loadsmith-core" }
 loadsmith-config   = { path = "../loadsmith-config" }
+loadsmith-plugin-manifest = { path = "../loadsmith-plugin-manifest" }
+loadsmith-tls      = { path = "../loadsmith-tls" }
+# Plugin download: pure-Rust TLS (multi-arch rule — no ring/aws-lc/native-tls),
+# pure-Rust gzip (flate2/miniz_oxide) + tar, sha2 for artifact verification.
+rustls             = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+webpki-roots       = "0.26"
+sha2               = "0.10"
+flate2             = "1"
+tar                = "0.4"

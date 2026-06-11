@@ -7,7 +7,10 @@ use tokio::io::{AsyncBufRead, AsyncWrite};
 
 use crate::error::CoreError;
 
-const SUPPORTED_VERSIONS: &[u32] = &[1];
+/// Protocol versions this core can speak. The handshake picks the highest
+/// version also advertised by the plugin; `loadsmith plugin install` checks a
+/// manifest's `protocol` range against this before fetching.
+pub const SUPPORTED_VERSIONS: &[u32] = &[1];
 
 /// What core learned about a plugin during the handshake.
 #[derive(Debug, Clone)]
