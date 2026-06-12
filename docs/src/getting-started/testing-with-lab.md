@@ -35,7 +35,7 @@ loadsmith-lab/
       generate.py                      ← regenerate with Python
       requirements.txt
   images/
-    postgres-15/
+    lab-postgres-15/
       Dockerfile
       init.sql
   cases/
@@ -134,7 +134,7 @@ When the lab needs an image named `loadsmith-lab-postgres:15`, it tries in order
 
 1. **Local Docker cache** — if the image already exists locally, use it.
 2. **Pull from registry** — try `docker pull loadsmith-lab-postgres:15`.
-3. **Build from Dockerfile** — look for `images/postgres-15/Dockerfile` and
+3. **Build from Dockerfile** — look for `images/lab-postgres-15/Dockerfile` and
    build it. The build context always includes `data/spacecraft_telemetry_events.csv`.
 
 On first run, the `loadsmith-lab-postgres:15` image will be built automatically.
