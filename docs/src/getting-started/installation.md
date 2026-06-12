@@ -15,51 +15,26 @@ cd loadsmith
 cargo build --release
 ```
 
-This produces all binaries under `target/release/`:
+This produces the loadsmith **core** binary at `target/release/loadsmith` (for
+development, `cargo build` puts it at `target/debug/loadsmith`). Plugins are not
+built here — they live in
+[`loadsmith-canonical-plugins`](https://github.com/loadsmith-el/loadsmith-canonical-plugins)
+and are installed on demand.
 
-```
-target/release/
-  loadsmith                           ← the CLI
-  loadsmith-source-postgres           ← postgres source plugin
-  loadsmith-destination-jsonl         ← JSONL destination plugin
-  loadsmith-destination-null          ← null destination plugin (discards rows)
-  loadsmith-config-provider-file      ← file:// config provider plugin
-```
-
-For development, use `cargo build` (debug mode):
-
-```bash
-cargo build
-./target/debug/loadsmith run pipeline.yaml --plugin-dir target/debug
-```
-
-## Plugin directory
+## Plugins
 
 Loadsmith discovers plugins by searching for binaries named
-`loadsmith-{kind}-{type}` in the plugin directory. The default plugin directory
-is:
-
-```
-~/.loadsmith/plugins/
-```
-
-To install the built plugins:
+`loadsmith-{kind}-{type}` in the plugin directory (default `~/.loadsmith/plugins/`).
+Install the canonical set with the built-in installer:
 
 ```bash
-mkdir -p ~/.loadsmith/plugins
-cp target/release/loadsmith-source-postgres ~/.loadsmith/plugins/
-cp target/release/loadsmith-destination-jsonl ~/.loadsmith/plugins/
-cp target/release/loadsmith-destination-null ~/.loadsmith/plugins/
-cp target/release/loadsmith-config-provider-file ~/.loadsmith/plugins/
+loadsmith plugin install --all        # install every canonical plugin
+loadsmith plugin install postgres     # or just one (resolved from the index)
 ```
 
-Or use the built-in install command:
-
-```bash
-loadsmith plugin install target/release/loadsmith-source-postgres
-```
-
-This copies the binary to the default plugin directory.
+You can also install from a manifest (`--manifest <path|URL>`) or a local binary
+(`--binary <path>`) — see the [CLI reference](../reference/cli.md). Index and
+manifest installs download a per-platform artifact and verify its sha256.
 
 ## Overriding the plugin directory
 

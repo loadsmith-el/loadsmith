@@ -68,10 +68,12 @@ The workspace is split into focused crates:
 | `loadsmith-core` | orchestration, the data pump, the run summary |
 | `loadsmith-cli` | the `loadsmith` binary |
 
-Plugins live under `plugins/{sources,destinations,sinks,config-providers}/` and
-build into standalone binaries (`loadsmith-source-postgres`,
-`loadsmith-destination-jsonl`, `loadsmith-destination-parquet`,
-`loadsmith-sink-local-copy`, …).
+Plugins live in their own repo,
+[`loadsmith-canonical-plugins`](https://github.com/loadsmith-el/loadsmith-canonical-plugins)
+— standalone binaries (`loadsmith-source-postgres`, `loadsmith-destination-jsonl`,
+`loadsmith-destination-parquet`, `loadsmith-sink-local-copy`, …) installed on
+demand with `loadsmith plugin install <name>`. This repo is the **core + the SDK
+crates** those plugins build against. The official image is slim (core only).
 
 A **sink** is an optional delivery stage that separates *format* from *location*:
 the destination writes files (Parquet, CSV) to a local staging dir, and the sink
@@ -116,10 +118,8 @@ handshake → negotiate protocol version → capabilities → configure
 ### Build
 
 ```bash
-cargo build
-# produces target/debug/loadsmith and the plugin binaries
-# (loadsmith-source-postgres, loadsmith-destination-jsonl,
-#  loadsmith-destination-null, loadsmith-config-provider-file)
+cargo build                 # produces target/debug/loadsmith (the core)
+loadsmith plugin install --all   # fetch the canonical plugins → ~/.loadsmith/plugins
 ```
 
 ### A pipeline
@@ -149,7 +149,7 @@ destination:
 ### Run it
 
 ```bash
-loadsmith run pipeline.yaml --plugin-dir target/debug
+loadsmith run pipeline.yaml   # discovers plugins in ~/.loadsmith/plugins
 ```
 
 ```text
@@ -225,7 +225,7 @@ every change:
 
 ```bash
 # from the loadsmith-lab repo
-loadsmith-lab run --local --select postgres-to-jsonl
+loadsmith-lab run --loadsmith ../loadsmith --select catalog/postgres-to-jsonl
 ```
 
 ---

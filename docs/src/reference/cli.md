@@ -17,7 +17,7 @@ Execute a pipeline.
 
 ```bash
 loadsmith run pipeline.yaml
-loadsmith run pipeline.yaml --plugin-dir target/debug
+loadsmith run pipeline.yaml --plugin-dir /opt/loadsmith/plugins   # override the default ~/.loadsmith/plugins
 loadsmith run pipeline.yaml --dry-run
 loadsmith run pipeline.yaml --dry-run --print-resolved-config
 loadsmith run pipeline.yaml --log-level debug
@@ -57,7 +57,7 @@ loadsmith run pipeline.yaml --no-color
 
 Run a pipeline using plugins from a custom directory:
 ```bash
-./target/debug/loadsmith run pipeline.yaml --plugin-dir ./target/debug
+./target/debug/loadsmith run pipeline.yaml --plugin-dir /opt/loadsmith/plugins
 ```
 
 Validate without running (useful in CI to catch config errors early):
@@ -91,7 +91,7 @@ Does not connect to any system or run any data.
 
 ```bash
 loadsmith validate pipeline.yaml
-loadsmith validate pipeline.yaml --plugin-dir target/debug
+loadsmith validate pipeline.yaml --plugin-dir /opt/loadsmith/plugins
 ```
 
 **Arguments:**
@@ -141,28 +141,42 @@ The version is read from the binary's `--version` output.
 
 ---
 
-## `loadsmith plugin install <binary>`
+## `loadsmith plugin install [<name>]`
 
-Copy a plugin binary into the plugin directory.
+Install plugins into the plugin directory (`~/.loadsmith/plugins/`). Plugins come
+from [`loadsmith-canonical-plugins`](https://github.com/loadsmith-el/loadsmith-canonical-plugins)
+via a canonical index, but you can also install from a manifest or a local binary.
 
 ```bash
-loadsmith plugin install target/release/loadsmith-source-postgres
-loadsmith plugin install target/release/loadsmith-destination-jsonl --plugin-dir /opt/loadsmith/plugins
+loadsmith plugin install postgres            # resolve from the index (latest)
+loadsmith plugin install postgres@0.1.0      # a pinned version
+loadsmith plugin install --all               # the whole canonical set
+loadsmith plugin install --manifest ./loadsmith-plugin.yaml   # a manifest path or file/http/https URL
+loadsmith plugin install --binary ./target/release/loadsmith-destination-jsonl  # a local binary
 ```
-
-**Arguments:**
-
-| Argument | Description |
-|---|---|
-| `<binary>` | Path to the plugin binary to install |
 
 **Flags:**
 
 | Flag | Default | Description |
 |---|---|---|
+| `--all` | — | Install every plugin in the index |
+| `--manifest <path\|URL>` | — | Install from a `loadsmith-plugin.yaml` |
+| `--binary <path>` | — | Install a single local plugin binary |
+| `--index <url>` | the canonical index | Override the plugin index |
 | `--plugin-dir <path>` | `~/.loadsmith/plugins/` | Target directory |
 
-The binary is copied, not moved. The original file is preserved.
+Index/manifest installs download a per-platform artifact, **verify its sha256**,
+and refuse a manifest whose declared `protocol` range is incompatible with this
+core (before fetching).
+
+## `loadsmith plugin uninstall <name>`
+
+Remove an installed plugin's binaries by type name (e.g. `uninstall postgres`
+removes `loadsmith-*-postgres`).
+
+```bash
+loadsmith plugin uninstall postgres
+```
 
 ---
 

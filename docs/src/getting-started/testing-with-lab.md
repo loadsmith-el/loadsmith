@@ -58,12 +58,13 @@ cd ../loadsmith && cargo build
 # then run the lab:
 cd ../loadsmith-lab
 cargo build
-./target/debug/loadsmith-lab run --local --select postgres-to-jsonl
+./target/debug/loadsmith-lab run --loadsmith ../loadsmith --select catalog/postgres-to-jsonl
 ```
 
-`--local` uses `../loadsmith/target/debug/loadsmith` instead of a Docker
-container — it's faster for development because you don't need to build a Docker
-image for loadsmith itself.
+`--loadsmith <path>` runs a local core — a project dir (built hermetically in
+Docker, as above) or a prebuilt binary. Without it, the lab uses a published
+image. You can likewise test a local plugin with
+`--plugin <binary|project>` (a project is built in a `rust:bookworm` container).
 
 ## How a case is declared
 
@@ -108,9 +109,8 @@ expect:
 ### Key fields
 
 **`services`** — a list of Docker services to start before running loadsmith.
-Each service gets a hostname alias (`pg`) that the pipeline can use. In `--local`
-mode, host ports are published starting at `15432` so loadsmith can reach them
-at `127.0.0.1`.
+Each service gets a hostname alias (`pg`) that the pipeline can use; loadsmith
+runs on the same Docker network and reaches services by that alias.
 
 **`readiness.tcp`** — the port to wait for. The lab polls `TcpStream::connect`
 every 500 ms until the port is open or the timeout expires.

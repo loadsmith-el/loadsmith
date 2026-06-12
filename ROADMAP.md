@@ -24,6 +24,13 @@ What's shipped and what's queued next. Shipped items are documented in
       idempotent destination.
 - [x] **`postgres` destination** — `COPY` into the target (`atomic`) or into a
       staging table then `MERGE` by PK (`staged_merge`, exactly-once effective)
+- [x] **Plugin distribution & `loadsmith install`** — plugins split out to
+      [`loadsmith-canonical-plugins`](https://github.com/loadsmith-el/loadsmith-canonical-plugins):
+      a manifest contract (`loadsmith-plugin.yaml`), per-plugin multi-arch GitHub
+      Releases + a canonical index, and `loadsmith plugin install <name>` /
+      `--all` / `--manifest` / `--binary` / `uninstall` (sha256-verified,
+      protocol-range-checked). The official image is now **slim** (core only);
+      plugins are installed on demand.
 
 ## Planned
 

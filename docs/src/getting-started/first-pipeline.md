@@ -5,7 +5,8 @@ writing to a JSONL file.
 
 ## Prerequisites
 
-- Loadsmith built: `cargo build` (see [Installation](./installation.md))
+- Loadsmith built: `cargo build`, and plugins installed:
+  `loadsmith plugin install --all` (see [Installation](./installation.md))
 - A running PostgreSQL instance with a table to read
 
 ## Step 1 — Write the pipeline
@@ -69,7 +70,6 @@ Before running, validate the pipeline without executing it:
 
 ```bash
 ./target/debug/loadsmith run pipeline.yaml \
-  --plugin-dir target/debug \
   --dry-run
 ```
 
@@ -77,7 +77,6 @@ To see the fully resolved config with secrets masked:
 
 ```bash
 ./target/debug/loadsmith run pipeline.yaml \
-  --plugin-dir target/debug \
   --dry-run \
   --print-resolved-config
 ```
@@ -105,8 +104,7 @@ destination:
 ## Step 4 — Run
 
 ```bash
-./target/debug/loadsmith run pipeline.yaml --plugin-dir target/debug
-```
+./target/debug/loadsmith run pipeline.yaml```
 
 You'll see:
 
@@ -156,7 +154,6 @@ To see every control message exchanged between the core and each plugin:
 
 ```bash
 ./target/debug/loadsmith run pipeline.yaml \
-  --plugin-dir target/debug \
   --log-level debug
 ```
 
@@ -180,7 +177,6 @@ When redirecting stdout to a file or running in a CI environment where ANSI
 escape codes appear as garbage:
 
 ```bash
-loadsmith run pipeline.yaml --no-color --plugin-dir target/debug
-```
+loadsmith run pipeline.yaml --no-color```
 
 Or set the environment variable `NO_COLOR=1` (follows the [no-color.org](https://no-color.org) convention).

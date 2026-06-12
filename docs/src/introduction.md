@@ -92,7 +92,7 @@ destination:
 ```
 
 ```
-$ loadsmith run pipeline.yaml --plugin-dir target/debug
+$ loadsmith run pipeline.yaml
 
 Loadsmith v0.1.0  ·  postgres → jsonl
   batch   1   2,000 rows

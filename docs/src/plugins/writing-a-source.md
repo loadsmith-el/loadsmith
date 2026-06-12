@@ -293,6 +293,6 @@ approach is a **loadsmith-lab** case:
 
 1. Create `../loadsmith-lab/cases/mysql-to-jsonl/case.yaml`
 2. Create a lab service image that seeds a MySQL database
-3. Run: `./target/debug/loadsmith-lab run --local --select mysql-to-jsonl`
+3. Run: `./target/debug/loadsmith-lab run --loadsmith ../loadsmith --select catalog/mysql-to-jsonl`
 
 See [Testing with loadsmith-lab](../getting-started/testing-with-lab.md).
