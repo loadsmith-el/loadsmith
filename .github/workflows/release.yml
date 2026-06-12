@@ -58,10 +58,16 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build (native ${{ matrix.arch }})
-        run: cargo build --release --bin loadsmith
+      # Compile inside rust:1-bookworm (Debian bookworm, glibc 2.36) so the binary
+      # links glibc <= 2.36 — it must run on debian:bookworm-slim (this image's
+      # runtime AND the lab's `--loadsmith <binary>` wrap). The native ubuntu-24.04
+      # runners would link glibc 2.39, which bookworm-slim cannot load. Native arch
+      # per runner — no QEMU.
+      - name: Build core (glibc-pinned, native ${{ matrix.arch }})
+        run: |
+          docker run --rm -v "$PWD":/src -w /src rust:1-bookworm \
+            cargo build --release --bin loadsmith
 
       - name: Package release tarball
         run: |
@@ -148,10 +154,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          flags=()
-          [ "${{ needs.meta.outputs.prerelease }}" = "true" ] && flags+=( --prerelease )
-          gh release create "${GITHUB_REF_NAME}" "${flags[@]}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "loadsmith ${GITHUB_REF_NAME}" \
-            --notes "Slim core image: \`docker pull ${IMAGE}:${{ needs.meta.outputs.image_tag }}\` (stable also \`${IMAGE}:slim\`). Linux amd64+arm64 binaries attached; plugins install on demand with \`loadsmith plugin install --all\`." \
-            dist/*.tar.gz dist/*.sha256
+          tag="${GITHUB_REF_NAME}"
+          notes="Slim core image: \`docker pull ${IMAGE}:${{ needs.meta.outputs.image_tag }}\` (stable also \`${IMAGE}:slim\`). Linux amd64+arm64 binaries attached; plugins install on demand with \`loadsmith plugin install --all\`."
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Re-run: refresh the assets in place rather than failing on "exists".
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber dist/*.tar.gz dist/*.sha256
+          else
+            flags=()
+            [ "${{ needs.meta.outputs.prerelease }}" = "true" ] && flags+=( --prerelease )
+            gh release create "$tag" "${flags[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "loadsmith $tag" \
+              --notes "$notes" \
+              dist/*.tar.gz dist/*.sha256
+          fi
