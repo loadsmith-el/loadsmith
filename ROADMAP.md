@@ -70,3 +70,12 @@ What's shipped and what's queued next. Shipped items are documented in
       DockerHub, …). Lowers the friction of going from "official slim image" to
       "my production image" — the project is loadsmith *plus* its tooling, and
       adoption hinges on how easy that whole loop is.
+- [ ] **End-to-end "build an EL" guide** — one narrative from a `pipeline.yaml`
+      (source → destination), to a runnable image with the needed plugins
+      installed on the slim core (`loadsmith plugin install`), to testing it with
+      loadsmith-lab. The getting-started-for-a-real-pipeline doc; pairs with the
+      Custom image builder above.
+- [ ] **Published docs** — host the mdbook (GitHub Pages) and give the official
+      plugin repo
+      ([`loadsmith-canonical-plugins`](https://github.com/loadsmith-el/loadsmith-canonical-plugins))
+      proper docs, so everything is browsable, not just in-repo.
