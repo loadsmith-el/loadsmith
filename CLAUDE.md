@@ -74,7 +74,7 @@ After changing core plumbing or a plugin, verify with:
 
 ```bash
 cd ../loadsmith && cargo build          # the lab runs ../loadsmith/target/debug
-cd ../loadsmith-lab && ./target/debug/loadsmith-lab run --local --select postgres-to-jsonl
+cd ../loadsmith-lab && ./target/debug/loadsmith-lab run --loadsmith ../loadsmith --select catalog/postgres-to-jsonl
 ```
 
 ## Hard rules — read before touching these areas
