@@ -151,6 +151,7 @@ jobs:
           flags=()
           [ "${{ needs.meta.outputs.prerelease }}" = "true" ] && flags+=( --prerelease )
           gh release create "${GITHUB_REF_NAME}" "${flags[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
             --title "loadsmith ${GITHUB_REF_NAME}" \
             --notes "Slim core image: \`docker pull ${IMAGE}:${{ needs.meta.outputs.image_tag }}\` (stable also \`${IMAGE}:slim\`). Linux amd64+arm64 binaries attached; plugins install on demand with \`loadsmith plugin install --all\`." \
             dist/*.tar.gz dist/*.sha256
