@@ -99,7 +99,8 @@ jobs:
       - name: Export digest
         run: |
           mkdir -p /tmp/digests
-          touch "/tmp/digests/${{ steps.push.outputs.digest }}"
+          digest="${{ steps.push.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"   # artifact filenames can't contain ':'
       - uses: actions/upload-artifact@v4
         with:
           name: digest-${{ matrix.arch }}
@@ -139,7 +140,7 @@ jobs:
             tags+=( -t "${IMAGE}:slim" )   # rolling tag only for stable releases
           fi
           refs=()
-          for d in /tmp/digests/*; do refs+=( "${IMAGE}@$(basename "$d")" ); done
+          for d in /tmp/digests/*; do refs+=( "${IMAGE}@sha256:$(basename "$d")" ); done
           docker buildx imagetools create "${tags[@]}" "${refs[@]}"
           docker buildx imagetools inspect "${IMAGE}:${{ needs.meta.outputs.image_tag }}"
 
