@@ -119,7 +119,11 @@ struct PluginInstallArgs {
     #[arg(long, conflicts_with_all = ["manifest", "name"])]
     binary: Option<PathBuf>,
 
-    #[arg(long, help = "Override the plugin index URL (for `install <name>`)")]
+    /// Install every plugin in the index (the whole canonical set)
+    #[arg(long, conflicts_with_all = ["manifest", "name", "binary"])]
+    all: bool,
+
+    #[arg(long, help = "Override the plugin index URL (for `install <name>` / --all)")]
     index: Option<String>,
 
     #[arg(long, help = "Plugin directory to install into")]
@@ -265,35 +269,42 @@ fn cmd_plugin_install(args: PluginInstallArgs) -> Result<()> {
         return Ok(());
     }
 
-    // From a manifest spec directly, or resolved from the index by name.
-    let manifest_spec = match (args.manifest, args.name) {
-        (Some(spec), _) => spec,
-        (None, Some(name)) => {
-            let index = args.index.as_deref().unwrap_or(plugin_install::DEFAULT_INDEX_URL);
-            plugin_install::resolve_from_index(&name, index)?
-        }
-        (None, None) => {
-            anyhow::bail!("nothing to install: pass a plugin name, --manifest, or --binary")
-        }
+    let index = args.index.as_deref().unwrap_or(plugin_install::DEFAULT_INDEX_URL);
+
+    // Resolve the manifest spec(s) to install: every plugin (--all), one named
+    // plugin from the index, or a manifest path/URL.
+    let specs: Vec<String> = if args.all {
+        plugin_install::index_plugin_names(index)?
+            .iter()
+            .map(|name| plugin_install::resolve_from_index(name, index))
+            .collect::<Result<_>>()?
+    } else if let Some(spec) = args.manifest {
+        vec![spec]
+    } else if let Some(name) = args.name {
+        vec![plugin_install::resolve_from_index(&name, index)?]
+    } else {
+        anyhow::bail!("nothing to install: pass a plugin name, --all, --manifest, or --binary")
     };
 
-    let manifest = plugin_install::load_manifest(&manifest_spec)?;
-    let installed = plugin_install::install_from_manifest(
-        &manifest,
-        &plugin_dir,
-        loadsmith_core::lifecycle::SUPPORTED_VERSIONS,
-    )?;
-    println!(
-        "Installed plugin '{}' v{} ({} binar{}) → {}",
-        manifest.name,
-        manifest.version,
-        installed.len(),
-        if installed.len() == 1 { "y" } else { "ies" },
-        plugin_dir.display()
-    );
-    for p in installed {
-        if let Some(name) = p.file_name().and_then(|f| f.to_str()) {
-            println!("  {name}");
+    for spec in specs {
+        let manifest = plugin_install::load_manifest(&spec)?;
+        let installed = plugin_install::install_from_manifest(
+            &manifest,
+            &plugin_dir,
+            loadsmith_core::lifecycle::SUPPORTED_VERSIONS,
+        )?;
+        println!(
+            "Installed plugin '{}' v{} ({} binar{}) → {}",
+            manifest.name,
+            manifest.version,
+            installed.len(),
+            if installed.len() == 1 { "y" } else { "ies" },
+            plugin_dir.display()
+        );
+        for p in installed {
+            if let Some(name) = p.file_name().and_then(|f| f.to_str()) {
+                println!("  {name}");
+            }
         }
     }
     Ok(())

@@ -50,13 +50,14 @@ Don't guess at "why" — go read it.
 ## Commands
 
 ```bash
-cargo build                      # builds the loadsmith binary + all plugin binaries into target/debug/
+cargo build                      # builds the loadsmith core binary into target/debug/
 cargo test --workspace           # all tests
 cargo test -p loadsmith-core     # one crate
 cargo test -p loadsmith-protocol handshake_roundtrip   # one test by name
 
-# Run a pipeline against the freshly-built plugins:
-./target/debug/loadsmith run pipeline.yaml --plugin-dir target/debug
+# Plugins live in loadsmith-canonical-plugins now — install them, then run:
+./target/debug/loadsmith plugin install --all          # the canonical set → ~/.loadsmith/plugins
+./target/debug/loadsmith run pipeline.yaml             # discovers plugins in ~/.loadsmith/plugins
 ./target/debug/loadsmith run pipeline.yaml --dry-run --print-resolved-config
 ./target/debug/loadsmith run pipeline.yaml --log-level debug   # shows the full protocol handshake
 ```
@@ -91,6 +92,10 @@ cd ../loadsmith-lab && ./target/debug/loadsmith-lab run --local --select postgre
 - **Keep the human report on stdout and tracing/diagnostics on stderr** — both
   loadsmith-lab and `--no-color`/`NO_COLOR`/`--log-level` consumers depend on
   that split.
-- **Don't move the Postgres source off the text protocol** (`simple_query`)
-  without first reading [`types.rs`](plugins/sources/postgres/src/types.rs) —
-  it's deliberate; the binary `FromSql` path mishandles `NUMERIC`, `TIME`, etc.
+- **Plugins live in their own repo now** —
+  [`loadsmith-canonical-plugins`](../loadsmith-canonical-plugins) (a Cargo
+  workspace that git-deps the SDK crates here, pinned by rev). This repo is the
+  **core + SDK**. Plugin-specific rules (e.g. the Postgres source's deliberate
+  `simple_query` text-protocol choice in its `types.rs`) live with the plugin
+  there. To change a plugin, work in that repo; to change the protocol/SDK, work
+  here and bump the rev the plugins pin.

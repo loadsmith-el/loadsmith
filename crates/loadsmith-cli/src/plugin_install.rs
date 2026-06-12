@@ -33,6 +33,15 @@ struct IndexEntry {
     versions: HashMap<String, String>,
 }
 
+/// All plugin names listed in the index (sorted) — for `install --all`.
+pub fn index_plugin_names(index_url: &str) -> Result<Vec<String>> {
+    let bytes = download::fetch(index_url).with_context(|| format!("fetching index {index_url}"))?;
+    let index: Index = serde_json::from_slice(&bytes).context("parsing plugin index")?;
+    let mut names: Vec<String> = index.plugins.into_keys().collect();
+    names.sort();
+    Ok(names)
+}
+
 /// Resolve a `name[@version]` spec against the index, returning the published
 /// manifest URL. `index_url` defaults to [`DEFAULT_INDEX_URL`].
 pub fn resolve_from_index(spec: &str, index_url: &str) -> Result<String> {

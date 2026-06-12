@@ -9,14 +9,12 @@ members = [
     "crates/loadsmith-core",
     "crates/loadsmith-cli",
     "crates/loadsmith-tls",
-    "plugins/postgres",
-    "plugins/destinations/jsonl",
-    "plugins/destinations/null",
-    "plugins/destinations/parquet",
-    "plugins/sinks/local-copy",
-    "plugins/config-providers/file",
 ]
 resolver = "2"
+
+# Plugins live in their own repo now (loadsmith-canonical-plugins). This repo is
+# the core + the SDK crates (loadsmith-plugin-sdk/arrow/tls/protocol/transport)
+# the plugins git-dep. Install plugins with `loadsmith plugin install <name>`.
 
 [workspace.package]
 license = "Apache-2.0"
