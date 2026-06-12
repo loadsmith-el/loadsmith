@@ -7,6 +7,11 @@
 # The build compiles entirely inside Docker (never copies host-built ELF), so it
 # is correct regardless of the host's glibc. Build and runtime share the same
 # Debian base (bookworm). cargo-chef caches the dependency compilation layer.
+#
+# This is the hermetic, build-from-source image (used locally and by the lab's
+# `--loadsmith <dir>` path). CI publishes the same runtime from a prebuilt
+# native binary via `ci/runtime.Dockerfile` — keep its runtime layer in sync
+# with the `runtime` stage below.
 
 FROM rust:1-bookworm AS chef
 RUN cargo install cargo-chef --locked

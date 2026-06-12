@@ -15,7 +15,10 @@ What's shipped and what's queued next. Shipped items are documented in
       and a core supervisor that respawns + resumes a crashed/hung sink from the
       delivery ledger
 - [x] Live progress reporting, run summary, `--log-level`, `--no-color`
-- [x] Multi-arch release image (`linux/amd64` + `linux/arm64` / Graviton)
+- [x] Multi-arch release image + binaries — slim core published to
+      `ghcr.io/loadsmith-el/loadsmith` (`:slim`, `:vX.Y.Z-slim`) plus per-arch
+      binary archives, from a `vX.Y.Z` tag by
+      [`release.yml`](.github/workflows/release.yml) (`linux/amd64` + `linux/arm64` / Graviton)
 - [x] **Incremental state & checkpoints** — core-owned watermark state with a
       pluggable backend (`local`, with locking for concurrent runs), source
       resume cursor + watermark reporting (`incremental_state`), and intra-run
