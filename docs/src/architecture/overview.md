@@ -90,6 +90,6 @@ raw fds) that plague C equivalents. Tokio's async runtime lets the core drain
 multiple channels concurrently without threads for each.
 
 The single `unsafe` block in the entire project is in
-[`spawner.rs`](../../crates/loadsmith-core/src/spawner.rs), inside a `pre_exec`
+[`spawner.rs`](https://github.com/loadsmith-el/loadsmith/blob/main/crates/loadsmith-core/src/spawner.rs), inside a `pre_exec`
 hook that runs in the forked child and must only call async-signal-safe functions
 (`dup2`, `close` via libc).

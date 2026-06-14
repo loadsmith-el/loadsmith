@@ -15,7 +15,7 @@ The release image is built with:
 docker buildx build --platform linux/amd64,linux/arm64 -t loadsmith:<tag> .
 ```
 
-against the [`Dockerfile`](../../Dockerfile), which is a plain `cargo build
+against the [`Dockerfile`](https://github.com/loadsmith-el/loadsmith/blob/main/Dockerfile), which is a plain `cargo build
 --release` inside a Debian base. There is no cross-compilation toolchain, no
 `--target`, no per-arch linker setup — each platform is built `cargo build`-native
 *inside* that architecture (under QEMU emulation for the non-host arch).

@@ -1,5 +1,7 @@
 # Loadsmith
 
+> 📖 **Full documentation:** <https://loadsmith-el.github.io/loadsmith/>
+
 **A modern, plugin-first EL (Extract & Load) tool for declarative data pipelines.**
 
 Loadsmith moves data from a source to a destination with real streaming, low

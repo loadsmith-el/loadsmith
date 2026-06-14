@@ -34,6 +34,12 @@ What's shipped and what's queued next. Shipped items are documented in
       `--all` / `--manifest` / `--binary` / `uninstall` (sha256-verified,
       protocol-range-checked). The official image is now **slim** (core only);
       plugins are installed on demand.
+- [x] **Published docs** — the mdbook is hosted on GitHub Pages
+      (<https://loadsmith-el.github.io/loadsmith/>), built and deployed on every
+      push to `main` by [`docs.yml`](.github/workflows/docs.yml). The official
+      plugin repo
+      [`loadsmith-canonical-plugins`](https://loadsmith-el.github.io/loadsmith-canonical-plugins/)
+      now ships its own published mdbook too.
 
 ## Planned
 
@@ -75,7 +81,3 @@ What's shipped and what's queued next. Shipped items are documented in
       installed on the slim core (`loadsmith plugin install`), to testing it with
       loadsmith-lab. The getting-started-for-a-real-pipeline doc; pairs with the
       Custom image builder above.
-- [ ] **Published docs** — host the mdbook (GitHub Pages) and give the official
-      plugin repo
-      ([`loadsmith-canonical-plugins`](https://github.com/loadsmith-el/loadsmith-canonical-plugins))
-      proper docs, so everything is browsable, not just in-repo.
