@@ -430,6 +430,82 @@ exactly-once-effective mode. Requires Postgres 15+ (`MERGE`).
 Durability is at the final `COMMIT`/swap, so the core persists the incremental
 watermark at end of run. See [Incremental State](../architecture/incremental-state.md).
 
+### MySQL source (`type: mysql`)
+
+Reads a query from MySQL on the pure-Rust `mysql_async` driver. Like the postgres
+source, it reads over the text protocol, so `DECIMAL`/`TIME` (and other
+text-rendered types) map to Arrow `Utf8` losslessly; `TINYINT`/`SMALLINT`/`INT` →
+`Int32`, `BIGINT` → `Int64`, `FLOAT`/`DOUBLE` → float, `DATE` → `Date32`,
+`DATETIME`/`TIMESTAMP` → `Timestamp(ms)`, `BLOB`/`STRING` with the binary
+collation → `Binary` else `Utf8`.
+
+Both server auth plugins are supported automatically (the driver negotiates
+whichever the user is configured with): the modern `caching_sha2_password` —
+default since 8.0 and the only option in MySQL 9, handled over plaintext via the
+pure-Rust RSA public-key exchange — and the legacy `mysql_native_password`
+(MySQL 5.x). No client-side configuration is needed for either.
+
+```yaml
+source:
+  type: mysql
+  config:
+    host: localhost
+    port: 3306                 # default 3306
+    dbname: lab
+    user: lab
+    password: "{{ env('MYSQL_PASSWORD') }}"
+    query: "SELECT * FROM events ORDER BY event_sequence"
+    batch_size: 2000           # default 1000
+    tls:
+      mode: require            # disable | prefer | require | verify-ca | verify-full
+    incremental:
+      cursor_column: updated_at
+      initial_value: "2026-01-01 00:00:00"   # optional first-run watermark
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `host` / `port` / `dbname` / `user` / `password` | — | yes (port default `3306`) | Connection. |
+| `query` | string | yes | The SQL to extract. Schema is inferred from a prepared statement. |
+| `batch_size` | integer | no | Rows per Arrow batch. Default `1000`. |
+| `tls` | block | no | The shared [TLS block](#tls). MySQL maps it onto `mysql_async`'s `SslOpts`: `require`/`prefer` encrypt without verification, `verify-ca`/`verify-full` verify against `root_cert` (PEM inline), plus mTLS via `client_cert`/`client_key`. |
+| `statement_timeout` | duration | no | Applied as the session `max_execution_time`. |
+| `session` | map | no | `SET SESSION <k> = <v>` applied on connect. |
+| `tcp_keepalive` | duration | no | TCP keepalive idle. |
+| `incremental` | block | no | `cursor_column` (+ optional `initial_value`) — the core persists the high watermark and the source resumes `> watermark ORDER BY` it. |
+
+### MySQL destination (`type: mysql`)
+
+Writes Arrow batches into a MySQL table via batched `INSERT` (parameter-bound).
+The target table must already exist. Two commit modes:
+
+```yaml
+destination:
+  type: mysql
+  config:
+    host: localhost
+    dbname: warehouse
+    user: loadsmith_writer
+    password: "{{ env('MYSQL_PASSWORD') }}"
+    target_table: orders
+    mode: staged_merge       # "atomic" (default) | "staged_merge"
+    merge_key: [id]          # excluded from the ON DUPLICATE KEY UPDATE set
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| connection fields | — | yes (port default `3306`) | Same connection block as the [mysql source](#mysql-source-type-mysql), including `tls`. |
+| `target_table` | string | yes | Destination table. Must already exist. |
+| `mode` | `atomic` / `staged_merge` | no | Commit strategy. Default `atomic`. |
+| `merge_key` | list of strings | for `staged_merge` | Columns excluded from the upsert's `UPDATE` set (conflict detection keys off the table's PRIMARY/UNIQUE index — MySQL semantics). |
+
+**`atomic`** — one transaction: `INSERT` straight into the target, `COMMIT` at the
+end. All-or-nothing, at-least-once.
+
+**`staged_merge`** — `INSERT` into a temporary staging table, then
+`INSERT ... SELECT ... ON DUPLICATE KEY UPDATE` into the target in the same
+transaction. Idempotent by the target's unique key ⇒ exactly-once effective.
+
 ## Full example
 
 ```yaml

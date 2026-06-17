@@ -40,6 +40,13 @@ What's shipped and what's queued next. Shipped items are documented in
       plugin repo
       [`loadsmith-canonical-plugins`](https://loadsmith-el.github.io/loadsmith-canonical-plugins/)
       now ships its own published mdbook too.
+- [x] **`mysql` connector** — a full source + destination
+      (`loadsmith-source-mysql` / `loadsmith-destination-mysql`) on the pure-Rust
+      `mysql_async` driver with rustls TLS (the same rustls-rustcrypto provider as
+      postgres — no ring/aws-lc). Source: streaming read + incremental watermark;
+      destination: `atomic` and `staged_merge` (ON DUPLICATE KEY upsert). Proven
+      end-to-end in loadsmith-lab against MySQL 8 (smoke, TLS, both destination
+      modes).
 
 ## Planned
 
@@ -55,9 +62,8 @@ What's shipped and what's queued next. Shipped items are documented in
       distributed lock) behind the existing `StateBackend` trait, reusing the
       s3 sink's SigV4/TLS. Local-file state with locking ships today.
 - [ ] **More plugins** — additional source/destination/sink types beyond the
-      current postgres source+destination / jsonl / null / parquet / local-copy
-      / file set (mysql, oracle, sqlserver sources; mysql destination; gcs/sftp
-      sinks).
+      current postgres + mysql source+destination / jsonl / null / parquet /
+      local-copy / file set (oracle, sqlserver sources; gcs/sftp sinks).
 - [ ] **Parallel plugin I/O** — a wishlist item, not yet designed in detail.
       Source/destination connect+fetch/write usually dominates runtime far more
       than the pump's data-plane transfer, so plugins fanning out internally
