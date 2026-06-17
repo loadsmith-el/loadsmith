@@ -47,6 +47,16 @@ What's shipped and what's queued next. Shipped items are documented in
       destination: `atomic` and `staged_merge` (ON DUPLICATE KEY upsert). Proven
       end-to-end in loadsmith-lab against MySQL 8 (smoke, TLS, both destination
       modes).
+- [x] **Per-kind plugin install** — `loadsmith plugin install <name>` installs a
+      whole **package** (all the binaries its manifest `provides`); a `:<kind>`
+      spec suffix or `--kind` flag installs a single **plugin**
+      (`install mysql:source` / `install mysql --kind source` → just
+      `loadsmith-source-mysql`), so a pipeline that reads from one system and
+      writes to another doesn't carry the unused side. `<package> --all` is the
+      explicit "all kinds" form; `:<kind>` composes with `@<version>`. No index
+      or release change — the package is the index key and `kind` filters
+      `provides` (the manifest already carries a `kind` per binary). `uninstall`
+      takes the same `:<kind>` selector.
 
 ## Planned
 

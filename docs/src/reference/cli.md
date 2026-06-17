@@ -147,9 +147,18 @@ Install plugins into the plugin directory (`~/.loadsmith/plugins/`). Plugins com
 from [`loadsmith-canonical-plugins`](https://github.com/loadsmith-el/loadsmith-canonical-plugins)
 via a canonical index, but you can also install from a manifest or a local binary.
 
+A **package** (e.g. `mysql`) provides one or more **plugins** — its binaries,
+one per kind (`loadsmith-source-mysql`, `loadsmith-destination-mysql`). The
+install spec is `<name>[:<kind>][@<version>]`: a bare package installs all its
+plugins; a `:<kind>` (or `--kind`) installs just one.
+
 ```bash
-loadsmith plugin install postgres            # resolve from the index (latest)
+loadsmith plugin install postgres            # the package — all its plugins
+loadsmith plugin install postgres --all      # explicit "all plugins of postgres"
+loadsmith plugin install mysql:source        # just the source plugin
+loadsmith plugin install mysql --kind source # same, via the flag
 loadsmith plugin install postgres@0.1.0      # a pinned version
+loadsmith plugin install mysql:source@0.1.0  # pinned version, one kind
 loadsmith plugin install --all               # the whole canonical set
 loadsmith plugin install --manifest ./loadsmith-plugin.yaml   # a manifest path or file/http/https URL
 loadsmith plugin install --binary ./target/release/loadsmith-destination-jsonl  # a local binary
@@ -159,23 +168,35 @@ loadsmith plugin install --binary ./target/release/loadsmith-destination-jsonl  
 
 | Flag | Default | Description |
 |---|---|---|
-| `--all` | — | Install every plugin in the index |
+| `--kind <kind>` | — | Install only this kind from the package (`source`/`destination`/`sink`/`parser`/`config-provider`). Same as the `:<kind>` spec suffix. |
+| `--all` | — | With no name: every package in the index. With a `<name>`: every plugin of that package. |
 | `--manifest <path\|URL>` | — | Install from a `loadsmith-plugin.yaml` |
 | `--binary <path>` | — | Install a single local plugin binary |
 | `--index <url>` | the canonical index | Override the plugin index |
 | `--plugin-dir <path>` | `~/.loadsmith/plugins/` | Target directory |
 
+**Version pinning.** `@<version>` resolves a specific release from the index
+(`entry.versions`; otherwise the package's `latest`) and composes with the kind
+selector — `mysql:source@0.1.0` is the source plugin of mysql 0.1.0. There is
+**one installed version at a time**: the on-disk binary is `loadsmith-{kind}-{name}`
+(no version in the filename), so reinstalling a different version overwrites it.
+`--all` always pulls each package's `latest`.
+
 Index/manifest installs download a per-platform artifact, **verify its sha256**,
 and refuse a manifest whose declared `protocol` range is incompatible with this
-core (before fetching).
+core (before fetching). Selecting a kind a package doesn't provide (e.g.
+`jsonl:source`) is a clear error.
 
-## `loadsmith plugin uninstall <name>`
+## `loadsmith plugin uninstall <name>[:<kind>]`
 
-Remove an installed plugin's binaries by type name (e.g. `uninstall postgres`
-removes `loadsmith-*-postgres`).
+Remove an installed plugin's binaries. A bare package removes all of them
+(`uninstall postgres` → `loadsmith-*-postgres`); a `:<kind>` (or `--kind`)
+removes just that one.
 
 ```bash
-loadsmith plugin uninstall postgres
+loadsmith plugin uninstall postgres            # all of postgres' binaries
+loadsmith plugin uninstall mysql:source        # just loadsmith-source-mysql
+loadsmith plugin uninstall mysql --kind source # same, via the flag
 ```
 
 ---

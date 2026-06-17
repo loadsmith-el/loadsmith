@@ -92,7 +92,7 @@ struct StateArgs {
 enum PluginAction {
     /// List installed plugins
     List(PluginListArgs),
-    /// Install a plugin from a manifest, a local binary, or (soon) the index
+    /// Install a plugin from the index (by name), a manifest, or a local binary
     Install(PluginInstallArgs),
     /// Remove an installed plugin's binaries (by type name, e.g. `postgres`)
     Uninstall(PluginUninstallArgs),
@@ -106,9 +106,17 @@ struct PluginListArgs {
 
 #[derive(Args)]
 struct PluginInstallArgs {
-    /// Plugin name to resolve from the official index (not available yet —
-    /// use --manifest or --binary)
+    /// Package to resolve from the official index, as `<name>[:<kind>][@<version>]`.
+    /// A bare `<name>` (or `<name> --all`) installs all of the package's plugins;
+    /// `<name>:<kind>` (or `--kind`) installs just one — e.g. `mysql:source`,
+    /// `mysql:source@0.1.0`.
     name: Option<String>,
+
+    /// Install only this plugin kind from the package
+    /// (source|destination|sink|parser|config-provider). Alternative to the
+    /// `<name>:<kind>` spec suffix.
+    #[arg(long, conflicts_with_all = ["manifest", "binary", "all"])]
+    kind: Option<String>,
 
     /// Install from a plugin manifest (loadsmith-plugin.yaml) — a local path
     /// or a file:// / http:// / https:// URL
@@ -119,8 +127,9 @@ struct PluginInstallArgs {
     #[arg(long, conflicts_with_all = ["manifest", "name"])]
     binary: Option<PathBuf>,
 
-    /// Install every plugin in the index (the whole canonical set)
-    #[arg(long, conflicts_with_all = ["manifest", "name", "binary"])]
+    /// Install all plugins: every package in the index, or — combined with a
+    /// `<name>` — every plugin of that one package
+    #[arg(long, conflicts_with_all = ["manifest", "binary"])]
     all: bool,
 
     #[arg(long, help = "Override the plugin index URL (for `install <name>` / --all)")]
@@ -132,8 +141,14 @@ struct PluginInstallArgs {
 
 #[derive(Args)]
 struct PluginUninstallArgs {
-    /// Plugin type name (e.g. `postgres` removes loadsmith-*-postgres)
+    /// Package to remove, as `<name>[:<kind>]`. A bare `<name>` removes all of
+    /// the package's binaries (e.g. `postgres` → `loadsmith-*-postgres`);
+    /// `<name>:<kind>` (or `--kind`) removes just one.
     name: String,
+
+    /// Remove only this plugin kind (alternative to the `<name>:<kind>` suffix)
+    #[arg(long)]
+    kind: Option<String>,
 
     #[arg(long, help = "Plugin directory to remove from")]
     plugin_dir: Option<PathBuf>,
@@ -271,27 +286,56 @@ fn cmd_plugin_install(args: PluginInstallArgs) -> Result<()> {
 
     let index = args.index.as_deref().unwrap_or(plugin_install::DEFAULT_INDEX_URL);
 
-    // Resolve the manifest spec(s) to install: every plugin (--all), one named
-    // plugin from the index, or a manifest path/URL.
-    let specs: Vec<String> = if args.all {
+    if args.kind.is_some() && args.name.is_none() && args.manifest.is_none() {
+        anyhow::bail!("--kind needs a package name (e.g. `install mysql --kind source`)");
+    }
+    if let Some(k) = &args.kind {
+        plugin_install::validate_kind(k)?;
+    }
+
+    // Each job: a manifest (index URL / path) plus the kinds to install from it
+    // (`None` ⇒ all of the package's binaries).
+    let jobs: Vec<(String, Option<Vec<String>>)> = if args.all && args.name.is_none() {
+        // The whole canonical set, every kind of each package.
         plugin_install::index_plugin_names(index)?
             .iter()
-            .map(|name| plugin_install::resolve_from_index(name, index))
+            .map(|name| plugin_install::resolve_from_index(name, index).map(|url| (url, None)))
             .collect::<Result<_>>()?
     } else if let Some(spec) = args.manifest {
-        vec![spec]
-    } else if let Some(name) = args.name {
-        vec![plugin_install::resolve_from_index(&name, index)?]
+        // A manifest path/URL, optionally narrowed by --kind.
+        vec![(spec, args.kind.map(|k| vec![k]))]
+    } else if let Some(name_spec) = args.name {
+        let (pkg, spec_kind, version) = plugin_install::parse_install_spec(&name_spec)?;
+        // Reconcile a `:kind` spec suffix with the --kind flag.
+        let kind = match (spec_kind, args.kind) {
+            (Some(a), Some(b)) if a != b => {
+                anyhow::bail!("conflicting kind: {a:?} (in spec) vs {b:?} (--kind)")
+            }
+            (Some(a), _) => Some(a),
+            (None, b) => b,
+        };
+        if args.all && kind.is_some() {
+            anyhow::bail!("--all installs every kind of the package; drop the kind selector");
+        }
+        let kinds = if args.all { None } else { kind.map(|k| vec![k]) };
+        let index_spec = match version {
+            Some(v) => format!("{pkg}@{v}"),
+            None => pkg,
+        };
+        vec![(plugin_install::resolve_from_index(&index_spec, index)?, kinds)]
     } else {
         anyhow::bail!("nothing to install: pass a plugin name, --all, --manifest, or --binary")
     };
 
-    for spec in specs {
+    for (spec, kinds) in jobs {
         let manifest = plugin_install::load_manifest(&spec)?;
+        let kind_refs: Option<Vec<&str>> =
+            kinds.as_ref().map(|v| v.iter().map(String::as_str).collect());
         let installed = plugin_install::install_from_manifest(
             &manifest,
             &plugin_dir,
             loadsmith_core::lifecycle::SUPPORTED_VERSIONS,
+            kind_refs.as_deref(),
         )?;
         println!(
             "Installed plugin '{}' v{} ({} binar{}) → {}",
@@ -312,9 +356,23 @@ fn cmd_plugin_install(args: PluginInstallArgs) -> Result<()> {
 
 fn cmd_plugin_uninstall(args: PluginUninstallArgs) -> Result<()> {
     let plugin_dir = args.plugin_dir.unwrap_or_else(discovery::default_plugin_dir);
-    let removed = plugin_install::uninstall(&args.name, &plugin_dir)?;
+    let (pkg, spec_kind, version) = plugin_install::parse_install_spec(&args.name)?;
+    if version.is_some() {
+        anyhow::bail!("uninstall takes no @version (one version is installed at a time)");
+    }
+    if let Some(k) = &args.kind {
+        plugin_install::validate_kind(k)?;
+    }
+    let kind = match (spec_kind, args.kind) {
+        (Some(a), Some(b)) if a != b => {
+            anyhow::bail!("conflicting kind: {a:?} (in spec) vs {b:?} (--kind)")
+        }
+        (Some(a), _) => Some(a),
+        (None, b) => b,
+    };
+    let removed = plugin_install::uninstall(&pkg, kind.as_deref(), &plugin_dir)?;
     if removed.is_empty() {
-        println!("No installed binaries found for plugin '{}'.", args.name);
+        println!("No installed binaries found for plugin '{pkg}'.");
     } else {
         println!("Removed {} binar{}:", removed.len(), if removed.len() == 1 { "y" } else { "ies" });
         for p in removed {

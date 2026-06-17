@@ -42,6 +42,42 @@ pub fn index_plugin_names(index_url: &str) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// Parse an install spec `<name>[:<kind>][@<version>]` into its parts.
+///
+/// The `@version` suffix (if any) is split off first, then a `:kind` suffix, so
+/// `mysql:source@0.1.0` resolves to (`mysql`, `source`, `0.1.0`). `kind`, when
+/// present, is validated against [`KNOWN_KINDS`](loadsmith_plugin_manifest::KNOWN_KINDS).
+pub fn parse_install_spec(spec: &str) -> Result<(String, Option<String>, Option<String>)> {
+    let (left, version) = match spec.rsplit_once('@') {
+        Some((l, v)) => (l, Some(v.to_string())),
+        None => (spec, None),
+    };
+    let (name, kind) = match left.split_once(':') {
+        Some((n, k)) => (n, Some(k.to_string())),
+        None => (left, None),
+    };
+    if name.is_empty() {
+        bail!("invalid plugin spec {spec:?}: empty package name");
+    }
+    if let Some(k) = &kind {
+        let known = loadsmith_plugin_manifest::KNOWN_KINDS;
+        if !known.contains(&k.as_str()) {
+            bail!("unknown plugin kind {k:?} (expected one of {known:?})");
+        }
+    }
+    Ok((name.to_string(), kind, version))
+}
+
+/// Validate a plugin kind string (e.g. a `--kind` flag value) against the known
+/// kinds. The `:kind` spec suffix is already validated by [`parse_install_spec`].
+pub fn validate_kind(kind: &str) -> Result<()> {
+    let known = loadsmith_plugin_manifest::KNOWN_KINDS;
+    if !known.contains(&kind) {
+        bail!("unknown plugin kind {kind:?} (expected one of {known:?})");
+    }
+    Ok(())
+}
+
 /// Resolve a `name[@version]` spec against the index, returning the published
 /// manifest URL. `index_url` defaults to [`DEFAULT_INDEX_URL`].
 pub fn resolve_from_index(spec: &str, index_url: &str) -> Result<String> {
@@ -79,10 +115,16 @@ pub fn load_manifest(spec: &str) -> Result<PluginManifest> {
 
 /// Resolve the host artifact, download + verify it, and install the promised
 /// binaries into `plugin_dir`. Returns the installed paths.
+///
+/// `wanted_kinds` filters which of the package's binaries to place: `None`
+/// installs every binary the manifest provides; `Some(kinds)` installs only the
+/// matching ones (how `install <pkg>:<kind>` / `--kind` pull a single plugin
+/// from the package's shared tarball).
 pub fn install_from_manifest(
     manifest: &PluginManifest,
     plugin_dir: &Path,
     supported_protocols: &[u32],
+    wanted_kinds: Option<&[&str]>,
 ) -> Result<Vec<PathBuf>> {
     if !manifest.protocol_compatible_with(supported_protocols) {
         bail!(
@@ -114,7 +156,7 @@ pub fn install_from_manifest(
         );
     }
 
-    let wanted: Vec<&str> = manifest.provides.iter().map(|p| p.bin.as_str()).collect();
+    let wanted = manifest.bins_for_kinds(wanted_kinds)?;
     let installed = extract_binaries(&bytes, &wanted, plugin_dir)?;
 
     for bin in &wanted {
@@ -128,10 +170,12 @@ pub fn install_from_manifest(
     Ok(installed)
 }
 
-/// Remove every installed binary belonging to a plugin type, i.e. files named
-/// `loadsmith-<kind>-<name>` in the plugin dir. Returns the removed paths.
-pub fn uninstall(name: &str, plugin_dir: &Path) -> Result<Vec<PathBuf>> {
+/// Remove installed binaries belonging to a package. With `kind = None`, removes
+/// every `loadsmith-<kind>-<name>` for the package; with `kind = Some(k)`, removes
+/// only `loadsmith-<k>-<name>`. Returns the removed paths.
+pub fn uninstall(name: &str, kind: Option<&str>, plugin_dir: &Path) -> Result<Vec<PathBuf>> {
     let suffix = format!("-{name}");
+    let exact = kind.map(|k| format!("loadsmith-{k}-{name}"));
     let mut removed = Vec::new();
     let entries = match std::fs::read_dir(plugin_dir) {
         Ok(e) => e,
@@ -140,7 +184,11 @@ pub fn uninstall(name: &str, plugin_dir: &Path) -> Result<Vec<PathBuf>> {
     for entry in entries.flatten() {
         let fname = entry.file_name();
         let fname = fname.to_string_lossy();
-        if fname.starts_with("loadsmith-") && fname.ends_with(&suffix) {
+        let matches = match &exact {
+            Some(e) => fname == e.as_str(),
+            None => fname.starts_with("loadsmith-") && fname.ends_with(&suffix),
+        };
+        if matches {
             let path = entry.path();
             std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
             removed.push(path);
@@ -236,14 +284,61 @@ mod tests {
         for f in ["loadsmith-source-postgres", "loadsmith-destination-postgres", "loadsmith-destination-jsonl"] {
             std::fs::write(dir.join(f), b"x").unwrap();
         }
-        let removed = uninstall("postgres", &dir).unwrap();
+        let removed = uninstall("postgres", None, &dir).unwrap();
         assert_eq!(removed.len(), 2);
         assert!(dir.join("loadsmith-destination-jsonl").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn uninstall_by_kind_removes_only_that_binary() {
+        let dir = tempdir();
+        for f in ["loadsmith-source-postgres", "loadsmith-destination-postgres"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let removed = uninstall("postgres", Some("source"), &dir).unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(!dir.join("loadsmith-source-postgres").exists());
+        assert!(dir.join("loadsmith-destination-postgres").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_install_specs() {
+        assert_eq!(
+            parse_install_spec("mysql").unwrap(),
+            ("mysql".into(), None, None)
+        );
+        assert_eq!(
+            parse_install_spec("mysql:source").unwrap(),
+            ("mysql".into(), Some("source".into()), None)
+        );
+        assert_eq!(
+            parse_install_spec("mysql@0.1.0").unwrap(),
+            ("mysql".into(), None, Some("0.1.0".into()))
+        );
+        assert_eq!(
+            parse_install_spec("mysql:source@0.1.0").unwrap(),
+            ("mysql".into(), Some("source".into()), Some("0.1.0".into()))
+        );
+        // local-copy / config-provider are valid kinds with hyphens in the name.
+        assert_eq!(
+            parse_install_spec("local-copy:sink").unwrap(),
+            ("local-copy".into(), Some("sink".into()), None)
+        );
+        assert!(parse_install_spec("mysql:bogus").is_err());
+        assert!(parse_install_spec(":source").is_err());
+    }
+
     fn tempdir() -> PathBuf {
-        let p = std::env::temp_dir().join(format!("loadsmith-pi-test-{}", std::process::id()));
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        // Unique per call so parallel tests don't share (and clobber) a dir.
+        let p = std::env::temp_dir().join(format!(
+            "loadsmith-pi-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p

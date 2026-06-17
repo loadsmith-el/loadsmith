@@ -51,6 +51,12 @@ pub enum ManifestError {
     UnknownKind { kind: String },
     #[error("invalid sha256 {0:?}: expected 64 hex characters")]
     Sha256(String),
+    #[error("package {name:?} provides no {requested} plugin (it provides: {available})")]
+    KindNotProvided {
+        name: String,
+        requested: String,
+        available: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -175,6 +181,37 @@ impl PluginManifest {
             }
         }
     }
+
+    /// The binary names to install, optionally filtered to `kinds`.
+    ///
+    /// `None` ⇒ every binary the package provides. `Some(kinds)` ⇒ only the
+    /// provides whose `kind` is in `kinds` — this is how `install <pkg>:<kind>`
+    /// / `--kind` install a single plugin from a package's shared tarball. Errors
+    /// when the filter matches nothing (the package provides no such kind).
+    pub fn bins_for_kinds(&self, kinds: Option<&[&str]>) -> Result<Vec<&str>, ManifestError> {
+        let bins: Vec<&str> = match kinds {
+            None => self.provides.iter().map(|p| p.bin.as_str()).collect(),
+            Some(kinds) => self
+                .provides
+                .iter()
+                .filter(|p| kinds.contains(&p.kind.as_str()))
+                .map(|p| p.bin.as_str())
+                .collect(),
+        };
+        if bins.is_empty() {
+            return Err(ManifestError::KindNotProvided {
+                name: self.name.clone(),
+                requested: kinds.map(|k| k.join("/")).unwrap_or_default(),
+                available: self
+                    .provides
+                    .iter()
+                    .map(|p| p.kind.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
+        Ok(bins)
+    }
 }
 
 /// The host platform as `(os, arch)` in the manifest's terms: OS via
@@ -255,6 +292,26 @@ runtime:
         assert!(matches!(
             PluginManifest::parse(&s),
             Err(ManifestError::UnknownKind { .. })
+        ));
+    }
+
+    #[test]
+    fn bins_for_kinds_filters() {
+        let m = PluginManifest::parse(OK).unwrap();
+        // None ⇒ every provided binary.
+        assert_eq!(
+            m.bins_for_kinds(None).unwrap(),
+            vec!["loadsmith-source-postgres", "loadsmith-destination-postgres"]
+        );
+        // A single kind ⇒ just that binary.
+        assert_eq!(
+            m.bins_for_kinds(Some(&["source"])).unwrap(),
+            vec!["loadsmith-source-postgres"]
+        );
+        // A kind the package doesn't provide ⇒ a clear error.
+        assert!(matches!(
+            m.bins_for_kinds(Some(&["sink"])),
+            Err(ManifestError::KindNotProvided { .. })
         ));
     }
 
