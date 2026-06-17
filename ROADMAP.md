@@ -61,9 +61,28 @@ What's shipped and what's queued next. Shipped items are documented in
 - [ ] **Remote state backend** — an `s3` state backend (conditional PUT for a
       distributed lock) behind the existing `StateBackend` trait, reusing the
       s3 sink's SigV4/TLS. Local-file state with locking ships today.
+- [ ] **`oracle` connector — shipped OUT OF CANON on native ODPI-C** in the
+      sibling repo
+      [`loadsmith-oracle-plugins`](https://github.com/loadsmith-el/loadsmith-oracle-plugins).
+      The pure-Rust [`oracle-rs`](https://github.com/stiang/oracle-rs) path was
+      paused: it can't read result sets larger than ~one TNS packet (a core
+      driver rewrite, not a patch — see the `loadsmith-el/oracle-rs` fork's
+      `UPSTREAM-oracle-rs.md`). So Oracle ships on ODPI-C / Instant Client
+      (reads multi-packet natively; amd64 + arm64), at the cost of a C toolchain
+      at build, the Instant Client `.so` at runtime, and OTN licensing — hence
+      out of the pure-Rust canonical set, with a separate `loadsmith-oracle-odpi`
+      delivery image. The `lab-oracle` DB fixture and the engine's oracle
+      readiness probe stay here in canon.
+- [ ] **Bring Oracle BACK to canon (pure-Rust)** — *the exit condition.* When
+      `oracle-rs` can read multi-packet result sets (the issue-#7 work in our
+      fork, filed upstream one PR at a time, starting with the already-proven
+      item-1 `tokio-rustls` `default-features = false` aws-lc fix), re-add an
+      `oracle` plugin here on the published pure-Rust driver, move the lab cases
+      back to the canonical catalog, and retire `loadsmith-oracle-plugins` + the
+      `loadsmith-oracle-odpi` image.
 - [ ] **More plugins** — additional source/destination/sink types beyond the
       current postgres + mysql source+destination / jsonl / null / parquet /
-      local-copy / file set (oracle, sqlserver sources; gcs/sftp sinks).
+      local-copy / file set (sqlserver sources; gcs/sftp sinks).
 - [ ] **Parallel plugin I/O** — a wishlist item, not yet designed in detail.
       Source/destination connect+fetch/write usually dominates runtime far more
       than the pump's data-plane transfer, so plugins fanning out internally
