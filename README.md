@@ -220,7 +220,7 @@ cargo test --workspace
 ```
 
 But the **best way to validate a real pipeline end-to-end** is
-**[loadsmith-lab](../loadsmith-lab)** — a companion harness that spins up real
+**[loadsmith-lab](https://github.com/loadsmith-el/loadsmith-lab)** — a companion harness that spins up real
 services in Docker, seeds them with canonical data, runs Loadsmith against them,
 and checks the output. It's how the Postgres → JSONL path above is verified on
 every change:

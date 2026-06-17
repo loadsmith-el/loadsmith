@@ -67,7 +67,8 @@ incrementally — do not accumulate. When the IPC stream ends (source exhausted)
 > three operator knobs: a configurable `compression` codec, a filename
 > `prefix`, and size-based file splitting (`max_file_size`). For the full
 > configuration reference see
-> [Parquet destination](../reference/pipeline-yaml.md#parquet-destination-type-parquet).
+> [Parquet](https://loadsmith-el.github.io/loadsmith-canonical-plugins/config/parquet.html)
+> in the canonical plugins docs.
 
 ### 1. Create the crate
 
