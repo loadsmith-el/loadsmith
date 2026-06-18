@@ -47,6 +47,16 @@ What's shipped and what's queued next. Shipped items are documented in
       destination: `atomic` and `staged_merge` (ON DUPLICATE KEY upsert). Proven
       end-to-end in loadsmith-lab against MySQL 8 (smoke, TLS, both destination
       modes).
+- [x] **`sharepoint` source connector** — reads from Microsoft 365 via the Graph
+      API (`loadsmith-source-sharepoint`): an Excel/CSV file download or
+      SharePoint List items, with in-plugin tabular transforms (filter with a
+      structured predicate / normalize / fix-merged-columns / drop-empty-rows)
+      applied before emitting Arrow. Source-only (SharePoint is read-only here).
+      Pure-Rust HTTPS (reqwest over rustls-rustcrypto — no ring/aws-lc), Excel via
+      calamine, CSV via the csv crate. Ported from the Python `sp-bulk`. Validated
+      without a live tenant: unit tests plus a fake-Graph integration suite, and a
+      `mock-graph` lab image (Graph is just HTTP, so the client's base URLs are
+      configurable — which also serves sovereign clouds).
 - [x] **Per-kind plugin install** — `loadsmith plugin install <name>` installs a
       whole **package** (all the binaries its manifest `provides`); a `:<kind>`
       spec suffix or `--kind` flag installs a single **plugin**
