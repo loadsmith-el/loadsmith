@@ -57,6 +57,17 @@ What's shipped and what's queued next. Shipped items are documented in
       without a live tenant: unit tests plus a fake-Graph integration suite, and a
       `mock-graph` lab image (Graph is just HTTP, so the client's base URLs are
       configurable — which also serves sovereign clouds).
+- [x] **`oracle` connector** — a full source + destination
+      (`loadsmith-source-oracle` / `loadsmith-destination-oracle`) in
+      `loadsmith-canonical-plugins`, on Oracle's official pure-Rust thin driver
+      [`oracledb`](https://github.com/oracle/rust-oracledb) (26.0.0 beta, pinned):
+      no Instant Client, amd64 + arm64 from the same build, TLS (TCPS) via the
+      same rustls-rustcrypto provider. Source: wide reads + incremental watermark;
+      destination: `atomic` (array INSERT) and `staged_merge` (staging GTT + one
+      set-based `MERGE`). Proven in loadsmith-lab against Oracle Free on amd64
+      and arm64 (7 cases, content-checked). Caveat: the driver still compiles
+      `aws-lc-sys` at build time (unused at runtime). Replaces the out-of-canon
+      ODPI-C build (`loadsmith-oracle-plugins`, retired).
 - [x] **Per-kind plugin install** — `loadsmith plugin install <name>` installs a
       whole **package** (all the binaries its manifest `provides`); a `:<kind>`
       spec suffix or `--kind` flag installs a single **plugin**
@@ -81,27 +92,14 @@ What's shipped and what's queued next. Shipped items are documented in
 - [ ] **Remote state backend** — an `s3` state backend (conditional PUT for a
       distributed lock) behind the existing `StateBackend` trait, reusing the
       s3 sink's SigV4/TLS. Local-file state with locking ships today.
-- [ ] **`oracle` connector — shipped OUT OF CANON on native ODPI-C** in the
-      sibling repo
-      [`loadsmith-oracle-plugins`](https://github.com/loadsmith-el/loadsmith-oracle-plugins).
-      The pure-Rust [`oracle-rs`](https://github.com/stiang/oracle-rs) path was
-      paused: it can't read result sets larger than ~one TNS packet (a core
-      driver rewrite, not a patch — see the `loadsmith-el/oracle-rs` fork's
-      `UPSTREAM-oracle-rs.md`). So Oracle ships on ODPI-C / Instant Client
-      (reads multi-packet natively; amd64 + arm64), at the cost of a C toolchain
-      at build, the Instant Client `.so` at runtime, and OTN licensing — hence
-      out of the pure-Rust canonical set, with a separate `loadsmith-oracle-odpi`
-      delivery image. The `lab-oracle` DB fixture and the engine's oracle
-      readiness probe stay here in canon.
-- [ ] **Bring Oracle BACK to canon (pure-Rust)** — *the exit condition.* When
-      `oracle-rs` can read multi-packet result sets (the issue-#7 work in our
-      fork, filed upstream one PR at a time, starting with the already-proven
-      item-1 `tokio-rustls` `default-features = false` aws-lc fix), re-add an
-      `oracle` plugin here on the published pure-Rust driver, move the lab cases
-      back to the canonical catalog, and retire `loadsmith-oracle-plugins` + the
-      `loadsmith-oracle-odpi` image.
+- [ ] **`oracle` follow-ups** — drop the build-time `aws-lc-sys` (needs
+      `oracledb` to make its rustls provider optional, oracle/rust-oracledb#34);
+      enforce TLS DN pinning once the driver applies it (#25); schema-qualified
+      `target_table`; CLOB values over 4000 bytes; real NLS coverage in the lab
+      (a server-side logon trigger, since thin drivers ignore `NLS_LANG`); move
+      the lab's Oracle readiness probe off the community `oracle-rs`.
 - [ ] **More plugins** — additional source/destination/sink types beyond the
-      current postgres + mysql source+destination / jsonl / null / parquet /
+      current postgres + mysql + oracle source+destination / sharepoint source / jsonl / null / parquet /
       local-copy / file set (sqlserver sources; gcs/sftp sinks).
 - [ ] **Parallel plugin I/O** — a wishlist item, not yet designed in detail.
       Source/destination connect+fetch/write usually dominates runtime far more

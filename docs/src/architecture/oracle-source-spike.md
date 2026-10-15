@@ -1,5 +1,16 @@
 # Oracle Source — Research Spike
 
+> **Outcome (2026-10-15):** option 3 happened, but Oracle did it. In July 2026
+> Oracle published [`oracledb`](https://github.com/oracle/rust-oracledb), an
+> official pure-Rust thin driver (by the `python-oracledb` team). The `oracle`
+> connector now ships in canon on it: no Instant Client, amd64 + arm64. The
+> interim ODPI-C build (option 2, shipped out of canon in
+> `loadsmith-oracle-plugins`) is retired. One residual gap against the
+> constraint below: the driver pulls rustls with default features, so
+> `aws-lc-sys` is still *compiled* (never used at runtime, where the
+> rustls-rustcrypto provider is installed) until upstream makes it optional.
+> The memo below is kept as the original record.
+
 A decision memo, not an implementation. It records why an Oracle source is *not*
 a drop-in like the MySQL connector, the options, and the recommendation for the
 1.0 plugin scope. See [Multi-arch & TLS](./multi-arch-and-tls.md) for the
