@@ -294,15 +294,25 @@ impl StateBackend for LocalFileBackend {
 mod tests {
     use super::*;
 
-    fn tmp_state_path(tag: &str) -> PathBuf {
+    /// Removes the test's temp dir when dropped (so `cargo test` leaves no
+    /// `/tmp/loadsmith-*-test-*` behind).
+    struct TmpDir(PathBuf);
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp_state_path(tag: &str) -> (TmpDir, PathBuf) {
         let dir = std::env::temp_dir().join(format!("loadsmith-state-test-{}-{}", tag, std::process::id()));
         let _ = fs::create_dir_all(&dir);
-        dir.join("state.json")
+        let path = dir.join("state.json");
+        (TmpDir(dir), path)
     }
 
     #[test]
     fn store_then_load_roundtrip() {
-        let path = tmp_state_path("roundtrip");
+        let (_tmp, path) = tmp_state_path("roundtrip");
         let _ = fs::remove_file(&path);
         let backend = LocalFileBackend::new(&path);
         assert!(backend.load("p1").unwrap().is_none());
@@ -318,7 +328,7 @@ mod tests {
 
     #[test]
     fn load_rejects_wrong_pipeline() {
-        let path = tmp_state_path("wrong-pipeline");
+        let (_tmp, path) = tmp_state_path("wrong-pipeline");
         let _ = fs::remove_file(&path);
         let backend = LocalFileBackend::new(&path);
         backend
@@ -329,7 +339,7 @@ mod tests {
 
     #[test]
     fn lock_excludes_second_holder() {
-        let path = tmp_state_path("lock-excl");
+        let (_tmp, path) = tmp_state_path("lock-excl");
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(LocalFileBackend::new(&path).lock_path());
         let backend = LocalFileBackend::new(&path);
@@ -344,7 +354,7 @@ mod tests {
 
     #[test]
     fn steals_expired_lease() {
-        let path = tmp_state_path("lock-steal");
+        let (_tmp, path) = tmp_state_path("lock-steal");
         let _ = fs::remove_file(&path);
         let backend = LocalFileBackend::new(&path);
         // Write a lock whose lease was last renewed long before LEASE_TTL ago.
@@ -356,7 +366,7 @@ mod tests {
 
     #[test]
     fn renew_keeps_lock_held() {
-        let path = tmp_state_path("lock-renew");
+        let (_tmp, path) = tmp_state_path("lock-renew");
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(LocalFileBackend::new(&path).lock_path());
         let backend = LocalFileBackend::new(&path);

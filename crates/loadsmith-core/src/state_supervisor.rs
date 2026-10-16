@@ -121,11 +121,21 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    fn tmp_path(tag: &str) -> PathBuf {
+    /// Removes the test's temp dir when dropped (so `cargo test` leaves no
+    /// `/tmp/loadsmith-*-test-*` behind).
+    struct TmpDir(PathBuf);
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp_path(tag: &str) -> (TmpDir, PathBuf) {
         let dir = std::env::temp_dir()
             .join(format!("loadsmith-statesup-test-{}-{}", tag, std::process::id()));
         let _ = fs::create_dir_all(&dir);
-        dir.join("state.json")
+        let path = dir.join("state.json");
+        (TmpDir(dir), path)
     }
 
     #[test]
@@ -144,7 +154,7 @@ mod tests {
 
     #[tokio::test]
     async fn persists_only_durable_watermark_at_end() {
-        let path = tmp_path("durable-end");
+        let (_tmp, path) = tmp_path("durable-end");
         let _ = fs::remove_file(&path);
         let backend = Box::new(LocalFileBackend::new(&path));
         let guard = backend.lock("p1").unwrap();
