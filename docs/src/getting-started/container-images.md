@@ -34,7 +34,8 @@ COPY pipeline.yaml /pipeline.yaml
 CMD ["run", "/pipeline.yaml"]
 ```
 
-That is a complete Postgres → Parquet image of about 30MB.
+That is a complete Postgres → Parquet image of about 35MB (the `postgres`
+package brings both its source and its destination).
 
 **At run time.** Mount a plugin directory and point `--plugin-dir` at it:
 
