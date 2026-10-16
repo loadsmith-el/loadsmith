@@ -75,7 +75,10 @@ Plugins live in their own repo,
 — standalone binaries (`loadsmith-source-postgres`, `loadsmith-destination-jsonl`,
 `loadsmith-destination-parquet`, `loadsmith-sink-local-copy`, …) installed on
 demand with `loadsmith plugin install <name>`. This repo is the **core + the SDK
-crates** those plugins build against. The official image is slim (core only).
+crates** those plugins build against. Releases ship static binaries and four
+image flavors, from a ~13MB distroless `-static` to a `-bundled` image with every
+canonical plugin (see
+[Container Images](docs/src/getting-started/container-images.md)).
 
 A **sink** is an optional delivery stage that separates *format* from *location*:
 the destination writes files (Parquet, CSV) to a local staging dir, and the sink

@@ -19,6 +19,7 @@
 # Getting Started
 
 - [Installation](./getting-started/installation.md)
+- [Container Images](./getting-started/container-images.md)
 - [Your First Pipeline](./getting-started/first-pipeline.md)
 - [Testing with loadsmith-lab](./getting-started/testing-with-lab.md)
 

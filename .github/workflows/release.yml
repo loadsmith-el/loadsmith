@@ -1,15 +1,25 @@
 name: Release
 
 # Tag the engine `vX.Y.Z` (matching crates/loadsmith-cli/Cargo.toml) and push the
-# tag — this builds the core NATIVELY for amd64 + arm64 (no QEMU), publishing
-# BOTH:
-#   - the slim image ghcr.io/loadsmith-el/loadsmith (tags: <tag>-slim, slim, sha-<sha>-slim)
-#   - a GitHub Release with per-arch binary archives + sha256
+# tag — this builds the core NATIVELY for amd64 + arm64 (no QEMU) as a static
+# musl binary, publishing BOTH:
+#   - the image ghcr.io/loadsmith-el/loadsmith in four flavors, all multi-arch
+#     and all from that one binary (see ci/runtime.Dockerfile):
+#       static, static-debug, slim, bundled
+#     each tagged <tag>-<flavor>, sha-<sha>-<flavor> and the rolling <flavor>;
+#     `latest` = slim;
+#   - a GitHub Release with per-arch binary archives + sha256.
+#
+# `bundled` carries every canonical plugin at the version the index lists as
+# latest when the release runs (resolved once, in `meta`, so both arches get the
+# same set); the list is in the image label `dev.loadsmith.plugins`. A plugin
+# release does not rebuild it — the next engine release picks it up.
 #
 # Release vs prerelease is decided by the tag, by semver: a clean `vX.Y.Z` is a
-# stable release (moves the rolling `:slim` tag); a `vX.Y.Z-<suffix>` (e.g.
-# `v0.1.0-pre`) is a prerelease — it publishes `:<tag>-slim` + `:sha-*-slim` but
-# does NOT move `:slim`, and the GitHub Release is marked --prerelease.
+# stable release (moves the rolling tags and `latest`); a `vX.Y.Z-<suffix>` (e.g.
+# `v0.1.0-pre`) is a prerelease — it publishes `:<tag>-<flavor>` +
+# `:sha-*-<flavor>` but moves no rolling tag, and the GitHub Release is marked
+# --prerelease.
 
 on:
   push:
@@ -17,6 +27,8 @@ on:
 
 env:
   IMAGE: ghcr.io/loadsmith-el/loadsmith
+  FLAVORS: static static-debug slim bundled
+  PLUGIN_INDEX: https://raw.githubusercontent.com/loadsmith-el/loadsmith-canonical-plugins/main/index.json
 
 jobs:
   meta:
@@ -24,8 +36,8 @@ jobs:
     outputs:
       version: ${{ steps.m.outputs.version }}
       prerelease: ${{ steps.m.outputs.prerelease }}
-      image_tag: ${{ steps.m.outputs.image_tag }}
       sha_short: ${{ steps.m.outputs.sha_short }}
+      plugins: ${{ steps.p.outputs.plugins }}
     steps:
       - uses: actions/checkout@v4
       - id: m
@@ -41,9 +53,18 @@ jobs:
           {
             echo "version=$version"
             echo "prerelease=$pre"
-            echo "image_tag=${tag}-slim"     # e.g. v0.1.0-slim / v0.1.0-pre-slim
             echo "sha_short=${GITHUB_SHA::7}"
           } >> "$GITHUB_OUTPUT"
+      - id: p
+        name: Snapshot the canonical plugin set for the bundled image
+        run: |
+          # "name@version" pairs, space-separated, sorted.
+          plugins=$(curl -fsSL "$PLUGIN_INDEX" | python3 -c 'import json, sys
+          idx = json.load(sys.stdin)["plugins"]
+          print(" ".join(n + "@" + p["latest"] for n, p in sorted(idx.items())))')
+          echo "plugins=$plugins"
+          test -n "$plugins"
+          echo "plugins=$plugins" >> "$GITHUB_OUTPUT"
 
   build:
     needs: meta
@@ -59,15 +80,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Compile inside rust:1-bookworm (Debian bookworm, glibc 2.36) so the binary
-      # links glibc <= 2.36 — it must run on debian:bookworm-slim (this image's
-      # runtime AND the lab's `--loadsmith <binary>` wrap). The native ubuntu-24.04
-      # runners would link glibc 2.39, which bookworm-slim cannot load. Native arch
-      # per runner — no QEMU.
-      - name: Build core (glibc-pinned, native ${{ matrix.arch }})
+      # Compile inside rust:1-alpine (host target *-unknown-linux-musl): the
+      # binary is fully static, so it runs on every image flavor, on any Linux
+      # host, and in the lab's `--loadsmith <binary>` wrap — no glibc floor.
+      # Native arch per runner — no QEMU.
+      - name: Build core (static musl, native ${{ matrix.arch }})
         run: |
-          docker run --rm -v "$PWD":/src -w /src rust:1-bookworm \
+          docker run --rm -u "$(id -u):$(id -g)" -e CARGO_HOME=/tmp/cargo \
+            -v "$PWD":/src -w /src rust:1-alpine \
             cargo build --release --bin loadsmith
+      - name: Check the binary is fully static
+        run: |
+          file target/release/loadsmith
+          if readelf -d target/release/loadsmith | grep -q NEEDED; then
+            echo "::error::loadsmith is dynamically linked"; exit 1
+          fi
 
       - name: Package release tarball
         run: |
@@ -84,9 +111,15 @@ jobs:
 
       - name: Assemble image build context
         run: |
-          mkdir -p ctx
+          mkdir -p ctx/plugins
           cp target/release/loadsmith ctx/loadsmith
           cp ci/runtime.Dockerfile ctx/Dockerfile
+          # The bundled flavor's plugins, installed by the binary just built
+          # (it runs natively here), pinned to the set resolved in `meta`.
+          for p in ${{ needs.meta.outputs.plugins }}; do
+            ./target/release/loadsmith plugin install "$p" --plugin-dir ctx/plugins
+          done
+          ls -la ctx/plugins
 
       - uses: docker/setup-buildx-action@v3
       - name: Log in to GHCR
@@ -95,22 +128,27 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build & push image by digest (${{ matrix.arch }})
-        id: push
-        uses: docker/build-push-action@v6
-        with:
-          context: ctx
-          platforms: linux/${{ matrix.arch }}
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-      - name: Export digest
+      - name: Build & push each flavor by digest (${{ matrix.arch }})
         run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.push.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"   # artifact filenames can't contain ':'
+          for f in $FLAVORS; do
+            docker buildx build ctx \
+              --platform "linux/${{ matrix.arch }}" \
+              --target "$f" \
+              --build-arg "PLUGINS=${{ needs.meta.outputs.plugins }}" \
+              --label "org.opencontainers.image.version=${{ needs.meta.outputs.version }}" \
+              --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+              --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+              --output "type=image,name=${IMAGE},push-by-digest=true,name-canonical=true,push=true" \
+              --metadata-file "meta-$f.json"
+            digest=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["containerimage.digest"])' "meta-$f.json")
+            echo "$f: $digest"
+            mkdir -p "/tmp/digests/$f"
+            touch "/tmp/digests/$f/${digest#sha256:}"   # artifact filenames can't contain ':'
+          done
       - uses: actions/upload-artifact@v4
         with:
-          name: digest-${{ matrix.arch }}
-          path: /tmp/digests/*
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/
           retention-days: 1
 
   release:
@@ -118,7 +156,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write          # create the GitHub Release
-      packages: write          # push the multi-arch manifest
+      packages: write          # push the multi-arch manifests
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -128,7 +166,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
-          pattern: digest-*
+          pattern: digests-*
           merge-multiple: true
 
       - uses: docker/setup-buildx-action@v3
@@ -138,24 +176,43 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Create multi-arch manifest
+      - name: Create the multi-arch manifests
         run: |
-          tags=( -t "${IMAGE}:${{ needs.meta.outputs.image_tag }}" \
-                 -t "${IMAGE}:sha-${{ needs.meta.outputs.sha_short }}-slim" )
-          if [ "${{ needs.meta.outputs.prerelease }}" = "false" ]; then
-            tags+=( -t "${IMAGE}:slim" )   # rolling tag only for stable releases
-          fi
-          refs=()
-          for d in /tmp/digests/*; do refs+=( "${IMAGE}@sha256:$(basename "$d")" ); done
-          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
-          docker buildx imagetools inspect "${IMAGE}:${{ needs.meta.outputs.image_tag }}"
+          for f in $FLAVORS; do
+            tags=( -t "${IMAGE}:${GITHUB_REF_NAME}-$f" \
+                   -t "${IMAGE}:sha-${{ needs.meta.outputs.sha_short }}-$f" )
+            if [ "${{ needs.meta.outputs.prerelease }}" = "false" ]; then
+              tags+=( -t "${IMAGE}:$f" )                      # rolling, stable only
+              [ "$f" = slim ] && tags+=( -t "${IMAGE}:latest" )
+            fi
+            refs=()
+            for d in "/tmp/digests/$f"/*; do refs+=( "${IMAGE}@sha256:$(basename "$d")" ); done
+            [ "${#refs[@]}" -eq 2 ] || { echo "::error::$f: expected 2 arch digests, got ${#refs[@]}"; exit 1; }
+            docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+            docker buildx imagetools inspect "${IMAGE}:${GITHUB_REF_NAME}-$f"
+          done
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="${GITHUB_REF_NAME}"
-          notes="Slim core image: \`docker pull ${IMAGE}:${{ needs.meta.outputs.image_tag }}\` (stable also \`${IMAGE}:slim\`). Linux amd64+arm64 binaries attached; plugins install on demand with \`loadsmith plugin install --all\`."
+          notes=$(cat <<EOF
+          Images (linux amd64+arm64), all from one static binary:
+
+          | flavor | pull | |
+          |---|---|---|
+          | static | \`${IMAGE}:${tag}-static\` | distroless/static, ~10MB |
+          | static-debug | \`${IMAGE}:${tag}-static-debug\` | + busybox shell |
+          | slim | \`${IMAGE}:${tag}-slim\` | debian:bookworm-slim |
+          | bundled | \`${IMAGE}:${tag}-bundled\` | slim + canonical plugins |
+
+          Stable releases also move the rolling \`:<flavor>\` tags and \`:latest\` (= slim).
+          Bundled plugins: ${{ needs.meta.outputs.plugins }}
+
+          The attached binaries are static (musl) and run on any Linux. Other flavors install plugins on demand: \`loadsmith plugin install --all\`.
+          EOF
+          )
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             # Re-run: refresh the assets in place rather than failing on "exists".
             gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber dist/*.tar.gz dist/*.sha256

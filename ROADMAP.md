@@ -19,6 +19,12 @@ What's shipped and what's queued next. Shipped items are documented in
       `ghcr.io/loadsmith-el/loadsmith` (`:slim`, `:vX.Y.Z-slim`) plus per-arch
       binary archives, from a `vX.Y.Z` tag by
       [`release.yml`](.github/workflows/release.yml) (`linux/amd64` + `linux/arm64` / Graviton)
+- [x] **Static musl builds + four image flavors** — the engine and every
+      canonical plugin are static musl binaries (with mimalloc), so one binary
+      per arch runs on any Linux. Each release publishes `-static`
+      (distroless, ~13MB), `-static-debug` (+ busybox), `-slim` (`:latest`) and
+      `-bundled` (slim + the canonical plugins at release time). See
+      [Container Images](docs/src/getting-started/container-images.md)
 - [x] **Incremental state & checkpoints** — core-owned watermark state with a
       pluggable backend (`local`, with locking for concurrent runs), source
       resume cursor + watermark reporting (`incremental_state`), and intra-run

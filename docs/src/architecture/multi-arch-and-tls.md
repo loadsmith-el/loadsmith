@@ -1,36 +1,42 @@
 # Multi-arch & TLS
 
-Loadsmith publishes a single release image for both `linux/amd64` and
-`linux/arm64` (AWS Graviton). That goal — **multi-arch first** — drives a
-dependency rule that is easy to misread as "no TLS." It is not. TLS is required
-(databases demand secure connections; the S3 sink will too). The real constraint
-is **no native/arch-specific code in the dependency tree**, and this page records
-how we satisfy both at once.
+Loadsmith publishes its release images (four flavors, see
+[Container Images](../getting-started/container-images.md)) and binaries for
+both `linux/amd64` and `linux/arm64` (AWS Graviton). That goal — **multi-arch
+first** — drives a dependency rule that is easy to misread as "no TLS." It is
+not. TLS is required (databases demand secure connections; the S3 sink will
+too). The real constraint is **no arch-specific native code in the dependency
+tree that needs its own toolchain**, and this page records how we satisfy both
+at once.
 
-## Why native code is the problem, not TLS
+## How the release is built
 
-The release image is built with:
+[`release.yml`](https://github.com/loadsmith-el/loadsmith/blob/main/.github/workflows/release.yml)
+compiles `loadsmith` natively on one runner per architecture (no QEMU), inside
+`rust:1-alpine`. Its host target is `*-unknown-linux-musl`, so a plain
+`cargo build --release` produces a fully static binary: no libc, no dynamic
+loader, nothing to match on the target system. The four image flavors wrap that
+same binary, and the canonical plugins are built the same way.
 
-```bash
-docker buildx build --platform linux/amd64,linux/arm64 -t loadsmith:<tag> .
-```
+Static musl retired the problem the earlier glibc builds had: a binary built on
+a newer distro linked newer glibc symbols and would not start on an older base
+image. The price is musl's memory allocator, which is slow under the many small
+allocations of Arrow batch handling, so the engine and every plugin set
+[mimalloc](https://github.com/microsoft/mimalloc) as the global allocator.
 
-against the [`Dockerfile`](https://github.com/loadsmith-el/loadsmith/blob/main/Dockerfile), which is a plain `cargo build
---release` inside a Debian base. There is no cross-compilation toolchain, no
-`--target`, no per-arch linker setup — each platform is built `cargo build`-native
-*inside* that architecture (under QEMU emulation for the non-host arch).
+## Why native code is still avoided
 
-Under that model, C/assembly crypto does not *fail* to compile — it compiles
-*natively under emulation*, which means:
+mimalloc is portable C that any `cc` compiles, so it costs nothing. Native
+*crypto* backends are a different matter:
 
-1. **Slow emulated C builds** — `cc`/`cmake`/`perl`/`nasm` running under QEMU can
-   inflate build time by an order of magnitude.
-2. **Fragile toolchains** — every native crypto backend drags in build-time
-   tooling (OpenSSL headers, `cmake`, NASM for some) that breaks the "needs no
+1. **Fragile toolchains** — they drag in build-time tooling (OpenSSL headers,
+   `cmake`, NASM for some) and per-arch assembly, which breaks the "needs no
    per-arch branches" promise.
+2. **Slow or brittle cross-builds** — anyone building an image for the other
+   arch locally (`docker buildx --platform`) compiles that C under QEMU
+   emulation, which can inflate build time by an order of magnitude.
 
-So the cost of native crypto is real even though it is not *impossible*. Avoiding
-it keeps the multi-arch build simple and fast.
+Avoiding them keeps every build, local or CI, simple and fast.
 
 ## Two layers, opposite risk profiles
 
@@ -107,7 +113,7 @@ make it work:
 | `tokio-postgres-rustls-improved` | 0.16 | Bridge (`MakeRustlsConnect`), `default-features = false` to drop `aws-lc-rs`; fixes SCRAM/SASL channel-binding bug vs the original crate |
 | `rustls-pemfile` | 2 | PEM parsing for root and client certificates |
 
-The **TLS spike gate** — cross-database handshakes against Postgres and MySQL, on
-both `linux/amd64` and `linux/arm64` under QEMU — remains to be executed before
-declaring the stack validated for all future source plugins. See the plan at
-`.claude/plans/planeja-para-a-gente-joyful-clarke.md`.
+The **TLS spike gate**, cross-database handshakes against Postgres, MySQL and
+Oracle, runs as the lab bundle `tls-spike` (`loadsmith-lab bundle run --select
+catalog/tls-spike`) and passes on `linux/amd64`. A run on `linux/arm64` is
+still to be done.

@@ -7,6 +7,17 @@
 - Linux (the core uses Linux-specific fd passing via `dup2`; macOS support is
   planned)
 
+## Prebuilt binaries and images
+
+Each [GitHub Release](https://github.com/loadsmith-el/loadsmith/releases) attaches
+static `linux/amd64` and `linux/arm64` binaries that run on any Linux
+distribution, and publishes the container images described in
+[Container Images](./container-images.md):
+
+```bash
+docker run --rm ghcr.io/loadsmith-el/loadsmith:latest --version
+```
+
 ## Build from source
 
 ```bash

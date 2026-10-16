@@ -154,6 +154,11 @@ struct PluginUninstallArgs {
     plugin_dir: Option<PathBuf>,
 }
 
+// mimalloc: release binaries are static musl, whose default allocator is slow
+// under the many small allocations of Arrow IPC framing.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();

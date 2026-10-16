@@ -64,7 +64,8 @@ cargo build
 `--loadsmith <path>` runs a local core — a project dir (built hermetically in
 Docker, as above) or a prebuilt binary. Without it, the lab uses a published
 image. You can likewise test a local plugin with
-`--plugin <binary|project>` (a project is built in a `rust:bookworm` container).
+`--plugin <binary|project>` (a plugin project is built as a static musl binary in a `rust:1-alpine`
+container, like a release).
 
 ## How a case is declared
 
