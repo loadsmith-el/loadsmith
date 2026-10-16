@@ -207,7 +207,12 @@ async fn cmd_run(args: RunArgs, color: bool) -> Result<()> {
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
 
-    run_pipeline(config, opts).await?;
+    let summary = run_pipeline(config, opts).await?;
+    // A pipeline that ran but failed (a plugin error, a failed delivery…) must
+    // exit non-zero, or schedulers and the lab read it as a success.
+    if summary.status == loadsmith_core::SummaryStatus::Error {
+        anyhow::bail!("pipeline '{}' failed (see the errors above)", summary.pipeline_name);
+    }
     Ok(())
 }
 

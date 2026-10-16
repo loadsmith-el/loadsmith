@@ -13,5 +13,5 @@ pub mod state_supervisor;
 pub mod summary;
 
 pub use runner::{run_pipeline, RunOpts};
-pub use summary::Summary;
+pub use summary::{Summary, SummaryStatus};
 pub use error::CoreError;

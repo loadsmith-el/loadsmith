@@ -109,9 +109,9 @@ async fn run_sink_inner<P: SinkPlugin>(plugin: &mut P) -> Result<()> {
         Ok(()) => writer.send(&Message::ConfigureAck(ConfigureAck::ok())).await?,
         Err(e) => {
             writer
-                .send(&Message::ConfigureAck(ConfigureAck::error("CONFIGURE_FAILED", e.to_string())))
+                .send(&Message::ConfigureAck(ConfigureAck::error("CONFIGURE_FAILED", format!("{e:#}"))))
                 .await?;
-            anyhow::bail!("configure rejected: {e}");
+            anyhow::bail!("configure rejected: {e:#}");
         }
     }
 
@@ -137,9 +137,9 @@ async fn run_sink_inner<P: SinkPlugin>(plugin: &mut P) -> Result<()> {
             Message::DeliverObject(d) => {
                 let path = PathBuf::from(&d.path);
                 if let Err(e) = plugin.deliver(path).await {
-                    events.error_msg(format!("deliver error for {}: {e}", d.path)).await;
+                    events.error_msg(format!("deliver error for {}: {e:#}", d.path)).await;
                     writer
-                        .send(&Message::Finished(Finished::error("DELIVER_FAILED", e.to_string())))
+                        .send(&Message::Finished(Finished::error("DELIVER_FAILED", format!("{e:#}"))))
                         .await?;
                     return Ok(());
                 }

@@ -80,9 +80,9 @@ async fn run_config_provider_inner<P: ConfigProviderPlugin>(plugin: &mut P) -> R
         Ok(()) => writer.send(&Message::ConfigureAck(ConfigureAck::ok())).await?,
         Err(e) => {
             writer
-                .send(&Message::ConfigureAck(ConfigureAck::error("CONFIGURE_FAILED", e.to_string())))
+                .send(&Message::ConfigureAck(ConfigureAck::error("CONFIGURE_FAILED", format!("{e:#}"))))
                 .await?;
-            anyhow::bail!("configure rejected: {e}");
+            anyhow::bail!("configure rejected: {e:#}");
         }
     }
 

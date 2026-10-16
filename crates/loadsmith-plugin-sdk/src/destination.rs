@@ -123,9 +123,9 @@ async fn run_destination_inner<P: DestinationPlugin>(plugin: &mut P) -> Result<(
         Ok(()) => writer.send(&Message::ConfigureAck(ConfigureAck::ok())).await?,
         Err(e) => {
             writer
-                .send(&Message::ConfigureAck(ConfigureAck::error("CONFIGURE_FAILED", e.to_string())))
+                .send(&Message::ConfigureAck(ConfigureAck::error("CONFIGURE_FAILED", format!("{e:#}"))))
                 .await?;
-            anyhow::bail!("configure rejected: {e}");
+            anyhow::bail!("configure rejected: {e:#}");
         }
     }
 
@@ -149,9 +149,9 @@ async fn run_destination_inner<P: DestinationPlugin>(plugin: &mut P) -> Result<(
             Ok(Some(batch)) => {
                 batches_total += 1;
                 if let Err(e) = plugin.write_batch(batch).await {
-                    events.error_msg(format!("write_batch error: {e}")).await;
+                    events.error_msg(format!("write_batch error: {e:#}")).await;
                     writer
-                        .send(&Message::Finished(Finished::error("WRITE_FAILED", e.to_string())))
+                        .send(&Message::Finished(Finished::error("WRITE_FAILED", format!("{e:#}"))))
                         .await?;
                     return Ok(());
                 }
@@ -172,7 +172,7 @@ async fn run_destination_inner<P: DestinationPlugin>(plugin: &mut P) -> Result<(
             Ok(None) => break,
             Err(e) => {
                 writer
-                    .send(&Message::Finished(Finished::error("IPC_READ_FAILED", e.to_string())))
+                    .send(&Message::Finished(Finished::error("IPC_READ_FAILED", format!("{e:#}"))))
                     .await?;
                 return Ok(());
             }

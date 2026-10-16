@@ -42,9 +42,8 @@ loadsmith run pipeline.yaml --no-color
 
 | Code | Meaning |
 |---|---|
-| `0` | Pipeline completed successfully |
-| `1` | Pipeline failed (source error, destination error, validation error) |
-| `2` | Configuration error (invalid YAML, missing plugin binary) |
+| `0` | Pipeline completed successfully (summary `Status: success`) |
+| `1` | Anything else: the pipeline ran and failed (`Status: error` — a source, destination or sink error), or it couldn't start (invalid YAML/config, missing plugin binary, protocol mismatch). The cause is printed to stderr |
 
 **Output:**
 

@@ -123,10 +123,10 @@ async fn run_source_inner<P: SourcePlugin>(plugin: &mut P) -> Result<()> {
             writer
                 .send(&Message::ConfigureAck(ConfigureAck::error(
                     "CONFIGURE_FAILED",
-                    e.to_string(),
+                    format!("{e:#}"),
                 )))
                 .await?;
-            anyhow::bail!("configure rejected: {e}");
+            anyhow::bail!("configure rejected: {e:#}");
         }
     }
 
@@ -169,9 +169,9 @@ async fn run_source_inner<P: SourcePlugin>(plugin: &mut P) -> Result<()> {
             }
             Ok(None) => break,
             Err(e) => {
-                events.error_msg(format!("batch error: {e}")).await;
+                events.error_msg(format!("batch error: {e:#}")).await;
                 writer
-                    .send(&Message::Finished(Finished::error("BATCH_FAILED", e.to_string())))
+                    .send(&Message::Finished(Finished::error("BATCH_FAILED", format!("{e:#}"))))
                     .await?;
                 return Ok(());
             }
