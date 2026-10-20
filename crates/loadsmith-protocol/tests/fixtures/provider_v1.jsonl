@@ -1,0 +1,9 @@
+{"type":"handshake_ack","protocol_supported_versions":[1],"plugin_name":"loadsmith-provider-file","plugin_version":"0.2.0","kind":"provider"}
+{"type":"capabilities_response","supports":["resolve"]}
+{"type":"start"}
+{"type":"ready"}
+{"type":"resolve","id":1,"ref":"db.json#password"}
+{"type":"resolved","id":1,"value":"s3cr3t"}
+{"type":"resolve","id":2,"ref":"missing.json"}
+{"type":"resolved","id":2,"error":{"code":"NOT_FOUND","message":"no such file: missing.json"}}
+{"type":"finished","status":"success"}

@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use loadsmith_protocol::PluginKind;
+
 use crate::error::CoreError;
 
 /// Default plugin directory.
@@ -14,13 +16,14 @@ fn dirs_home() -> PathBuf {
 }
 
 /// Resolves the binary path for a plugin by kind and type name.
-/// E.g. kind="source", plugin_type="postgres" → `<dir>/loadsmith-source-postgres`
+/// E.g. `Source` + `postgres` → `<dir>/loadsmith-source-postgres`,
+/// `Provider` + `file` → `<dir>/loadsmith-provider-file`.
 pub fn find_plugin_binary(
-    kind: &str,
+    kind: PluginKind,
     plugin_type: &str,
     plugin_dir: &Path,
 ) -> Result<PathBuf, CoreError> {
-    let name = format!("loadsmith-{kind}-{plugin_type}");
+    let name = kind.binary_name(plugin_type);
     let path = plugin_dir.join(&name);
     if path.exists() {
         return Ok(path);

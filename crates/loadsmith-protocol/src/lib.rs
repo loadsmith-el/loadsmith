@@ -48,6 +48,22 @@ pub enum Message {
     /// Feeds the core's delivery ledger so a crashed sink can resume.
     ObjectDelivered(ObjectDelivered),
 
+    // Parsing (raw source → core → parser)
+    /// Core → parser (control plane): parse the local file at this path. The
+    /// path comes from a raw source's `object_ready`. Idempotent per path.
+    ParseObject(ParseObject),
+    /// Parser → core (event plane, fd4): informational — a file was fully
+    /// parsed into Arrow batches.
+    ObjectParsed(ObjectParsed),
+
+    // Value resolution (core ↔ provider)
+    /// Core → provider (control plane): resolve one reference (the second
+    /// argument of a `secret()` template call).
+    Resolve(Resolve),
+    /// Provider → core (control plane): the answer to the `resolve` with the
+    /// same `id` — a value or an error, never both.
+    Resolved(Resolved),
+
     // Observability
     Log(LogEvent),
 
@@ -198,6 +214,80 @@ pub struct ObjectDelivered {
     pub path: String,
 }
 
+// ── Parsing ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParseObject {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectParsed {
+    pub path: String,
+    /// Rows parsed from this file.
+    pub rows: u64,
+    /// Arrow batches written to fd3 for this file.
+    pub batches: u64,
+    /// Global batch ordinal (1-based, as on `checkpoint`) of this file's last
+    /// batch; `0` when the file produced no batch.
+    pub last_batch_seq: u64,
+}
+
+// ── Value resolution ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Resolve {
+    /// Chosen by the core, unique within one provider conversation; echoed
+    /// back in `resolved`.
+    pub id: u64,
+    /// The provider-defined reference, opaque to the core (e.g.
+    /// `db.json#password`).
+    #[serde(rename = "ref")]
+    pub reference: String,
+}
+
+/// Body of `resolved`. Exactly one of `value` / `error` is set.
+///
+/// `Debug` never prints the value: a resolved value is a secret.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Resolved {
+    pub id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ResolveError>,
+}
+
+impl std::fmt::Debug for Resolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Resolved")
+            .field("id", &self.id)
+            .field("value", &self.value.as_ref().map(|_| "***"))
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveError {
+    pub code: String,
+    pub message: String,
+}
+
+impl Resolved {
+    pub fn value(id: u64, value: impl Into<String>) -> Self {
+        Self { id, value: Some(value.into()), error: None }
+    }
+
+    pub fn error(id: u64, code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            id,
+            value: None,
+            error: Some(ResolveError { code: code.into(), message: message.into() }),
+        }
+    }
+}
+
 // ── Log event ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,14 +376,90 @@ pub enum FinishedStatus {
 
 // ── Plugin kind ───────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginKind {
     Source,
     Destination,
     Sink,
     Parser,
-    ConfigProvider,
+    Provider,
+}
+
+/// Every kind's user-facing name, in [`PluginKind::ALL`] order. The same
+/// spelling is used on the wire (`handshake_ack.kind`), in binary names
+/// (`loadsmith-<kind>-<type>`), in plugin manifests, on the command line and
+/// in log labels.
+pub const PLUGIN_KIND_NAMES: [&str; 5] = [
+    PluginKind::Source.as_str(),
+    PluginKind::Destination.as_str(),
+    PluginKind::Sink.as_str(),
+    PluginKind::Parser.as_str(),
+    PluginKind::Provider.as_str(),
+];
+
+impl PluginKind {
+    pub const ALL: [PluginKind; 5] = [
+        PluginKind::Source,
+        PluginKind::Destination,
+        PluginKind::Sink,
+        PluginKind::Parser,
+        PluginKind::Provider,
+    ];
+
+    /// The kind's one spelling: wire, binary prefix, manifest, CLI, logs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PluginKind::Source => "source",
+            PluginKind::Destination => "destination",
+            PluginKind::Sink => "sink",
+            PluginKind::Parser => "parser",
+            PluginKind::Provider => "provider",
+        }
+    }
+
+    /// The kind spelled `name` (as [`as_str`](Self::as_str) spells it).
+    pub fn from_name(name: &str) -> Option<PluginKind> {
+        PluginKind::ALL.into_iter().find(|k| k.as_str() == name)
+    }
+
+    /// The binary that implements `plugin_type` for this kind, e.g.
+    /// `loadsmith-provider-file`.
+    pub fn binary_name(self, plugin_type: &str) -> String {
+        format!("loadsmith-{}-{plugin_type}", self.as_str())
+    }
+}
+
+impl std::fmt::Display for PluginKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ── Capability names ──────────────────────────────────────────────────────────
+
+/// Capability names (`capabilities_response.supports`) with a defined
+/// meaning. The core gates features on some of them; unknown names are
+/// ignored.
+pub mod capabilities {
+    /// Source: streams Arrow batches on fd3 (informational).
+    pub const BATCH_READ: &str = "batch_read";
+    /// Destination: reads Arrow batches from fd3 (informational).
+    pub const BATCH_WRITE: &str = "batch_write";
+    /// Source: accepts a resume cursor and reports watermarks. Required by a
+    /// `state:` block.
+    pub const INCREMENTAL_STATE: &str = "incremental_state";
+    /// Destination: stages files and announces each with `object_ready`
+    /// (required to attach a sink). Source: a *raw* source — it produces
+    /// files instead of Arrow and announces each with `object_ready`
+    /// (requires a `parser:`).
+    pub const OBJECT_OUTPUT: &str = "object_output";
+    /// Sink: delivers staged files (`deliver_object`).
+    pub const OBJECT_DELIVERY: &str = "object_delivery";
+    /// Parser: turns files (`parse_object`) into Arrow batches on fd3.
+    pub const PARSE: &str = "parse";
+    /// Provider: answers `resolve` with `resolved`.
+    pub const RESOLVE: &str = "resolve";
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -313,6 +479,19 @@ impl ConfigureAck {
 }
 
 impl Finished {
+    /// `finished{success}` without counters (a provider).
+    pub fn success() -> Self {
+        Self {
+            status: FinishedStatus::Success,
+            rows_read: None,
+            batches_read: None,
+            rows_written: None,
+            batches_written: None,
+            code: None,
+            message: None,
+        }
+    }
+
     pub fn success_source(rows: u64, batches: u64) -> Self {
         Self {
             status: FinishedStatus::Success,
@@ -626,6 +805,47 @@ mod tests {
         } else {
             panic!("wrong variant");
         }
+    }
+
+    #[test]
+    fn kind_names_are_the_wire_names() {
+        for kind in PluginKind::ALL {
+            let wire = serde_json::to_string(&kind).unwrap();
+            assert_eq!(wire, format!("\"{}\"", kind.as_str()));
+            assert_eq!(PluginKind::from_name(kind.as_str()), Some(kind));
+            assert_eq!(kind.to_string(), kind.as_str());
+        }
+        assert_eq!(PLUGIN_KIND_NAMES, PluginKind::ALL.map(PluginKind::as_str));
+        assert_eq!(PluginKind::Provider.binary_name("file"), "loadsmith-provider-file");
+        assert_eq!(PluginKind::from_name("config_provider"), None);
+    }
+
+    #[test]
+    fn resolve_roundtrip() {
+        let msg = Message::Resolve(Resolve { id: 3, reference: "db.json#password".into() });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(json, r#"{"type":"resolve","id":3,"ref":"db.json#password"}"#);
+        let Message::Resolve(r) = roundtrip(&msg) else { panic!("wrong variant") };
+        assert_eq!((r.id, r.reference.as_str()), (3, "db.json#password"));
+    }
+
+    #[test]
+    fn resolved_forms_roundtrip() {
+        let ok = Message::Resolved(Resolved::value(1, "s3cr3t"));
+        assert_eq!(
+            serde_json::to_string(&ok).unwrap(),
+            r#"{"type":"resolved","id":1,"value":"s3cr3t"}"#
+        );
+        let err = Message::Resolved(Resolved::error(2, "NOT_FOUND", "no such key"));
+        let Message::Resolved(r) = roundtrip(&err) else { panic!("wrong variant") };
+        assert!(r.value.is_none());
+        assert_eq!(r.error.unwrap().code, "NOT_FOUND");
+    }
+
+    #[test]
+    fn resolved_debug_never_shows_the_value() {
+        let shown = format!("{:?}", Message::Resolved(Resolved::value(1, "hunter22")));
+        assert!(!shown.contains("hunter22"), "{shown}");
     }
 
     #[test]

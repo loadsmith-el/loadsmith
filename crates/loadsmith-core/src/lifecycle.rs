@@ -69,7 +69,7 @@ pub async fn run_handshake_and_configure(
             label,
             error_codes::WRONG_PLUGIN_KIND,
             CoreError::PluginIncompatible(format!(
-                "{plugin_name}: expected plugin kind {expected_kind:?}, got {kind:?}"
+                "{plugin_name}: expected plugin kind {expected_kind}, got {kind}"
             )),
         ));
     }

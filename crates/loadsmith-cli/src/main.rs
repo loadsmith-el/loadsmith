@@ -136,7 +136,7 @@ struct PluginInstallArgs {
     name: Option<String>,
 
     /// Install only this plugin kind from the package
-    /// (source|destination|sink|parser|config-provider). Alternative to the
+    /// (source|destination|sink|parser|provider). Alternative to the
     /// `<name>:<kind>` spec suffix.
     #[arg(long, conflicts_with_all = ["manifest", "binary", "all"])]
     kind: Option<String>,

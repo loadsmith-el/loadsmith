@@ -30,10 +30,12 @@ use serde::Deserialize;
 pub const API_VERSION: &str = "loadsmith.dev/plugin/v1";
 
 /// Plugin kinds, matching the core's `loadsmith-{kind}-{type}` discovery
-/// convention. `kind` in a manifest is validated against this set; `bin` is the
+/// convention (the protocol crate owns the spelling, see
+/// [`loadsmith_protocol::PluginKind::as_str`]). `kind` in a manifest is
+/// validated against this set; `bin` is the
 /// authoritative binary filename (so the manifest, not a derivation, decides
 /// what gets installed).
-pub const KNOWN_KINDS: &[&str] = &["source", "destination", "sink", "parser", "config-provider"];
+pub const KNOWN_KINDS: &[&str] = &loadsmith_protocol::PLUGIN_KIND_NAMES;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
@@ -293,6 +295,15 @@ runtime:
             PluginManifest::parse(&s),
             Err(ManifestError::UnknownKind { .. })
         ));
+    }
+
+    #[test]
+    fn provider_is_the_provider_kind() {
+        let s = OK
+            .replace("kind: source,      bin: loadsmith-source-postgres", "kind: provider, bin: loadsmith-provider-postgres");
+        assert!(PluginManifest::parse(&s).is_ok(), "{s}");
+        let old = OK.replace("kind: source,", "kind: config-provider,");
+        assert!(matches!(PluginManifest::parse(&old), Err(ManifestError::UnknownKind { .. })));
     }
 
     #[test]

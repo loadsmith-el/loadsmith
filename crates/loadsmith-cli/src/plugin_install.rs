@@ -321,7 +321,7 @@ mod tests {
             parse_install_spec("mysql:source@0.1.0").unwrap(),
             ("mysql".into(), Some("source".into()), Some("0.1.0".into()))
         );
-        // local-copy / config-provider are valid kinds with hyphens in the name.
+        // A hyphenated package name (local-copy) still splits on the colon.
         assert_eq!(
             parse_install_spec("local-copy:sink").unwrap(),
             ("local-copy".into(), Some("sink".into()), None)

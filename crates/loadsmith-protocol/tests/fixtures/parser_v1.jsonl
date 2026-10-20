@@ -1,0 +1,13 @@
+{"type":"handshake_ack","protocol_supported_versions":[1],"plugin_name":"loadsmith-parser-csv","plugin_version":"0.1.0","kind":"parser"}
+{"type":"capabilities_response","supports":["parse"]}
+{"type":"capabilities_response","supports":["object_output"]}
+{"type":"start"}
+{"type":"ready"}
+{"type":"object_ready","path":"/mnt/s3/inbox/2026-10-01.csv"}
+{"type":"parse_object","path":"/mnt/s3/inbox/2026-10-01.csv"}
+{"type":"schema","fields":[{"name":"id","type":"int64","nullable":false},{"name":"name","type":"utf8","nullable":true}]}
+{"type":"progress","rows_read":1000,"batches_read":1}
+{"type":"object_parsed","path":"/mnt/s3/inbox/2026-10-01.csv","rows":1500,"batches":2,"last_batch_seq":2}
+{"type":"object_parsed","path":"/mnt/s3/inbox/empty.csv","rows":0,"batches":0,"last_batch_seq":0}
+{"type":"finished","status":"success","rows_read":1500,"batches_read":2}
+{"type":"finished","status":"error","code":"SCHEMA_MISMATCH","message":"b.csv: column 2 is int64, the stream has utf8"}

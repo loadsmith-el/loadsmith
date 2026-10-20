@@ -90,12 +90,12 @@ pub async fn run_sink_supervisor(
         let event_task = tokio::spawn(async move {
             drain_events(
                 loadsmith_transport::ControlReader::new(BufReader::new(event)),
-                "sink",
+                PluginKind::Sink.as_str(),
                 crate::events::EventForward::default(),
             )
             .await;
         });
-        let mut peer = Peer::new("sink", sp);
+        let mut peer = Peer::new(PluginKind::Sink.as_str(), sp);
 
         let setup = async {
             let info = run_handshake_and_configure(

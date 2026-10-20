@@ -159,13 +159,13 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         );
     }
 
-    let source_bin = find_plugin_binary("source", &config.source.plugin_type, &opts.plugin_dir)?;
+    let source_bin = find_plugin_binary(PluginKind::Source, &config.source.plugin_type, &opts.plugin_dir)?;
     facts.update(|f| f.source.path = Some(source_bin.clone()));
     let dest_bin =
-        find_plugin_binary("destination", &config.destination.plugin_type, &opts.plugin_dir)?;
+        find_plugin_binary(PluginKind::Destination, &config.destination.plugin_type, &opts.plugin_dir)?;
     facts.update(|f| f.destination.path = Some(dest_bin.clone()));
     let sink_bin = match &config.sink {
-        Some(s) => Some(find_plugin_binary("sink", &s.plugin_type, &opts.plugin_dir)?),
+        Some(s) => Some(find_plugin_binary(PluginKind::Sink, &s.plugin_type, &opts.plugin_dir)?),
         None => None,
     };
     facts.update(|f| f.sink.path = sink_bin.clone());
@@ -245,8 +245,8 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         .await;
     });
 
-    let mut src = Peer::new("source", src_sp);
-    let mut dst = Peer::new("destination", dst_sp);
+    let mut src = Peer::new(PluginKind::Source.as_str(), src_sp);
+    let mut dst = Peer::new(PluginKind::Destination.as_str(), dst_sp);
 
     // Read the header of the source's Arrow IPC stream (its exact schema) on
     // a blocking thread. It only completes once the source writes it, right

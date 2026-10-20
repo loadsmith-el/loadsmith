@@ -1203,6 +1203,7 @@ dependencies = [
 name = "loadsmith-plugin-manifest"
 version = "0.1.0"
 dependencies = [
+ "loadsmith-protocol",
  "semver",
  "serde",
  "serde_json",
