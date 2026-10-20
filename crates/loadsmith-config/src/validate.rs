@@ -1,7 +1,22 @@
 use crate::{error::ConfigError, model::PipelineConfig};
 
+/// Whether `s` holds a `{{ }}` template (so its value is only known after
+/// resolution).
+fn templated(s: &str) -> bool {
+    s.contains("{{")
+}
+
+/// Whether `name` is a valid provider instance name: ASCII letters, digits,
+/// `_` and `-`.
+pub fn valid_instance_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// Validates the core-owned fields of a PipelineConfig.
 /// Plugin-specific config is validated by the plugin itself via configure_ack.
+///
+/// Works on resolved and unresolved configs alike: a check that depends on a
+/// value is skipped while that value is still a template.
 pub fn validate_pipeline(config: &PipelineConfig) -> Result<(), ConfigError> {
     if config.pipeline.name.trim().is_empty() {
         return Err(ConfigError::Validation("pipeline.name must not be empty".into()));
@@ -21,11 +36,34 @@ pub fn validate_pipeline(config: &PipelineConfig) -> Result<(), ConfigError> {
             return Err(ConfigError::Validation("sink.type must not be empty".into()));
         }
     }
+    if let Some(parser) = &config.parser {
+        if parser.plugin_type.trim().is_empty() {
+            return Err(ConfigError::Validation("parser.type must not be empty".into()));
+        }
+        if config.state.is_some() {
+            return Err(ConfigError::Validation(
+                "a parser: cannot be combined with a state: block (incremental loads through a \
+                 parser are not supported yet)"
+                    .into(),
+            ));
+        }
+    }
+    for (name, provider) in &config.providers {
+        if !valid_instance_name(name) {
+            return Err(ConfigError::Validation(format!(
+                "invalid provider instance name '{name}' under providers: (use letters, digits, \
+                 '_' and '-')"
+            )));
+        }
+        if provider.plugin_type.trim().is_empty() {
+            return Err(ConfigError::Validation(format!("providers.{name}.type must not be empty")));
+        }
+    }
     if let Some(state) = &config.state {
         if state.backend.trim().is_empty() {
             return Err(ConfigError::Validation("state.backend must not be empty".into()));
         }
-        if state.backend != "local" {
+        if state.backend != "local" && !templated(&state.backend) {
             return Err(ConfigError::Validation(format!(
                 "unsupported state.backend '{}' (only 'local' is available)",
                 state.backend
@@ -37,4 +75,3 @@ pub fn validate_pipeline(config: &PipelineConfig) -> Result<(), ConfigError> {
     }
     Ok(())
 }
-

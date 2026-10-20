@@ -1,10 +1,22 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     pub pipeline: PipelineMeta,
+    /// Provider instances, by name: each resolves the `secret('<name>', …)`
+    /// template calls that name it. Only the instances a `secret()` call
+    /// references are started.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, ProviderRef>,
     pub source: PluginRef,
+    /// Optional parsing stage between a raw source (one advertising
+    /// `object_output`: it produces files, not Arrow) and the destination.
+    /// Accepted by the config model; the core does not drive parsers yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parser: Option<PluginRef>,
     pub destination: PluginRef,
     /// Optional delivery stage. Only valid for file-output destinations (those
     /// advertising the `object_output` capability) — the core enforces that at
@@ -130,6 +142,33 @@ pub struct PluginRef {
     pub plugin_type: String,
     #[serde(default)]
     pub config: serde_yaml::Value,
+}
+
+/// How long the core waits for one provider instance by default: from its
+/// spawn to its `finished`, every reference included.
+pub const DEFAULT_PROVIDER_TIMEOUT_SECONDS: u64 = 60;
+
+/// A provider instance (`providers.<name>`): a plugin of kind `provider`
+/// (binary `loadsmith-provider-<type>`) with its opaque config. Its config
+/// may use `env()`/`file()` but never `secret()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRef {
+    #[serde(rename = "type")]
+    pub plugin_type: String,
+    #[serde(default)]
+    pub config: serde_yaml::Value,
+    /// The instance's whole budget, from spawn to `finished`. Defaults to
+    /// [`DEFAULT_PROVIDER_TIMEOUT_SECONDS`]; `0` disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
+}
+
+impl ProviderRef {
+    /// The effective timeout (`None` when disabled).
+    pub fn timeout(&self) -> Option<std::time::Duration> {
+        Timeouts::limit(self.timeout_seconds.unwrap_or(DEFAULT_PROVIDER_TIMEOUT_SECONDS))
+    }
 }
 
 /// Core-owned state block. Enables incremental loads: the core persists the

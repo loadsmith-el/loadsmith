@@ -1,18 +1,23 @@
-use crate::{error::ConfigError, mask::MaskList, model::PipelineConfig, template::resolve_value};
+use crate::{
+    document::Document, error::ConfigError, mask::MaskList, model::PipelineConfig,
+    template::SecretValues,
+};
 
-/// Parses a YAML pipeline config string, resolves templates, and returns
-/// the typed config along with a MaskList of resolved secret values.
+/// Parses a YAML pipeline config string, resolves its `env()`/`file()`
+/// templates, and returns the typed config along with a MaskList of the
+/// resolved values.
+///
+/// A file with `secret()` calls is rejected: those need provider plugins,
+/// which only the engine can run (`loadsmith_core::load`).
 pub fn parse_pipeline_yaml(content: &str) -> Result<(PipelineConfig, MaskList), ConfigError> {
-    // First pass: parse raw YAML into a Value so we can run template resolution
-    // before deserializing into the typed struct.
-    let raw: serde_yaml::Value = serde_yaml::from_str(content)?;
-
-    let mut mask = MaskList::new();
-    let resolved = resolve_value(raw, &mut mask)?;
-
-    // Second pass: deserialize the resolved Value into PipelineConfig.
-    let config: PipelineConfig = serde_yaml::from_value(resolved)?;
-
+    let doc = Document::parse(content)?;
+    if let Some(first) = doc.secrets().first() {
+        return Err(ConfigError::Template(format!(
+            "{first} needs provider resolution, which is not available here"
+        )));
+    }
+    let mask = MaskList::new();
+    let config = doc.resolve(&SecretValues::new(), &mask)?;
     Ok((config, mask))
 }
 
