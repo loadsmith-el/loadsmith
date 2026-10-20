@@ -86,6 +86,13 @@ What's shipped and what's queued next. Shipped items are documented in
       or release change — the package is the index key and `kind` filters
       `provides` (the manifest already carries a `kind` per binary). `uninstall`
       takes the same `:<kind>` selector.
+- [x] **End-to-end "build an EL" guide** —
+      [Build an EL, End to End](docs/src/getting-started/build-an-el.md): one
+      narrative from a `pipeline.yaml` (incremental postgres → jsonl, secrets via
+      `{{ env() }}`), to a pinned multi-arch image on the slim core with only the
+      needed plugins (`loadsmith plugin install`), to testing that image with a
+      loadsmith-lab case in a local origin. Verified end to end against the
+      v0.2.0 images. The Custom image builder (below) is its future shortcut.
 
 ## Planned
 
@@ -127,8 +134,3 @@ What's shipped and what's queued next. Shipped items are documented in
       DockerHub, …). Lowers the friction of going from "official slim image" to
       "my production image" — the project is loadsmith *plus* its tooling, and
       adoption hinges on how easy that whole loop is.
-- [ ] **End-to-end "build an EL" guide** — one narrative from a `pipeline.yaml`
-      (source → destination), to a runnable image with the needed plugins
-      installed on the slim core (`loadsmith plugin install`), to testing it with
-      loadsmith-lab. The getting-started-for-a-real-pipeline doc; pairs with the
-      Custom image builder above.

@@ -29,11 +29,17 @@ shell:
 
 ```dockerfile
 FROM ghcr.io/loadsmith-el/loadsmith:v0.2.0-static
-RUN ["loadsmith", "plugin", "install", "postgres"]
-RUN ["loadsmith", "plugin", "install", "parquet"]
+RUN ["loadsmith", "plugin", "install", "postgres", "--plugin-dir", "/usr/local/bin"]
+RUN ["loadsmith", "plugin", "install", "parquet", "--plugin-dir", "/usr/local/bin"]
 COPY pipeline.yaml /pipeline.yaml
 CMD ["run", "/pipeline.yaml"]
 ```
+
+Installing into `/usr/local/bin` (as the `-bundled` image does) keeps the
+plugins visible to any user: the core falls back to `PATH`. The default plugin
+dir is `$HOME/.loadsmith/plugins`, which at build time is `/root/...` — a
+container started with `--user` or Kubernetes `runAsNonRoot` would not find
+plugins installed there.
 
 That is a complete Postgres → Parquet image of about 35MB (the `postgres`
 package brings both its source and its destination).

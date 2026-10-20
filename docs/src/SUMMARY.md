@@ -21,6 +21,7 @@
 - [Installation](./getting-started/installation.md)
 - [Container Images](./getting-started/container-images.md)
 - [Your First Pipeline](./getting-started/first-pipeline.md)
+- [Build an EL, End to End](./getting-started/build-an-el.md)
 - [Testing with loadsmith-lab](./getting-started/testing-with-lab.md)
 
 # Writing Plugins
