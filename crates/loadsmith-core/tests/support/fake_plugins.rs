@@ -9,6 +9,9 @@
 //!   (crash, fail, hang, slow down) comes from their pipeline `config`. They
 //!   append what happened to them (`prepare`, `batch N`, `finalize`,
 //!   `cancel`, …) to the `journal` file named in their config.
+//! - `provider-fake` is an SDK provider: it resolves references from its
+//!   `values` config and can fail, hang, crash or leak a value into its logs
+//!   (see [`FakeProvider`]).
 //! - `source-<scenario>` for the scenarios in [`RAW_SOURCES`] are hand-rolled
 //!   protocol speakers that misbehave on the wire in ways the SDK never would
 //!   (malformed lines, unknown message types, ignoring `cancel`/`resend`).
@@ -24,7 +27,7 @@ use anyhow::Result;
 use arrow_array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use async_trait::async_trait;
-use loadsmith_plugin_sdk::{DestinationPlugin, SourcePlugin};
+use loadsmith_plugin_sdk::{DestinationPlugin, ProviderPlugin, ResolveFailure, SourcePlugin};
 use loadsmith_protocol::{
     CapabilitiesResponse, ConfigureAck, Finished, HandshakeAck, Message, PluginKind,
 };
@@ -38,7 +41,11 @@ pub fn install(dir: &Path) -> PathBuf {
     let plugins = dir.join("plugins");
     std::fs::create_dir_all(&plugins).unwrap();
     let exe = std::env::current_exe().unwrap();
-    let mut names = vec!["loadsmith-source-fake".to_string(), "loadsmith-destination-fake".to_string()];
+    let mut names = vec![
+        "loadsmith-source-fake".to_string(),
+        "loadsmith-destination-fake".to_string(),
+        "loadsmith-provider-fake".to_string(),
+    ];
     names.extend(RAW_SOURCES.iter().map(|s| format!("loadsmith-source-{s}")));
     for name in names {
         let link = plugins.join(name);
@@ -59,6 +66,7 @@ pub fn run_as_plugin_if_invoked() {
         "destination-fake" => {
             rt().block_on(loadsmith_plugin_sdk::run_destination(FakeDestination::default()))
         }
+        "provider-fake" => rt().block_on(loadsmith_plugin_sdk::run_provider(FakeProvider::default())),
         other => match other.strip_prefix("source-") {
             Some(scenario) if RAW_SOURCES.contains(&scenario) => raw_source(scenario),
             _ => {}
@@ -126,6 +134,78 @@ impl FakeSource {
     fn wide(&self) -> bool {
         self.config.get("wide").and_then(|v| v.as_bool()) == Some(true)
     }
+
+    /// `leak: true`: log the whole config (a `password` included) on fd4,
+    /// and put the password in a `fail_after` error — a careless plugin.
+    fn leaks(&self) -> bool {
+        self.config.get("leak").and_then(|v| v.as_bool()) == Some(true)
+    }
+}
+
+/// Writes one `log` event straight to fd4, as a careless plugin would.
+fn leak_log(message: &str) {
+    let line = serde_json::to_string(&Message::Log(loadsmith_protocol::LogEvent {
+        level: loadsmith_protocol::LogLevel::Error,
+        message: message.to_string(),
+    }))
+    .unwrap();
+    // The SDK owns fd4; borrow it without closing it.
+    let mut fd4 = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(4) });
+    let _ = writeln!(fd4, "{line}");
+}
+
+// ── SDK provider ──────────────────────────────────────────────────────────────
+
+/// Config: `journal`; `values` (reference → value); `errors` (references
+/// answered with a `NOT_FOUND` resolved error; so is any reference missing
+/// from `values`); `hang: true` (never answers a `resolve`), `crash: true`
+/// (exits 44 on the first `resolve`), `reject: true` (rejects its config);
+/// `leak: true` (logs every value it resolves on fd4).
+#[derive(Default)]
+pub struct FakeProvider {
+    config: serde_json::Value,
+    journal: Option<PathBuf>,
+}
+
+#[async_trait]
+impl ProviderPlugin for FakeProvider {
+    fn plugin_name(&self) -> &str {
+        "fake-provider"
+    }
+    fn plugin_version(&self) -> &str {
+        "0.0.0"
+    }
+    async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
+        self.journal = config.get("journal").and_then(|v| v.as_str()).map(PathBuf::from);
+        note(&self.journal, "configure");
+        anyhow::ensure!(config.get("reject").is_none(), "fake provider rejects this config");
+        self.config = config;
+        Ok(())
+    }
+    async fn resolve(&mut self, reference: &str) -> Result<String> {
+        note(&self.journal, &format!("resolve {reference}"));
+        let flag = |k: &str| self.config.get(k).and_then(|v| v.as_bool()) == Some(true);
+        if flag("hang") {
+            std::future::pending::<()>().await;
+        }
+        if flag("crash") {
+            note(&self.journal, "crash");
+            std::process::exit(44);
+        }
+        let listed_error = self.config["errors"].as_array().is_some_and(|e| e.iter().any(|r| r == reference));
+        match self.config["values"].get(reference).and_then(|v| v.as_str()) {
+            Some(value) if !listed_error => {
+                if flag("leak") {
+                    leak_log(&format!("resolved {reference} to {value}"));
+                }
+                Ok(value.to_string())
+            }
+            _ => Err(ResolveFailure::new("NOT_FOUND", format!("fake provider has no '{reference}'")).into()),
+        }
+    }
+    async fn cancel(&mut self) {
+        note(&self.journal, "cancel");
+    }
 }
 
 #[async_trait]
@@ -143,6 +223,13 @@ impl SourcePlugin for FakeSource {
         self.journal = config.get("journal").and_then(|v| v.as_str()).map(PathBuf::from);
         self.config = config;
         note(&self.journal, "configure");
+        if let Some(pw) = self.config.get("password").and_then(|v| v.as_str()) {
+            // The journal is a file, not output: it proves what arrived.
+            note(&self.journal, &format!("password={pw}"));
+        }
+        if self.leaks() {
+            leak_log(&format!("configured with {}", self.config));
+        }
         Ok(())
     }
     async fn schema(&mut self) -> Result<Schema> {
@@ -159,6 +246,9 @@ impl SourcePlugin for FakeSource {
             std::process::exit(42);
         }
         if opt_u64(&self.config, "fail_after") == Some(n) {
+            if self.leaks() {
+                anyhow::bail!("fake source failure after {n} batches (password {})", self.config["password"]);
+            }
             anyhow::bail!("fake source failure after {n} batches");
         }
         if opt_u64(&self.config, "hang_after") == Some(n) {

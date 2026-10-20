@@ -34,3 +34,8 @@ loadsmith-plugin-sdk = { path = "../loadsmith-plugin-sdk" }
 [[test]]
 name    = "abort"
 harness = false
+
+# End-to-end provider resolution tests (same fake-plugin trick).
+[[test]]
+name    = "providers"
+harness = false

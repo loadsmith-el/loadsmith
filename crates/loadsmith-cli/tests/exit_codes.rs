@@ -33,6 +33,10 @@ fn main() {
         ("json_summary_when_cancelled", json_summary_when_cancelled),
         ("json_summary_for_a_dry_run", json_summary_for_a_dry_run),
         ("output_json_conflicts_with_print_resolved_config", output_json_conflicts_with_print_resolved_config),
+        ("provider_secret_never_appears_in_output", provider_secret_never_appears_in_output),
+        ("provider_failures_exit_3_and_4", provider_failures_exit_3_and_4),
+        ("validate_is_static_unless_resolve", validate_is_static_unless_resolve),
+        ("state_commands_start_no_provider", state_commands_start_no_provider),
     ];
     let filter: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
     let mut failed = Vec::new();
@@ -78,6 +82,12 @@ impl Env {
 
     fn write_pipeline(&self, yaml: &str) -> PathBuf {
         let path = self.scratch.path("pipeline.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        path
+    }
+
+    fn write_named(&self, name: &str, yaml: &str) -> PathBuf {
+        let path = self.scratch.path(name);
         std::fs::write(&path, yaml).unwrap();
         path
     }
@@ -458,4 +468,177 @@ fn output_json_conflicts_with_print_resolved_config() {
     let (code, out) =
         exit_code(env.run(&pipeline).args(["--output", "json", "--print-resolved-config"]));
     assert_eq!(code, 2, "{out}");
+}
+
+// ── Providers ─────────────────────────────────────────────────────────────────
+
+/// A value with a long second line, as a PEM key would have.
+const SECRET: &str = "Sup3r-S3cret-Value\nsecond-line-of-the-key";
+
+impl Env {
+    /// The fake source with `password` (and `extra`) from `secret()`, and a
+    /// `creds` instance of the fake provider configured with `provider`.
+    fn with_provider(&self, source: serde_json::Value, provider: serde_json::Value, extra_top: &str) -> PathBuf {
+        let mut src = json!({
+            "journal": self.journal_path("source"),
+            "password": "{{ secret('creds', 'db#pw') }}",
+        });
+        if let (Some(s), serde_json::Value::Object(e)) = (src.as_object_mut(), source) {
+            s.extend(e);
+        }
+        let mut prov = json!({ "journal": self.journal_path("creds") });
+        if let (Some(p), serde_json::Value::Object(e)) = (prov.as_object_mut(), provider) {
+            p.extend(e);
+        }
+        self.write_pipeline(&pipeline_yaml(
+            "cli",
+            "fake",
+            src,
+            json!({ "journal": self.journal_path("destination") }),
+            &timeouts(""),
+            &format!("providers:\n  creds:\n    type: fake\n    config: {prov}\n{extra_top}"),
+        ))
+    }
+}
+
+#[track_caller]
+fn assert_no_secret(what: &str, text: &str) {
+    for part in SECRET.lines().chain([SECRET]) {
+        assert!(!text.contains(part), "{what} leaks {part:?}:\n{text}");
+    }
+}
+
+fn provider_secret_never_appears_in_output() {
+    let env = Env::new("prov-mask");
+    // Both the source and the provider log the value on fd4; the source
+    // also puts it in its failure message.
+    let leaky = json!({ "values": { "db#pw": SECRET }, "leak": true });
+    let ok = env.with_provider(json!({ "leak": true }), leaky.clone(), "");
+    let file = env.scratch.path("summary.json");
+    let out = env
+        .run(&ok)
+        .args(["--log-level", "debug", "--summary-file"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert_no_secret("stdout", &stdout);
+    assert_no_secret("stderr", &stderr);
+    assert!(stderr.contains("configured with") && stderr.contains("***"), "the leak was logged, masked: {stderr}");
+    assert_no_secret("summary file", &std::fs::read_to_string(&file).unwrap());
+    // The value did reach the source (its journal is a file, not output).
+    let src = journal(&env.journal_path("source"));
+    assert!(src.iter().any(|l| l.starts_with("password=Sup3r-S3cret-Value")), "{src:?}");
+
+    // --print-resolved-config and --dry-run resolve providers too, masked.
+    let (code, out) = exit_code(env.run(&ok).arg("--print-resolved-config"));
+    assert_eq!(code, 0, "{out}");
+    assert_no_secret("print-resolved-config", &out);
+    assert!(out.contains("password:") && out.contains("***"), "{out}");
+    let resolves = || journal(&env.journal_path("creds")).iter().filter(|l| *l == "resolve db#pw").count();
+    let before = resolves();
+    let (code, out) = exit_code(env.run(&ok).arg("--dry-run"));
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(resolves(), before + 1, "--dry-run must resolve providers");
+    assert_no_secret("dry-run", &out);
+
+    // A failure whose message carries the value: exit 1, masked everywhere.
+    let failing = env.with_provider(json!({ "leak": true, "fail_after": 1 }), leaky, "");
+    let (code, doc, stderr) = json_run(env.run(&failing).args(["--output", "json"]));
+    assert_eq!(code, 1, "{doc}\n{stderr}");
+    let cause = doc["cause"].as_str().unwrap();
+    assert!(cause.contains("(password \"***\")"), "{cause}");
+    assert_no_secret("json summary", &doc.to_string());
+    assert_no_secret("stderr", &stderr);
+}
+
+fn provider_failures_exit_3_and_4() {
+    let env = Env::new("prov-fail");
+    // A reference the provider cannot resolve: config class, nothing ran.
+    let missing = env.with_provider(json!({}), json!({ "values": {} }), "");
+    let base = std::fs::read_to_string(&missing).unwrap();
+    let (code, doc, stderr) = json_run(env.run(&missing).args(["--output", "json"]));
+    assert_eq!(code, 3, "{doc}\n{stderr}");
+    assert_v1_shape(&doc);
+    assert_eq!(doc["pipeline"], "cli", "the static check names the pipeline: {doc}");
+    assert!(doc["cause"].as_str().unwrap().contains("provider 'creds' could not resolve 'db#pw'"), "{doc}");
+    assert!(stderr.contains("error: configuration error: provider 'creds' could not resolve"), "{stderr}");
+    assert!(journal(&env.journal_path("source")).is_empty(), "the source must not start");
+
+    // A provider that times out: config class too.
+    let slow = env.with_provider(json!({}), json!({ "hang": true }), "    timeout_seconds: 1\n");
+    let (code, out) = exit_code(&mut env.run(&slow));
+    assert_eq!(code, 3, "{out}");
+    assert!(out.contains("did not finish within 1s"), "{out}");
+
+    // An undeclared instance: static, before anything runs.
+    let undeclared = env.write_named(
+        "undeclared.yaml",
+        &base.replace("secret('creds'", "secret('vault'"),
+    );
+    let (code, out) = exit_code(&mut env.run(&undeclared));
+    assert_eq!(code, 3, "{out}");
+    assert!(out.contains("'vault'") && out.contains("not declared"), "{out}");
+
+    // A provider binary that is not installed: plugin class.
+    let absent = env.write_named(
+        "absent.yaml",
+        &base.replace("type: fake\n    config: {\"journal\"", "type: absent\n    config: {\"journal\""),
+    );
+    let (code, out) = exit_code(&mut env.run(&absent));
+    assert_eq!(code, 4, "{out}");
+    assert!(out.contains("provider instance 'creds'") && out.contains("loadsmith-provider-absent"), "{out}");
+}
+
+fn validate_is_static_unless_resolve() {
+    let env = Env::new("prov-validate");
+    let pipeline = env.with_provider(
+        json!({ "host": "{{ env('LS_CLI_TEST_UNSET_VAR') }}" }),
+        json!({ "values": { "db#pw": SECRET } }),
+        "",
+    );
+    // Static: an unset variable and an uninstalled provider are fine.
+    let (code, out) = exit_code(env.command(&["validate"]).arg(&pipeline));
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("static check"), "{out}");
+    assert!(journal(&env.journal_path("creds")).is_empty(), "static validate starts nothing");
+    // --resolve: the unset variable now fails (config class).
+    let (code, out) = exit_code(
+        env.command(&["validate", "--resolve"]).arg("--plugin-dir").arg(&env.plugins).arg(&pipeline),
+    );
+    assert_eq!(code, 3, "{out}");
+    assert!(out.contains("LS_CLI_TEST_UNSET_VAR"), "{out}");
+    // With the variable set, --resolve runs the provider.
+    let (code, out) = exit_code(
+        env.command(&["validate", "--resolve"])
+            .arg("--plugin-dir")
+            .arg(&env.plugins)
+            .arg(&pipeline)
+            .env("LS_CLI_TEST_UNSET_VAR", "db.local"),
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("fully resolved; 1 secret() reference resolved"), "{out}");
+    assert_eq!(journal(&env.journal_path("creds")), ["configure", "resolve db#pw"]);
+    assert_no_secret("validate --resolve", &out);
+}
+
+fn state_commands_start_no_provider() {
+    let env = Env::new("prov-state");
+    let state = env.scratch.path("state.json");
+    // The provider type is not installed and the source has an unset
+    // variable: neither matters to the state commands.
+    let pipeline = env.with_provider(
+        json!({ "host": "{{ env('LS_CLI_TEST_UNSET_VAR') }}" }),
+        json!({}),
+        &format!("state:\n  backend: local\n  path: {}\n", state.display()),
+    );
+    let pipeline = env.write_pipeline(
+        &std::fs::read_to_string(&pipeline).unwrap().replace("    type: fake\n    config: {\"journal\"", "    type: absent\n    config: {\"journal\""),
+    );
+    let (code, out) = exit_code(env.command(&["state", "show"]).arg(&pipeline));
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("No state recorded for pipeline 'cli'"), "{out}");
+    let (code, out) = exit_code(env.command(&["state", "rm"]).arg(&pipeline));
+    assert_eq!(code, 0, "{out}");
 }
