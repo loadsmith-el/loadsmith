@@ -52,14 +52,37 @@ optional field" a compatible change within protocol version 1:
 | Unknown **field** on a known message | ignored | ignored |
 | Well-formed JSON object with an unknown **`type`** | logged (`warn`) and skipped | logged (`warn`) and skipped |
 | A known message that is out of place for this channel/phase | protocol error where the lifecycle expects a specific reply; otherwise logged and ignored | logged (`warn`) and ignored |
-| Malformed line: not JSON, not UTF-8, no `type`, or a known `type` with an invalid body | **fatal** — protocol error, the run fails | logged (`warn`) and skipped; draining continues |
+| Malformed line: not JSON, not UTF-8, no `type`, or a known `type` with an invalid body | answered with `resend` **once**; a second consecutive malformed line is **fatal** (see [below](#malformed-lines-and-resend)) | logged (`warn`) and skipped; draining continues |
 
 Why the two channels differ on malformed input: the control channel carries the
-lifecycle, so a garbled line there means the peer is broken and continuing would
-only produce a confusing failure later. The event channel carries logs and
+lifecycle, so a garbled line there means a misbehaving peer: it gets exactly one
+chance to repeat itself, and continuing past a second garbled line would only
+produce a confusing failure later. The event channel carries logs and
 progress; it **must never stop being drained** — a core that stopped reading
 fd4 would let the pipe fill and block the plugin forever — so a bad event line
 costs only that line.
+
+### Malformed lines and `resend`
+
+On the control channel, both sides apply the same rule:
+
+1. The receiver of a malformed line sends `{"type":"resend"}` (with an optional
+   `reason`) and waits again.
+2. The peer re-sends its most recent control message. It never counts a `pong`
+   or a `resend` as that message. A sink that asks for a resend gets every
+   `deliver_object` it has not acknowledged yet (`deliver` is idempotent).
+3. Two consecutive malformed lines from the same peer are fatal: the core
+   aborts the run (sending `error` with code `MALFORMED_MESSAGE`), and an SDK
+   plugin stops. Any well-formed line resets the count.
+
+Pipes are reliable, so this mostly catches a transient bug in a peer's
+encoder; it is not a retransmission protocol. The lifecycle is
+request/response, so the most recent message is nearly always the garbled one.
+When it is not (the core sends `set_protocol_version` and
+`capabilities_request` back to back), the replay arrives out of place and the
+run fails as a protocol violation, exactly as it would have without `resend`.
+A peer that ignores `resend` cannot hang the run: the core's
+[timeouts](#timeouts) end it.
 
 Consequences for evolving the protocol within version 1:
 
@@ -151,26 +174,66 @@ destination, delivering its queue at its own pace. See
 - The core never sends `start` before receiving `configure_ack: ok`.
 - The core never starts the data pump before receiving both `schema` (from source)
   and `ready` (from destination).
-- `finished` is always the last message a plugin sends. After sending it, the
-  plugin must close fd3 and fd4 and exit.
-- The core reads `finished` after the pump completes (source fd3 reaches EOF).
+- A source writes the Arrow IPC end-of-stream marker on fd3 only after its last
+  batch succeeded, then sends `finished`.
+- **Commit point:** the core writes the end-of-stream marker to the
+  destination's fd3 only after the source's stream ended with its marker
+  **and** the source sent `finished` with `status: "success"`. A destination
+  finalizes (commits) only on that clean end of input; a stream that ends
+  without the marker is truncated and must be rolled back.
+- `finished` is always the last message a plugin sends, after any cleanup.
+  After sending it, the plugin must close fd3 and fd4 and exit.
 
-## Error handling
+## Abort rules
 
-If `configure_ack` carries `status: "error"`, or a plugin violates the protocol,
-the core aborts the run with an error (`plugin rejected config: …`) and exits
-with a non-zero code. No `cancel` is sent to the other plugin.
+The core aborts the run on the first failure: a plugin that crashes or exits
+without `finished`, a `finished` with `status: "error"`, a rejected config, a
+failed capability gate, a protocol violation, two malformed lines in a row, a
+[timeout](#timeouts), a stalled data plane, or SIGINT/SIGTERM. Then it:
 
-If either plugin sends `finished` with `status: "error"`, the run is marked
-failed in the summary and the exit code is non-zero.
+1. stops forwarding batches and **never** ends the destination's fd3 cleanly;
+2. sends `cancel` to every plugin still running, and `error` instead to the
+   plugin at fault, with a code from the
+   [`error` reference](./messages.md#error);
+3. waits `timeouts.cancel_grace_seconds` (default 30) for each plugin to exit,
+   recording any `finished` it sends, then kills each plugin's process group
+   (SIGKILL);
+4. closes the destination's fd3 only after the destination is gone, so even a
+   plugin that ignores `cancel` never sees a clean end of input;
+5. releases the state lock (only durably committed watermarks are persisted);
+6. prints the summary with `Status: error` (or `cancelled` for a signal) and
+   the root cause, and exits with the matching
+   [exit code](../reference/cli.md#exit-codes).
 
-If a plugin process exits unexpectedly (crashes), the core sees EOF on the
-plugin's stdout (fd1) before `finished` (`EOF while waiting for …` or `plugin
-closed control channel without sending finished`) and treats it as a protocol
-error.
+A failure before data flows (a missing or incompatible plugin, a rejected
+config, the state lock) ends the run the same way, but the cause is printed as
+an error instead of a summary.
 
-Propagating `cancel` to the other plugin on failure is planned but not yet
-implemented.
+On `cancel` (or `error`), a plugin stops, undoes its partial work — a
+destination rolls back its transaction or deletes partial files; a source
+releases its cursor — and exits, replying `finished` with `status:
+"cancelled"` to a `cancel`. It never finalizes. A plugin must keep reading
+stdin while it moves data, so `cancel` can reach it mid-stream; the SDK does
+this. A plugin should treat an unexpected EOF on stdin, or a fd3 input that
+ends without the end-of-stream marker, the same way: the core is gone.
+
+Each plugin runs in its own process group: a terminal's Ctrl+C reaches only
+the core, which cancels the plugins gracefully. The engine handles SIGINT and
+SIGTERM explicitly because it is PID 1 in the container images, where an
+unhandled SIGTERM would be ignored.
+
+A sink is cancelled too when the run aborts. Objects it already delivered stay
+delivered: a sink is not transactional.
+
+## Timeouts
+
+Every wait is bounded by `pipeline.timeouts` (see the
+[pipeline reference](../reference/pipeline-yaml.md#pipelinetimeouts)). A
+timeout aborts the run and sends `error` with code `TIMEOUT` to the late
+plugin. The data-plane stall timeout is opt-in (`stall_seconds`, off by
+default); with it on, the first batch gets its own, generous budget
+(`first_batch_seconds`) because some sources buffer their whole result before
+they emit a batch.
 
 ## Implementing the protocol in another language
 

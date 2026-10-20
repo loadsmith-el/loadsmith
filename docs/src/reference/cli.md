@@ -38,12 +38,19 @@ loadsmith run pipeline.yaml --no-color
 | `--dry-run` | off | Parse, resolve templates and validate the pipeline, then exit without spawning plugins (plugin binaries are not checked) |
 | `--print-resolved-config` | off | Print the resolved config (with secrets masked) to stdout and exit, without running |
 
-**Exit codes:**
+**Exit codes:** see [Exit codes](#exit-codes). A run that fails once data is
+flowing prints the summary with `Status: error` and a `Cause:` line; a run that
+cannot start prints the cause as an `error:` line on stderr.
 
-| Code | Meaning |
-|---|---|
-| `0` | Pipeline completed successfully (summary `Status: success`) |
-| `1` | Anything else: the pipeline ran and failed (`Status: error` — a source, destination or sink error), or it couldn't start (invalid YAML/config, missing plugin binary, protocol mismatch). The cause is printed to stderr |
+**Signals:** SIGINT (Ctrl+C) and SIGTERM stop a run gracefully: the engine
+sends `cancel` to every plugin (a destination rolls back), waits up to
+`pipeline.timeouts.cancel_grace_seconds` (default 30), kills what is left,
+releases the state lock, prints the summary with `Status: cancelled`, and exits
+`130` or `143`. The plugins run in their own process groups, so a terminal's
+Ctrl+C reaches only the engine. The handlers are explicit because the engine is
+PID 1 in the container images, where an unhandled SIGTERM would be ignored.
+Keep the grace period below your orchestrator's (see
+[`pipeline.timeouts`](pipeline-yaml.md#pipelinetimeouts)).
 
 **Output:**
 
@@ -253,6 +260,29 @@ Both commands fail with `pipeline '<name>' has no state: block` when the pipelin
 has no `state:` block.
 
 ---
+
+## Exit codes
+
+Every `loadsmith` command exits with one of these codes. The table is a covered
+interface: it is frozen at 1.0 (see the [Stability Policy](stability.md)), and
+a new code can only be added in a minor release for a case that today falls
+under `1`.
+
+| Code | Meaning | Examples |
+|---|---|---|
+| `0` | Success | `run`: summary `Status: success` |
+| `1` | The run failed | A plugin reported an error, crashed, broke the protocol or timed out; the data plane stalled; sink delivery or state persistence failed; any failure not listed below |
+| `2` | Usage error | Unknown flag or missing argument (from the argument parser); conflicting selectors such as `plugin install mysql:source --kind destination` |
+| `3` | Configuration error | Unreadable pipeline file, invalid YAML, unknown key, failed template, validation error, a plugin rejected its `config` (`configure_ack` error), a capability gate (a `sink:` on a destination without `object_output`, a `state:` block with a non-incremental source), `state show` on a pipeline with no `state:` block |
+| `4` | Plugin unavailable | Plugin binary not found, cannot be started, no protocol version in common, wrong kind |
+| `5` | State error | The state lock is held by another run, the state file is unreadable or from a newer engine, the source schema drifted (`on_schema_change: refuse`) |
+| `130` | Interrupted (SIGINT) | Ctrl+C, after cancelling the plugins |
+| `143` | Terminated (SIGTERM) | `docker stop`, a Kubernetes pod shutdown, after cancelling the plugins |
+
+`130` and `143` follow the shell convention of 128 + the signal number.
+`plugin install`/`uninstall` failures other than usage errors (a download, a
+checksum, a manifest whose `protocol` range this engine does not support) exit
+`1`.
 
 ## Environment variables
 

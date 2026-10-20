@@ -122,6 +122,13 @@ handshake → negotiate protocol version → capabilities → configure
   → finished (rows read / written, batches, duration, throughput)
 ```
 
+The destination only sees the end of its input — and commits — after the source
+finished successfully. If anything fails first (a plugin crash or error, a
+timeout, Ctrl+C or SIGTERM), the core cancels the plugins instead: the
+destination rolls back, the summary names the root cause, and the exit code
+says what kind of failure it was (see the
+[CLI reference](docs/src/reference/cli.md#exit-codes)).
+
 ---
 
 ## Quickstart

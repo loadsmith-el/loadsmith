@@ -34,7 +34,7 @@ pub trait SourcePlugin: Send {
 | `schema()` | After `start` signal | Return the Arrow schema of the rows you will emit |
 | `next_batch()` | Repeatedly, until done | Return the next `RecordBatch`, or `Ok(None)` when exhausted |
 | `current_watermark()` | After each batch | Return the high cursor value so far — the core persists it (durability-gated) |
-| `cancel()` | Not currently invoked | Reserved for future cancel propagation — the core never sends `cancel` to sources yet |
+| `cancel()` | The run will not complete (after `start`): the core sent `cancel`/`error`, the core is gone, or the source itself failed | Stop producing and release the cursor/connection. On `cancel`, an in-flight `next_batch()` future may have been dropped first |
 
 > **Incremental sources.** Advertise `incremental_state`, store the value from
 > `resume_from`, build `WHERE cursor > value ORDER BY cursor` yourself (the core
@@ -201,7 +201,9 @@ impl SourcePlugin for MysqlPlugin {
 
     async fn cancel(&mut self) {
         // Close cursor, rollback transaction, disconnect.
-        // Not invoked yet: the core does not send `cancel` to sources today.
+        // Called when the run aborts (or after our own failure): stop
+        // producing and release the cursor / connection. An in-flight
+        // `next_batch()` may already have been dropped.
         // Return quickly — do not block.
     }
 }

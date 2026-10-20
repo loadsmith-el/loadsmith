@@ -56,6 +56,15 @@ time as above, or mount an `emptyDir` for the plugin dir. Also mount an
 `emptyDir` at `/tmp`: some plugins write temporary files there (for example, the
 Oracle plugin writes a temporary wallet for TLS).
 
+**Stopping a run.** The engine is the entrypoint, so it runs as PID 1 and
+receives `docker stop`'s or Kubernetes' SIGTERM directly. It handles the signal
+explicitly: it cancels the plugins (a destination rolls back), waits up to
+`pipeline.timeouts.cancel_grace_seconds` (default 30 s), kills what is left,
+releases the state lock and exits `143`. `docker stop` only waits 10 s before
+it sends SIGKILL, so either give it more time (`docker stop -t 40`) or lower
+`cancel_grace_seconds`; in Kubernetes keep it under
+`terminationGracePeriodSeconds`.
+
 ## Choosing a flavor
 
 - **static**: production, when you want the smallest image and the smallest

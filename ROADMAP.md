@@ -102,9 +102,16 @@ What's shipped and what's queued next. Shipped items are documented in
       toolchain) and tests before every release; the 1.0 blockers fixed
       (tolerant protocol reader and an fd4 drain that never stops, UTF-8-safe
       templates, a versioned state format with a stable fingerprint, strict
-      plugin blocks in `pipeline.yaml`, lock-lease fixes). Remaining: the
-      policy's open decisions (exit codes, machine-readable output,
-      experimental kinds, core `cancel`/`error`).
+      plugin blocks in `pipeline.yaml`, lock-lease fixes); a correct abort
+      (the destination's input ends only after the source succeeded; on any
+      failure or SIGINT/SIGTERM the core sends `cancel`/`error`, waits a grace
+      period and kills — the destination rolls back instead of committing a
+      partial load), per-phase timeouts and an opt-in stall timeout, one
+      `resend` for a malformed control line, and distinct exit codes.
+      Remaining: the policy's open decisions (machine-readable output,
+      experimental kinds, Arrow field types, remote state, SDK publishing),
+      and the canonical plugins' `cancel()` rolling back once they move to
+      the new SDK.
 
 - [ ] **`s3` sink** — multipart-upload delivery of staged files to S3. The TLS
       direction is settled (`rustls` + the pure-Rust `rustls-rustcrypto` provider

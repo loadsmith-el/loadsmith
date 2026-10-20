@@ -86,10 +86,14 @@ network sockets, no shared memory, no IPC libraries.
 
 If a plugin crashes:
 - Its file descriptors are closed by the OS.
-- The core detects EOF on the control channel and reports the failure; the run
-  ends with an error and a non-zero exit code.
-- The other plugin is not notified: propagating `cancel` to it is planned but not
-  yet implemented. (A crashed sink is the exception — its supervisor respawns it.)
+- The core detects EOF on the control channel (or a data stream that ends
+  without its end-of-stream marker) and aborts the run.
+- The other plugin gets `cancel`, undoes its partial work and exits; after a
+  grace period, whatever is left is killed. The destination never sees a clean
+  end of input after an upstream failure, so it never commits a partial load.
+  (A crashed sink is the exception — its supervisor respawns it.)
+- The summary reports `Status: error` with the root cause, and the run exits
+  `1`. See the [abort rules](../protocol/reference.md#abort-rules).
 
 ## Why Rust
 

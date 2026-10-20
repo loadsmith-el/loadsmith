@@ -35,8 +35,8 @@ pub trait DestinationPlugin: Send {
 | `write_batch(batch)` | Once per incoming batch | Write this `RecordBatch` to the sink |
 | `durable_through()` | After each batch | Highest batch ordinal now **durably** committed — gates the core's watermark persistence. Leave `None` if only durable at `finalize` |
 | `take_ready_objects()` | After each `write_batch()` and after `finalize()` | Return (and clear) the paths of files finalized since the last call — the SDK emits an `object_ready` for each. Required with `object_output`: advertising the capability alone delivers nothing to the sink |
-| `finalize()` | After the IPC stream ends | Flush buffers, close resources, return total `rows_written` |
-| `cancel()` | Not currently invoked | Reserved for future cancel propagation — the core never sends `cancel` to destinations yet |
+| `finalize()` | After the IPC stream ends **cleanly** (the core writes the end marker only after the source succeeded) | Flush buffers, commit, close resources, return total `rows_written` |
+| `cancel()` | The run will not complete (after `start`): the core sent `cancel`/`error`, the core is gone (stdin closed, or fd3 ended without the end-of-stream marker), or `write_batch`/`finalize` failed | **Undo the partial load**: roll back the open transaction, drop the staging table, delete partial files. `finalize()` is never called after it |
 
 > **Durability & incremental state.** The SDK emits a `committed` event whenever
 > `durable_through()` advances, plus a final one at `finalize()`. That ack is
@@ -234,8 +234,8 @@ impl DestinationPlugin for ParquetPlugin {
     }
 
     async fn cancel(&mut self) {
-        // Not invoked yet (the core does not send `cancel` to destinations
-        // today). Intended: drop the writer and delete the partial file.
+        // Called when the run aborts (or after our own failure): the input
+        // is incomplete, so drop the writer and delete the partial file.
         self.writer = None;
         if let Some(cfg) = &self.config {
             let _ = std::fs::remove_file(&cfg.path);

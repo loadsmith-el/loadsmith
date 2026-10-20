@@ -45,7 +45,7 @@ The version is negotiated in the handshake. Once set via `set_protocol_version`,
 ```
 Core → Plugin   handshake
 Plugin → Core   handshake_ack
-Core → Plugin   set_protocol_version    (if incompatible: the core aborts the run; nothing is sent)
+Core → Plugin   set_protocol_version    (if incompatible: the core sends error and aborts the run)
 ```
 
 ### 4.2 Capabilities
@@ -72,20 +72,91 @@ Plugin → Core   ready                   (destination: ready to receive batches
                 ... progress and log happen during execution ...
                 ... checkpoint (source) and committed (destination) happen on fd4 ...
                 ... ping/pong happens with sinks only (see below) ...
-Plugin → Core   finished
+Source → Core   finished                (after writing the IPC end-of-stream marker)
+                ... commit point: the core ends the destination's fd3 ...
+Destination → Core   finished           (after finalize)
 ```
 
-### 4.5 Cancellation
+**Commit point.** The core writes the Arrow IPC end-of-stream marker to the
+destination's fd3 only after (a) the source's stream ended with its own
+end-of-stream marker and (b) the source sent `finished` with status `success`.
+A destination must treat a clean end of fd3 as "the input is complete" and only
+then finalize (commit). A stream that ends **without** the marker is truncated:
+the destination must not finalize it.
 
-> **Reserved — not currently emitted by the core.** The core never sends
-> `cancel` today; only the sink SDK reacts to it.
+### 4.5 Cancellation and abort
 
-Intended to be possible at any time after `start`:
+The core may send `cancel` at any time, to any plugin:
 
 ```
 Core → Plugin   cancel
-Plugin → Core   finished  (status: cancelled)
+Plugin → Core   finished  (status: cancelled)   (after undoing its partial work)
 ```
+
+The core aborts a run on any failure: a plugin crash or unexpected exit, a
+`finished` with status `error`, a protocol violation, a timeout (§4.7), a
+stalled data plane, or an operator signal (SIGINT/SIGTERM). Then:
+
+1. it stops forwarding batches and **never** writes the end-of-stream marker
+   to the destination;
+2. it sends `cancel` to every plugin still running, or `error` to the plugin at
+   fault (an incompatible protocol, a wrong kind, a protocol violation, two
+   malformed lines, a timeout);
+3. it waits `timeouts.cancel_grace_seconds` (default 30) for each plugin to
+   exit, then kills each plugin's process group with SIGKILL;
+4. it closes the destination's fd3 only after the destination has exited;
+5. it reports both plugins' outcomes and the root cause in the summary.
+
+A plugin that receives `cancel` (or `error`) stops, undoes its partial work (a
+destination rolls back its transaction or deletes partial output; a source
+releases its cursor) and exits, replying `finished` with status `cancelled` to
+`cancel`. It must not finalize. A plugin should also stop the same way when
+its stdin reaches EOF unexpectedly, or when its fd3 input ends without the
+end-of-stream marker: both mean the core is gone.
+
+To be able to observe `cancel` mid-stream, a plugin must keep reading stdin
+while it reads or writes fd3. Each plugin runs in its own process group, so a
+terminal's Ctrl+C reaches only the core, which then cancels the plugins.
+
+### 4.6 Malformed lines and `resend`
+
+A malformed control line (not JSON, not UTF-8, no `type`, or a known `type`
+with an invalid body) is answered **once** with `resend`: the receiver asks its
+peer to re-send its most recent control message. Two consecutive malformed
+lines from the same peer are fatal (the core aborts the run with `error`, code
+`MALFORMED_MESSAGE`). Any well-formed line resets the count. Both sides follow
+this rule.
+
+The sender keeps its most recent control message (never a `pong` or a
+`resend`) and re-sends it on `resend`. Exception: a sink that asks for a
+`resend` gets every `deliver_object` it has not acknowledged yet (`deliver` is
+idempotent).
+
+Pipes do not corrupt data, so in practice this only catches a transient bug in
+a peer's encoder. The lifecycle is request/response, so the most recent message
+is almost always the garbled one; when it is not (for example
+`set_protocol_version` and `capabilities_request`, which the core sends back to
+back), the replay arrives out of place and the run fails as a protocol
+violation, as it would have without `resend`. A peer that ignores `resend`
+cannot hang the run: the timeouts of §4.7 end it.
+
+### 4.7 Timeouts
+
+Every wait of the core is bounded by `pipeline.timeouts` in `pipeline.yaml`:
+
+| Wait | Key | Default |
+|---|---|---|
+| each `handshake_ack` / `capabilities_response` | `handshake_seconds` | 60 |
+| `configure` → `configure_ack` | `configure_seconds` | 300 |
+| `start` → `schema` / `ready` | `start_seconds` | 600 |
+| source stream ended → source `finished` | `finish_seconds` | 300 |
+| commit point → destination `finished` | `finalize_seconds` | 21600 |
+| `cancel`/`error` → plugin exit | `cancel_grace_seconds` | 30 |
+| no batch through the pump (opt-in) | `stall_seconds` | 0 (off) |
+| first batch, when `stall_seconds` is on | `first_batch_seconds` | 3600 |
+
+`0` disables a limit. A timeout aborts the run (§4.5) and sends `error` with
+code `TIMEOUT` to the plugin that is late.
 
 ---
 
@@ -124,7 +195,7 @@ Fields:
 
 **Core → Plugin.** The core picks the version to use — the highest one present in `protocol_supported_versions` that the core also supports. From this point on, the protocol of the chosen version is in force.
 
-If there is no compatible version, the core aborts the run with a `no compatible protocol version` error and sends nothing to the plugin (the plugin sees its stdin close).
+If there is no compatible version, the core sends `error` (code `UNSUPPORTED_PROTOCOL_VERSION`) and aborts the run.
 
 ```jsonl
 {"type":"set_protocol_version","protocol_version":1}
@@ -364,25 +435,47 @@ configurable.
 
 ### `cancel`
 
-**Core → Plugin. Reserved — not currently emitted by the core.** Requests
-cancellation: the plugin should stop as fast as possible and send `finished`.
-Only the sink SDK handles it today.
+**Core → Plugin.** The run is being aborted (§4.5): another plugin failed, a
+timeout fired, or the operator sent SIGINT/SIGTERM. The plugin stops, undoes its
+partial work, and replies `finished` with status `cancelled`. It must not
+finalize. May arrive at any time, including mid-stream.
 
 ```jsonl
-{"type":"cancel","reason":"timeout"}
+{"type":"cancel","reason":"plugin failed: source exited with status 42 without sending finished"}
 ```
 
 ---
 
 ### `error`
 
-**Core → Plugin. Reserved — not currently emitted by the core.** Meant for an
-unrecoverable error raised by the core before or during the handshake. Today the
-core instead aborts the run with a local error (e.g. `no compatible protocol
-version: …`) and the plugin just sees its stdin close.
+**Core → Plugin.** The core is aborting the run because of a fault in **this**
+plugin. The plugin stops and undoes its partial work, as for `cancel`; no reply
+is expected. Codes (a plugin must treat an unknown code like any other):
+
+| Code | Meaning |
+|---|---|
+| `UNSUPPORTED_PROTOCOL_VERSION` | No protocol version is supported by both sides |
+| `WRONG_PLUGIN_KIND` | `handshake_ack` declared another kind than the one spawned |
+| `PROTOCOL_VIOLATION` | A message out of place for the lifecycle phase |
+| `MALFORMED_MESSAGE` | Two consecutive malformed control lines |
+| `TIMEOUT` | No answer within the configured timeout (§4.7) |
 
 ```jsonl
-{"type":"error","code":"UNSUPPORTED_PROTOCOL_VERSION","message":"plugin supports versions [2, 3], core supports only [1]"}
+{"type":"error","code":"UNSUPPORTED_PROTOCOL_VERSION","message":"no compatible protocol version: core supports [1], plugin supports [2]"}
+```
+
+---
+
+### `resend`
+
+**Either direction, control channel only.** The previous line received from
+this peer was malformed; re-send your most recent control message (§4.6).
+`reason` is optional and informational. A peer that does not know `resend`
+ignores it (tolerant reader), and the requester's timeout ends the run.
+
+```jsonl
+{"type":"resend"}
+{"type":"resend","reason":"expected value at line 1 column 1"}
 ```
 
 ---
@@ -421,6 +514,6 @@ Cancelled:
 
 Unknown fields in any message must be ignored. New optional fields may be added within the same protocol version.
 
-Readers are **tolerant**: a well-formed message whose `type` is unknown is logged and skipped on every channel. A malformed line (not JSON, not UTF-8, missing `type`, or a known `type` with an invalid body) is fatal on the control channel (fd0/fd1) and logged and skipped on the event channel (fd4), which must never stop being drained. See `docs/src/protocol/reference.md` ("Compatibility rule: tolerant reader").
+Readers are **tolerant**: a well-formed message whose `type` is unknown is logged and skipped on every channel. A malformed line (not JSON, not UTF-8, missing `type`, or a known `type` with an invalid body) is answered with `resend` once on the control channel (fd0/fd1), and a second consecutive one is fatal (§4.6); on the event channel (fd4), which must never stop being drained, it is logged and skipped. See `docs/src/protocol/reference.md` ("Compatibility rule: tolerant reader").
 
 New informational message types (ones a receiver may safely ignore) may be added within the same protocol version. Adding new mandatory message types, or changing the semantics of existing messages, requires incrementing the protocol version.

@@ -282,7 +282,8 @@ Rows written: 15
 ```
 
 A run with nothing new reports `Rows read: 0` and leaves an empty file for that
-`RUN_ID`. The exit code is `0` on success and `1` on any failure, which is what
+`RUN_ID`. The exit code is `0` on success and non-zero on failure (`1` for a failed run;
+the full table is in the [CLI reference](../reference/cli.md#exit-codes)), which is what
 schedulers and retries key on.
 
 **Inspecting and resetting the watermark.** `state show` and `state rm` read the

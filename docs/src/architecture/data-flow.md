@@ -120,8 +120,10 @@ handles:
 5. **The heartbeat** — logs `pipeline still running…` every
    `pipeline.heartbeat_seconds` (default 30, `0` disables it) until the pump ends.
 
-6. **Awaiting `Finished` messages** — after the pump completes, the core reads
-   the terminal `Finished` message from each plugin on the control channel.
+6. **The supervisor loop** — while the pump runs, the core watches both
+   plugins' control channels, the pump, the timeouts and SIGINT/SIGTERM at the
+   same time. Each plugin's fd1 is read by its own task, so any of these can
+   end the run the moment it happens (see [Ending the run](#ending-the-run)).
 
 The full sequence after spawning both plugins is:
 
@@ -130,23 +132,37 @@ tokio::spawn  drain_source_events    ──────────────�
 tokio::spawn  drain_destination_events ──────────────────────────────────────────► (async, concurrently)
 tokio::spawn  sink supervisor        (if sink:)  ──────────────────────────────────► (async, concurrently)
 tokio::spawn  state supervisor       (if state:) ──────────────────────────────────► (async, concurrently)
-spawn_blocking  pump                ────────────────────────────────────────────►  (blocks until done)
+spawn_blocking  pump                ────────────────────────────────────────────►  (until the source's stream ends)
 tokio::spawn  heartbeat              (while the pump runs)
-await pump result, stop the heartbeat
-await Finished from source control channel
-await Finished from destination control channel
+supervise: pump end + source Finished ⇒ commit point (end the destination's fd3)
+           destination Finished ⇒ done;  any failure ⇒ abort (cancel, grace, kill)
+reap both plugins, stop the heartbeat
 await both event drains
 await the state supervisor (final watermark flush, lock released)
 await the sink supervisor (delivery queue drained)
 remove the core-allocated staging scratch dir (if any)
 ```
 
+## Ending the run
+
+When the source's IPC stream ends, the pump returns — but it does **not** end
+the destination's stream. The core first checks two things: the source's
+stream ended with the IPC end-of-stream marker (a stream that just stops is a
+crashed source: arrow-rs alone cannot tell the two apart), and the source sent
+`Finished` with `status: "success"`. Only then does it write the marker to
+`out_pipe` and close it — the **commit point**. The destination sees that clean
+end of input and calls `finalize()`.
+
+On any failure before that, the destination never sees a clean end of input:
+the core stops forwarding, sends it `cancel`, and keeps `out_pipe` open until
+the destination has exited (or was killed after the grace period). The pump
+keeps draining the source meanwhile, so a source blocked on a full pipe can
+still read its `cancel`. See the
+[abort rules](../protocol/reference.md#abort-rules).
+
 ## What the `Finished` message carries
 
-When the source's IPC stream ends (writer drops → EOF on the read side → IPC
-reader returns `Ok(None)`), the pump closes its write end of `out_pipe`. The
-destination sees EOF on its fd3 and calls `finalize()`. Then both plugins send
-`Finished`:
+Both plugins end with `Finished`:
 
 **Source `Finished`** (success):
 ```json
@@ -159,3 +175,5 @@ destination sees EOF on its fd3 and calls `finalize()`. Then both plugins send
 ```
 
 The core validates that both finished successfully, then prints the summary.
+After a failure, the summary shows `Status: error` (or `cancelled` after a
+signal) and a `Cause:` line with the first failure observed.

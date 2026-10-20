@@ -11,6 +11,15 @@ pipeline:
   description: string     # optional — human-readable description
   heartbeat_seconds: int  # optional — interval of the "still running" log during
                           #   the data pump. 0 disables it. Default: 30
+  timeouts:               # optional — how long the core waits for plugins
+    handshake_seconds: int    # each handshake reply. Default: 60
+    configure_seconds: int    # configure → configure_ack. Default: 300
+    start_seconds: int        # start → schema / ready. Default: 600
+    finish_seconds: int       # source data ended → its finished. Default: 300
+    finalize_seconds: int     # destination input ended → its finished. Default: 21600
+    cancel_grace_seconds: int # cancel → plugin exit, then kill. Default: 30
+    stall_seconds: int        # opt-in: no batch for N s fails the run. Default: 0 (off)
+    first_batch_seconds: int  # with stall_seconds on: budget for the first batch. Default: 3600
 
 source:
   type: string            # required — source plugin type (e.g., "postgres")
@@ -49,6 +58,41 @@ as the core is concerned — the plugin validates them.
 | `name` | string | yes | Pipeline identifier. Appears in progress output and the summary |
 | `description` | string | no | Human-readable description. Informational only |
 | `heartbeat_seconds` | integer | no | Interval of the "still running" heartbeat log emitted during the data pump. `0` disables it. Default: `30` |
+| `timeouts` | object | no | Limits on how long the core waits for plugins. See [`pipeline.timeouts`](#pipelinetimeouts) |
+
+### `pipeline.timeouts`
+
+Every wait of the core on a plugin is bounded. When a limit is hit, the run is
+aborted: the late plugin gets `error` (code `TIMEOUT`), the others `cancel`,
+and the run exits `1` with the timeout as its root cause (see the
+[abort rules](../protocol/reference.md#abort-rules)). All fields are optional;
+`0` disables a limit.
+
+| Field | Default | What it bounds |
+|---|---|---|
+| `handshake_seconds` | `60` | Each reply during the handshake and the capability exchange |
+| `configure_seconds` | `300` | `configure` → `configure_ack`. Plugins often connect here |
+| `start_seconds` | `600` | `start` → `schema` (source) or `ready` (destination, sink). A source may run its query before it knows its schema |
+| `finish_seconds` | `300` | The source's data stream ended → its `finished` |
+| `finalize_seconds` | `21600` (6 h) | The core ended the destination's input → its `finished`. Covers `finalize` — a final commit or a staged `MERGE` — so raise it for very large staged loads |
+| `cancel_grace_seconds` | `30` | After `cancel`/`error` (or a signal), how long each plugin gets to undo its work and exit before its process group is killed. `0` kills at once |
+| `stall_seconds` | `0` (off) | **Opt-in.** Fail the run when no batch passes through the pump for this long. Counts backpressure too: a destination that takes longer than this for one batch trips it |
+| `first_batch_seconds` | `3600` | Only with `stall_seconds` on: the budget for the *first* batch, from the start of the pump. Separate and generous because some sources (e.g. `mysql`, `oracle`) buffer their result before they emit a batch. `0` leaves the first batch unbounded |
+
+```yaml
+pipeline:
+  name: nightly-orders
+  timeouts:
+    stall_seconds: 300        # fail if the data plane stops moving for 5 min
+    cancel_grace_seconds: 20  # stay inside a 30 s orchestrator grace period
+```
+
+> **Orchestrator grace periods.** On SIGTERM the engine cancels the plugins and
+> waits up to `cancel_grace_seconds` before killing them. Keep it below your
+> orchestrator's own grace period (`docker stop` waits 10 s by default — use
+> `docker stop -t`; Kubernetes waits `terminationGracePeriodSeconds`, 30 s by
+> default), or the engine itself is killed before the plugins finish rolling
+> back.
 
 ### `source`
 

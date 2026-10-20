@@ -24,9 +24,52 @@ release notes in their repositories.
 - CI on every push and PR to `main`: build, tests and clippy with
   `-D warnings`, all `--locked`, on a toolchain pinned in
   `rust-toolchain.toml`.
+- **Graceful cancel.** On any failure, timeout, or SIGINT/SIGTERM the core
+  sends `cancel` to every live plugin (`error`, with a code, to the plugin at
+  fault), waits `pipeline.timeouts.cancel_grace_seconds` (default 30), then
+  kills each plugin's process group. The engine handles both signals
+  explicitly (it is PID 1 in the images), releases the state lock, and exits
+  `130` (SIGINT) or `143` (SIGTERM). Plugins now run in their own process
+  group, so a terminal's Ctrl+C reaches only the engine.
+- `pipeline.timeouts` in `pipeline.yaml`: limits for every wait on a plugin
+  (handshake 60 s, configure 300 s, start 600 s, source finish 300 s,
+  destination finalize 6 h), and an opt-in data-plane stall timeout
+  (`stall_seconds`, off by default) with a separate first-batch budget.
+- Protocol: the `resend` message. A malformed control line is answered once
+  with `resend` and the peer repeats its last control message; a second
+  malformed line in a row is fatal. Golden JSONL fixtures pin the wire form of
+  `cancel`, `error`, `resend` and `finished`.
+- **Distinct exit codes:** `0` success, `1` run failed, `2` usage, `3`
+  configuration, `4` plugin not found or incompatible, `5` state (lock held,
+  bad state file, schema drift), `130`/`143` signals. See the
+  [CLI reference](docs/src/reference/cli.md#exit-codes).
+- The run summary has a `Cause:` line with the root cause when a run fails or
+  is cancelled.
+- SDK: every plugin kind reads its control channel concurrently with its
+  work, answers `ping`, honours `resend`, and stops on `cancel`, `error`, or a
+  lost core. `cancel()` is now called whenever a run will not complete after
+  `start` (including the plugin's own failure), before `finished`.
 
 ### Changed
 
+- **Protocol v1 now has a commit point.** The core writes the Arrow IPC
+  end-of-stream marker to the destination's fd3 only after the source's
+  stream ended with its own marker and the source sent `finished` with
+  success. After an upstream failure the destination gets `cancel` and its
+  fd3 stays open until it exits. Destinations must commit only on a clean end
+  of input and roll back in `cancel()`; the canonical plugins need an SDK bump
+  for their `cancel()` to take effect (older SDK builds are killed after the
+  grace period instead, which also rolls a database transaction back).
+- The core sends `error` (code `UNSUPPORTED_PROTOCOL_VERSION`,
+  `WRONG_PLUGIN_KIND`, `PROTOCOL_VIOLATION`, `MALFORMED_MESSAGE` or `TIMEOUT`)
+  instead of just closing a faulty plugin's stdin. `cancel` and `error` are no
+  longer experimental.
+- SDK: a destination whose fd3 ends without the end-of-stream marker reports
+  `INPUT_TRUNCATED` and rolls back instead of finalizing. New `finished` error
+  codes: `SCHEMA_FAILED`, `PREPARE_FAILED`, `IPC_WRITE_FAILED`,
+  `FINALIZE_FAILED`, `MALFORMED_MESSAGE`, `PROTOCOL_VIOLATION`,
+  `CONTROL_CHANNEL_FAILED`, `PLUGIN_FAILED`. A plugin that fails after `start`
+  now exits `1`.
 - **`pipeline.yaml`: unknown keys in `source`, `destination` and `sink` blocks
   are now rejected.** Before, a typo such as `confg:` passed validation and the
   plugin ran with an empty config. Only `type` and `config` are allowed there;
@@ -49,6 +92,17 @@ release notes in their repositories.
 
 ### Fixed
 
+- **A source that crashed mid-stream made the destination commit a partial
+  load.** arrow-rs reads EOF at a batch boundary as a clean end of stream, so
+  the pump ended the destination's input and postgres/mysql/oracle committed
+  while the run was marked failed. The core now tells a clean end from a
+  truncated one and never ends the destination's input after a failure.
+- A failing source made the run return early: the destination's outcome was
+  never collected and no summary was printed. Both outcomes are now always
+  collected, and the summary always prints once data has flowed.
+- The other plugin was never told about a failure; it now gets `cancel`.
+- The core waited forever on a plugin that stopped answering during the
+  handshake, configure, start or finish phases; each phase now has a timeout.
 - The event-channel (fd4) drain stopped at the first unknown or malformed
   line. The pipe then filled up and the plugin blocked forever. It now logs
   the line and keeps draining until EOF.

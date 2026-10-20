@@ -147,10 +147,14 @@ them through the pump to the destination's fd3. Both plugins concurrently write
 events to fd4.
 
 This phase ends when:
-- The source exhausts its data, closes its IPC writer, and fd3 reaches EOF for
-  the core's reader.
-- The pump closes the write end of `out_pipe`, which sends EOF to the destination.
-- The destination's `finalize()` is called.
+- The source exhausts its data, writes the IPC end-of-stream marker, and sends
+  `finished` with `status: "success"`.
+- Only then — the **commit point** — the core writes the end-of-stream marker
+  to the destination's fd3 and closes it.
+- The destination sees that clean end of input and calls `finalize()`.
+
+If anything fails before the commit point, the destination never sees a clean
+end of input: it gets `cancel` instead (see [Cancellation](#cancellation)).
 
 ## Phase 7 — Finished
 
@@ -172,26 +176,38 @@ If a plugin encounters an unrecoverable error at any point, it sends:
 {"type": "finished", "status": "error", "code": "BATCH_FAILED", "message": "connection reset"}
 ```
 
-The SDK's codes are `BATCH_FAILED` (source) and `WRITE_FAILED` /
-`IPC_READ_FAILED` (destination); hand-written plugins may use their own.
+The SDK's codes are listed under
+[`finished`](../protocol/messages.md#finished); hand-written plugins may use
+their own. The SDK calls the plugin's `cancel()` (undo) before it reports the
+error.
 
 ## Cancellation
 
-> **Planned — not yet wired up.** The protocol defines `cancel`, but the core
-> never sends it and has no SIGINT handler; only the sink SDK reacts to it today.
-> The source and destination `cancel()` trait methods are never called.
-
-Current behavior: when a plugin fails, the core returns an error and the run
-ends with a non-zero exit code. A terminal Ctrl+C sends SIGINT to the whole
-foreground process group — plugins are not put in their own group — so every
-process exits without running `cancel()`. A signal sent only to the loadsmith pid
-(e.g. `kill`, some container stops) is not forwarded to the plugins.
-
-The intended design: on SIGINT or a failure in one plugin, the core sends
+The core aborts the run on the first failure — a plugin crash, a `finished`
+with an error, a protocol violation, a timeout, a stalled data plane — or on
+SIGINT/SIGTERM. It sends
 
 ```json
-{"type": "cancel", "reason": "source plugin failed"}
+{"type": "cancel", "reason": "plugin failed: source exited with status 42 without sending finished"}
 ```
 
-to the other, and each plugin's `cancel()` aborts promptly — closing cursors,
-rolling back transactions, removing partial output files.
+to every plugin still running (`error` to the one at fault), waits
+`timeouts.cancel_grace_seconds` (default 30), then kills each plugin's process
+group. The SDK reads stdin concurrently with the data loop, so `cancel` reaches
+a plugin mid-stream; it then calls the plugin's `cancel()` — closing cursors,
+rolling back transactions, removing partial output files — replies `finished`
+with `status: "cancelled"`, and exits. `finalize()` is never called after a
+cancel.
+
+The destination's fd3 is not closed until the destination has exited, so a
+plugin built on an older SDK (which does not read stdin mid-stream) is not
+fooled either: it waits for more data and is killed after the grace period,
+which drops its database connection and rolls its transaction back.
+
+Each plugin runs in its own process group, so a terminal's Ctrl+C reaches only
+the core, which cancels the plugins in order. A `kill` or container stop sent
+to the loadsmith pid works the same way. A second signal while the run is
+stopping is ignored; the grace period already bounds the wait.
+
+The full rules are in the
+[protocol reference](../protocol/reference.md#abort-rules).

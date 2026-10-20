@@ -346,7 +346,8 @@ covering all batches; one with incremental flush emits them during the run.
 A **sink-only** liveness check today. The core's sink supervisor sends `ping`
 every 5 s (fixed); the sink responds with `pong`. A missing `pong` by the next
 tick counts as a hang: the sink is respawned (up to 5 restarts) and every unacked
-object is re-sent. Sources and destinations are not pinged.
+object is re-sent. Sources and destinations are not pinged. (The SDK answers `ping`
+for every plugin kind.)
 
 ```json
 {"type": "ping"}
@@ -389,12 +390,15 @@ re-sends only the objects not yet acknowledged.
 
 ### `cancel`
 
-Defined by the protocol but **not currently emitted by the core** (reserved for
-future cancel propagation on Ctrl+C or a failure in another plugin). Only the
-sink SDK reacts to it today, by sending `finished` with `status: "cancelled"`.
+Sent by the **core** to abort the run: another plugin failed, a timeout fired,
+or the operator sent SIGINT/SIGTERM. May arrive at any time, including
+mid-stream. The plugin stops, undoes its partial work (a destination rolls
+back; a source releases its cursor), does **not** finalize, and replies
+`finished` with `status: "cancelled"`. The SDK does all of this and calls the
+plugin's `cancel()`. See the [abort rules](./reference.md#abort-rules).
 
 ```json
-{"type": "cancel", "reason": "source plugin failed"}
+{"type": "cancel", "reason": "plugin failed: source exited with status 42 without sending finished"}
 ```
 
 | Field | Type | Description |
@@ -405,22 +409,49 @@ sink SDK reacts to it today, by sending `finished` with `status: "cancelled"`.
 
 ### `error`
 
-Reserved — **not currently emitted by the core**. On a protocol violation (an
-unexpected message, a wrong `kind`, no compatible protocol version) the core
-aborts the run with a local error; the plugin just sees its stdin close.
+Sent by the **core** when it aborts the run because of a fault in **this**
+plugin. The plugin stops and undoes its partial work, as for `cancel`; the core
+expects no reply. A plugin must treat an unknown `code` like any other `error`.
 
 ```json
 {
   "type": "error",
-  "code": "protocol_violation",
-  "message": "expected handshake_ack, got configure"
+  "code": "PROTOCOL_VIOLATION",
+  "message": "source: expected schema, got ready"
 }
 ```
 
 | Field | Type | Description |
 |---|---|---|
-| `code` | string | Machine-readable error code |
+| `code` | string | Machine-readable error code (below) |
 | `message` | string | Human-readable description |
+
+| Code | Meaning |
+|---|---|
+| `UNSUPPORTED_PROTOCOL_VERSION` | No protocol version is supported by both sides |
+| `WRONG_PLUGIN_KIND` | `handshake_ack` declared another kind than the one spawned |
+| `PROTOCOL_VIOLATION` | A message out of place for the lifecycle phase |
+| `MALFORMED_MESSAGE` | Two consecutive malformed control lines |
+| `TIMEOUT` | No answer within the configured [timeout](./reference.md#timeouts) |
+
+---
+
+### `resend`
+
+Sent by **either side** on the control channel when the previous line it
+received from the peer was malformed. The peer re-sends its most recent control
+message (never a `pong` or a `resend`); a sink is re-sent every unacknowledged
+`deliver_object` instead. A second consecutive malformed line is fatal. See
+[Malformed lines and `resend`](./reference.md#malformed-lines-and-resend).
+
+```json
+{"type": "resend"}
+{"type": "resend", "reason": "expected value at line 1 column 1"}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `reason` | string, optional | What was wrong with the line. Informational |
 
 ---
 
@@ -465,6 +496,14 @@ sending this, the plugin must close fd3 and fd4 and exit.
 ```json
 {"type": "finished", "status": "cancelled"}
 ```
+
+The SDK's error codes: `SCHEMA_FAILED`, `BATCH_FAILED`, `IPC_WRITE_FAILED`
+(source); `PREPARE_FAILED`, `WRITE_FAILED`, `IPC_READ_FAILED`,
+`INPUT_TRUNCATED` (fd3 ended without the end-of-stream marker),
+`FINALIZE_FAILED` (destination); `DELIVER_FAILED` (sink); and, for any kind,
+`MALFORMED_MESSAGE`, `PROTOCOL_VIOLATION`, `CONTROL_CHANNEL_FAILED`,
+`PLUGIN_FAILED`. Hand-written plugins may use their own. A plugin that failed
+after `start` undoes its partial work *before* it sends this `finished`.
 
 | Field | Type | Description |
 |---|---|---|

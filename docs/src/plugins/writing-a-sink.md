@@ -29,7 +29,7 @@ pub trait SinkPlugin: Send {
 | `prepare()` | After `start` | Open connections / clients. SDK sends `Ready` when done |
 | `deliver(path)` | Once per finalized file | Ship the file at `path` to the target. **Must be idempotent** |
 | `finalize()` | After all objects are delivered (control EOF) | Flush, close, return the object count |
-| `cancel()` | On abort | Best-effort cleanup |
+| `cancel()` | The run is aborted (the core sent `cancel`/`error`) or `deliver`/`finalize` failed, after `start` | Best-effort cleanup (e.g. abort an in-progress multipart upload). Objects already acknowledged stay delivered: a sink is not transactional |
 
 ## `deliver` must be idempotent
 

@@ -448,7 +448,7 @@ control (fd0/fd1):  handshake, handshake_ack, set_protocol_version,
                     capabilities_request, capabilities_response,
                     configure, configure_ack, start, schema, ready,
                     deliver_object, object_delivered, ping, pong,
-                    cancel (reserved), error (reserved), finished
+                    cancel, error, resend, finished
 events (fd4):       progress, log, object_ready, checkpoint, committed
 ```
 
