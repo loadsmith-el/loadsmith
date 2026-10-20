@@ -45,7 +45,7 @@ rereads strictly `> Vn`. The only overlap is the boundary, which an idempotent
 destination absorbs.
 
 This makes the guarantee **at-least-once**. Exactly-once needs an idempotent
-destination — the postgres destination's `staged_merge` mode (a `MERGE` by
+destination — the database destinations' `mode: merge` (a merge on
 `merge_key`) is exactly that: re-applying the delta is harmless, so the
 crash-window between "destination committed" and "core persisted the watermark"
 is closed for free.
@@ -59,12 +59,12 @@ advance:
 |---|---|---|---|
 | default | at `finalize` | end of run | at-least-once |
 | implements `durable_through()` | incremental flush | intra-run | at-least-once |
-| `mode: staged_merge` | atomic swap at end | end of run | exactly-once effective |
+| `mode: merge` | one transaction at end | end of run | exactly-once effective |
 
 The core reads no durability capability: intra-run durability is reported by
 implementing `DestinationPlugin::durable_through()`, after which the SDK emits a
-`committed` whenever the durable prefix advances. (`staged_merge` also appears in the
-postgres/mysql/oracle destinations' capability lists, but the core does not use
+`committed` whenever the durable prefix advances. (The postgres/mysql/oracle destinations still advertise a `staged_merge`
+capability string — the name of the mode before 1.0 — but the core does not use
 it.)
 
 All three flow through the same `committed` mechanism — a destination that only

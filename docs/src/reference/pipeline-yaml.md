@@ -234,8 +234,8 @@ interprets it** — the source decides how to use it (the cursor column lives in
 
 **Guarantee.** Loadsmith is **at-least-once**: on a crash the next run rereads
 from the last *durable* watermark and may re-deliver the boundary. Pair it with
-an **idempotent destination** (e.g. the postgres destination in `staged_merge`
-mode) for exactly-once. The source requires the `incremental_state` capability;
+an **idempotent destination** (e.g. a database destination in `mode: merge`)
+for exactly-once. The source requires the `incremental_state` capability;
 attaching `state:` to a source without it is a config error.
 
 ```yaml
