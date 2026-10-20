@@ -50,10 +50,9 @@ destination:
     #       Point it at a mounted volume (e.g. EBS) for very large outputs.
 
 sink:                 # optional; only valid with a file-output destination
-  type: s3
+  type: local-copy    # the shipped sink; an `s3` sink is planned, not yet available
   config:
-    bucket: vendas-raw
-    prefix: tabela/
+    dest: /mnt/out
 ```
 
 A database destination has no `sink` (and no format/location split):
@@ -61,7 +60,7 @@ A database destination has no `sink` (and no format/location split):
 ```yaml
 destination:
   type: postgres
-  config: { url: "...", table: vendas }
+  config: { host: ..., dbname: ..., user: ..., password: ..., target_table: vendas }
 ```
 
 ### Path resolution and cleanup

@@ -75,9 +75,16 @@ accept the C toolchain cost deliberately, not by accident.
 
 This is not a postgres-only decision. Every network-facing plugin speaks `rustls`:
 
-- **Postgres** (`sslmode=require`, …) — `tokio-postgres-rustls-improved` plugs a
-  rustls-based `MakeTlsConnect` into the existing `tokio-postgres` driver.
-- **MySQL** (`useSSL`, …) — `mysql_async` / `sqlx` expose a `rustls-tls` feature.
+- **Postgres** (`tls: { mode: require }`, …) — `tokio-postgres-rustls-improved`
+  plugs a rustls-based `MakeTlsConnect` into the existing `tokio-postgres` driver.
+- **MySQL** (`tls: { mode: require }`, …) — `mysql_async` with the
+  `default-rustls-no-provider` feature, after `loadsmith_tls::install_provider()`.
+- **Oracle** — the `oracledb` thin driver (TCPS), after `install_provider()`.
+  Caveat: `oracledb` pulls rustls with default features, so `aws-lc-sys` still
+  compiles at build time, though it is never used at runtime (until
+  oracle/rust-oracledb#34 makes that provider optional).
+- **SharePoint** — Microsoft Graph over `reqwest`/rustls with the installed
+  provider and webpki roots.
 - **S3 / HTTP** (the future sink) — `object_store` / `reqwest` / `hyper` all ship
   a rustls feature.
 
@@ -91,26 +98,29 @@ The generic, driver-agnostic part of this — installing the provider, the five
 TLS modes (`disable` / `prefer` / `require` / `verify-ca` / `verify-full`), mTLS,
 the cert loaders and verifiers — lives in the **`loadsmith-tls`** crate
 (`crates/loadsmith-tls`). It exposes a generic `TlsConfig` and a
-`client_config(&TlsConfig) -> Option<rustls::ClientConfig>`; it depends on
-`rustls` only, **never** on any database/transport driver. Each network plugin
-takes that `rustls::ClientConfig` and wraps it in its own connector (postgres:
-`MakeRustlsConnect`; mysql/s3: their own). This is the boundary that keeps the
+`client_config(&TlsConfig) -> Result<Option<rustls::ClientConfig>>`; it depends
+on `rustls` only, **never** on any database/transport driver. Postgres wraps that
+`ClientConfig` in `MakeRustlsConnect`; mysql and oracle call `install_provider()`
+and map `TlsConfig` / `TlsMode` onto their driver's own rustls setup; sharepoint
+only calls `install_provider()` (reqwest builds its own rustls config with webpki
+roots, and the plugin has no `tls:` options). This is the boundary that keeps the
 loadsmith core/crates agnostic: loadsmith knows *TLS* (a shared networking
 concern), never *postgres*.
 
-## Status: first real consumer
+## Status
 
-The postgres plugins (`plugins/postgres`, emitting `loadsmith-source-postgres`
-and `loadsmith-destination-postgres`) are the **first consumers** of
-`loadsmith-tls`, both over the same connection layer. They implement all five TLS
-modes, mTLS, and the `rustls-rustcrypto` provider install. The crate choices that
-make it work:
+`loadsmith-tls` has four consumers in `loadsmith-canonical-plugins`: `postgres`,
+`mysql`, `oracle` and `sharepoint`. The postgres plugins
+(`loadsmith-canonical-plugins/postgres`, emitting `loadsmith-source-postgres` and
+`loadsmith-destination-postgres`) were the first, both over the same connection
+layer. They implement all five TLS modes, mTLS, and the `rustls-rustcrypto`
+provider install. The crate choices that make it work:
 
 | Crate | Version | Role |
 |---|---|---|
 | `rustls` | 0.23 | TLS protocol, `default-features = false` to drop `aws-lc-rs` |
 | `rustls-rustcrypto` | 0.0.2-alpha | Pure-Rust crypto provider (`CryptoProvider::install_default`) |
-| `tokio-postgres-rustls-improved` | 0.16 | Bridge (`MakeRustlsConnect`), `default-features = false` to drop `aws-lc-rs`; fixes SCRAM/SASL channel-binding bug vs the original crate |
+| `tokio-postgres-rustls-improved` | 0.17 | Bridge (`MakeRustlsConnect`), `default-features = false` to drop `aws-lc-rs`; fixes SCRAM/SASL channel-binding bug vs the original crate |
 | `rustls-pemfile` | 2 | PEM parsing for root and client certificates |
 
 The **TLS spike gate**, cross-database handshakes against Postgres, MySQL and

@@ -9,7 +9,8 @@ What's shipped and what's queued next. Shipped items are documented in
       (control / Arrow IPC data / event)
 - [x] `postgres` source plugin (server-side cursor, full type mapping)
 - [x] `jsonl`, `null`, `parquet` destination plugins
-- [x] `file` config provider
+- [x] `file` config-provider plugin (protocol/SDK level; not yet invoked by the
+      core — `{{ env() }}` / `{{ file() }}` templates are resolved in-process)
 - [x] **Sink delivery stage** — separates format from location (no `s3_parquet`
       explosion); `local-copy` sink, `object_ready`/`deliver_object` protocol,
       and a core supervisor that respawns + resumes a crashed/hung sink from the
@@ -33,13 +34,14 @@ What's shipped and what's queued next. Shipped items are documented in
       idempotent destination.
 - [x] **`postgres` destination** — `COPY` into the target (`atomic`) or into a
       staging table then `MERGE` by PK (`staged_merge`, exactly-once effective)
-- [x] **Plugin distribution & `loadsmith install`** — plugins split out to
+- [x] **Plugin distribution & `loadsmith plugin install`** — plugins split out to
       [`loadsmith-canonical-plugins`](https://github.com/loadsmith-el/loadsmith-canonical-plugins):
       a manifest contract (`loadsmith-plugin.yaml`), per-plugin multi-arch GitHub
       Releases + a canonical index, and `loadsmith plugin install <name>` /
       `--all` / `--manifest` / `--binary` / `uninstall` (sha256-verified,
-      protocol-range-checked). The official image is now **slim** (core only);
-      plugins are installed on demand.
+      protocol-range-checked). The default image (`:latest`) is **slim** (core
+      only), with plugins installed on demand; a `-bundled` flavor carries the
+      canonical plugins (see the static musl item above).
 - [x] **Published docs** — the mdbook is hosted on GitHub Pages
       (<https://loadsmith-el.github.io/loadsmith/>), built and deployed on every
       push to `main` by [`docs.yml`](.github/workflows/docs.yml). The official
@@ -92,7 +94,7 @@ What's shipped and what's queued next. Shipped items are documented in
       — see [docs](docs/src/architecture/multi-arch-and-tls.md)); the remaining
       work is the pure-Rust multipart upload + SigV4 signing, not the crypto stack.
 - [ ] **Templates & secret providers** — config interpolation today covers
-      `{{ env(...) }}`; broader templating and dedicated secret-provider
+      `{{ env(...) }}` and `{{ file(...) }}`; broader templating and dedicated secret-provider
       plugins (vault, cloud secret managers, …) would get credentials out of
       plain environment variables.
 - [ ] **Remote state backend** — an `s3` state backend (conditional PUT for a

@@ -202,7 +202,7 @@ jobs:
 
           | flavor | pull | |
           |---|---|---|
-          | static | \`${IMAGE}:${tag}-static\` | distroless/static, ~10MB |
+          | static | \`${IMAGE}:${tag}-static\` | distroless/static, ~13MB (~4MB download) |
           | static-debug | \`${IMAGE}:${tag}-static-debug\` | + busybox shell |
           | slim | \`${IMAGE}:${tag}-slim\` | debian:bookworm-slim |
           | bundled | \`${IMAGE}:${tag}-bundled\` | slim + canonical plugins |

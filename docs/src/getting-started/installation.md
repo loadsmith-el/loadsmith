@@ -2,10 +2,7 @@
 
 ## Prerequisites
 
-- Rust toolchain (stable, 2021 edition) — install via [rustup.rs](https://rustup.rs)
-- `cargo` in `PATH`
-- Linux (the core uses Linux-specific fd passing via `dup2`; macOS support is
-  planned)
+- Linux (the core uses Linux-specific fd passing via `dup2`)
 
 ## Prebuilt binaries and images
 
@@ -19,6 +16,9 @@ docker run --rm ghcr.io/loadsmith-el/loadsmith:latest --version
 ```
 
 ## Build from source
+
+Building needs a Rust toolchain (stable, 2021 edition — install via
+[rustup.rs](https://rustup.rs)) with `cargo` in `PATH`.
 
 ```bash
 git clone https://github.com/loadsmith-el/loadsmith
@@ -35,12 +35,14 @@ and are installed on demand.
 ## Plugins
 
 Loadsmith discovers plugins by searching for binaries named
-`loadsmith-{kind}-{type}` in the plugin directory (default `~/.loadsmith/plugins/`).
-Install the canonical set with the built-in installer:
+`loadsmith-{kind}-{type}` in the plugin directory (default `~/.loadsmith/plugins/`),
+then on `PATH` as a fallback. Install the canonical set with the built-in installer:
 
 ```bash
 loadsmith plugin install --all        # install every canonical plugin
-loadsmith plugin install postgres     # or just one (resolved from the index)
+loadsmith plugin install postgres     # or one package — all its binaries (source + destination)
+loadsmith plugin install mysql:source@0.1.1   # one kind of a package, pinned version
+loadsmith plugin uninstall postgres   # remove a package (or `postgres:source`)
 ```
 
 You can also install from a manifest (`--manifest <path|URL>`) or a local binary
@@ -49,31 +51,29 @@ manifest installs download a per-platform artifact and verify its sha256.
 
 ## Overriding the plugin directory
 
-You can override the plugin directory at runtime:
+You can override the plugin directory at runtime with `--plugin-dir`:
 
 ```bash
-# via flag
 loadsmith run pipeline.yaml --plugin-dir /path/to/plugins
-
-# via environment variable
-LOADSMITH_PLUGIN_PATH=/path/to/plugins loadsmith run pipeline.yaml
 ```
 
-The flag takes precedence over the environment variable.
+A binary not found there is still looked up on `PATH`.
 
 ## Checking installed plugins
 
 ```bash
 loadsmith plugin list
-# loadsmith-source-postgres (0.1.0)
-# loadsmith-destination-jsonl (0.1.0)
-# loadsmith-config-provider-file (0.1.0)
+# Plugins in /home/you/.loadsmith/plugins:
+#   loadsmith-source-postgres
+#   loadsmith-destination-postgres
+#   loadsmith-destination-jsonl
 ```
+
+With an empty directory it prints `No plugins found in <dir>`.
 
 ## Environment variables
 
 | Variable | Purpose |
 |---|---|
-| `LOADSMITH_PLUGIN_PATH` | Override plugin directory |
 | `NO_COLOR` | Disable ANSI color output (same as `--no-color`) |
 | Any variable referenced by `{{ env('VAR') }}` in pipeline.yaml | Secret injection |

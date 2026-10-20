@@ -26,7 +26,7 @@ pub trait SourcePlugin: Send {
 
 | Method | When called | What to do |
 |---|---|---|
-| `plugin_name()` | During handshake | Return the binary name exactly: `"loadsmith-source-{type}"` |
+| `plugin_name()` | During handshake | Return the binary name, `"loadsmith-source-{type}"` (convention, shown in the run summary) |
 | `plugin_version()` | During handshake | Return the semver version string |
 | `capabilities()` | During handshake | Override to add `"incremental_state"` if you support resume |
 | `configure(config)` | After protocol negotiation | Deserialize config, validate, open connection |
@@ -34,7 +34,7 @@ pub trait SourcePlugin: Send {
 | `schema()` | After `start` signal | Return the Arrow schema of the rows you will emit |
 | `next_batch()` | Repeatedly, until done | Return the next `RecordBatch`, or `Ok(None)` when exhausted |
 | `current_watermark()` | After each batch | Return the high cursor value so far — the core persists it (durability-gated) |
-| `cancel()` | On abort | Close cursors, rollback transactions |
+| `cancel()` | Not currently invoked | Reserved for future cancel propagation — the core never sends `cancel` to sources yet |
 
 > **Incremental sources.** Advertise `incremental_state`, store the value from
 > `resume_from`, build `WHERE cursor > value ORDER BY cursor` yourself (the core
@@ -44,10 +44,22 @@ pub trait SourcePlugin: Send {
 
 ## Step-by-step example: MySQL source
 
+> A full MySQL connector already ships in
+> [`loadsmith-canonical-plugins/mysql`](https://github.com/loadsmith-el/loadsmith-canonical-plugins)
+> (package `loadsmith-mysql`, source + destination). Use it as the real
+> reference; this walkthrough is a minimal skeleton of the same shape. See also
+> the canonical book's
+> [Plugin Anatomy](https://loadsmith-el.github.io/loadsmith-canonical-plugins/anatomy.html)
+> and [Building](https://loadsmith-el.github.io/loadsmith-canonical-plugins/building.html)
+> pages.
+
 ### 1. Create the crate
 
+Plugins don't live in the loadsmith repo: create the package in your own repo or
+as a member of `loadsmith-canonical-plugins`.
+
 ```
-plugins/sources/mysql/
+mysql-source/
   Cargo.toml
   src/
     main.rs
@@ -55,7 +67,15 @@ plugins/sources/mysql/
     types.rs   (optional — for type mapping)
 ```
 
+(A connector that ships both a source and a destination uses a shared `lib` plus
+`src/bin/source.rs` and `src/bin/destination.rs`, like the canonical `mysql`.)
+
 ### 2. `Cargo.toml`
+
+The SDK crates are git dependencies pinned by `rev`, and
+`[package.metadata.loadsmith]` is the install metadata a release turns into the
+published `loadsmith-plugin.yaml` — without it the plugin can't be installed with
+`loadsmith plugin install`.
 
 ```toml
 [package]
@@ -63,26 +83,37 @@ name = "loadsmith-source-mysql"
 version = "0.1.0"
 edition = "2021"
 
+[package.metadata.loadsmith]
+name     = "mysql"
+summary  = "MySQL source"
+protocol = "^1"
+provides = [
+    { kind = "source", bin = "loadsmith-source-mysql" },
+]
+
 [[bin]]
 name = "loadsmith-source-mysql"
 path = "src/main.rs"
 
 [dependencies]
-tokio       = { workspace = true }
-anyhow      = { workspace = true }
-tracing     = { workspace = true }
-serde       = { workspace = true }
-serde_json  = { workspace = true }
-async-trait = { workspace = true }
-arrow       = { workspace = true }
-arrow-array = { workspace = true }
-arrow-schema = { workspace = true }
-loadsmith-plugin-sdk = { path = "../../../crates/loadsmith-plugin-sdk" }
-loadsmith-arrow      = { path = "../../../crates/loadsmith-arrow" }
+tokio        = { version = "1", features = ["full"] }
+anyhow       = "1"
+tracing      = "0.1"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+async-trait  = "0.1"
+arrow        = "54"
+arrow-array  = "54"
+arrow-schema = "54"
+loadsmith-plugin-sdk = { git = "https://github.com/loadsmith-el/loadsmith", rev = "<commit>" }
+loadsmith-arrow      = { git = "https://github.com/loadsmith-el/loadsmith", rev = "<commit>" }
 
-# Add your MySQL driver:
-sqlx = { version = "0.8", features = ["mysql", "runtime-tokio"] }
+# Add your MySQL driver (the canonical connector uses pure-Rust mysql_async):
+mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust", "default-rustls-no-provider"] }
 ```
+
+(Inside `loadsmith-canonical-plugins`, use `{ workspace = true }`; the workspace
+root pins the SDK `rev` once for every plugin.)
 
 ### 3. `src/main.rs`
 
@@ -170,26 +201,16 @@ impl SourcePlugin for MysqlPlugin {
 
     async fn cancel(&mut self) {
         // Close cursor, rollback transaction, disconnect.
-        // This is called on Ctrl+C or when the destination fails.
+        // Not invoked yet: the core does not send `cancel` to sources today.
         // Return quickly — do not block.
     }
 }
 ```
 
-### 5. Register in `Cargo.toml` (workspace root)
-
-```toml
-[workspace]
-members = [
-    # ... existing members ...
-    "plugins/sources/mysql",
-]
-```
-
-### 6. Build and verify
+### 5. Build and verify
 
 ```bash
-cargo build -p loadsmith-source-mysql
+cargo build --release    # → target/release/loadsmith-source-mysql
 ```
 
 ## Implementing `schema()` correctly
@@ -210,14 +231,18 @@ Use `loadsmith_arrow::schema_from_protocol_fields` to convert a vec of protocol
 
 ```rust
 use loadsmith_arrow::schema_from_protocol_fields;
-use loadsmith_protocol::Field;
+use loadsmith_protocol::{Field, FieldType};
 
 let fields = vec![
     Field { name: "id".into(), field_type: FieldType::Utf8 },
     Field { name: "amount".into(), field_type: FieldType::Float64 },
 ];
-let schema = schema_from_protocol_fields(&fields)?;
+let schema = schema_from_protocol_fields(&fields);
 ```
+
+This needs `loadsmith-protocol` as a dependency too (a git dep from the same repo
+and `rev` as `loadsmith-plugin-sdk`). Alternatively, build the Arrow `Schema`
+directly with `arrow_schema` — which is what the canonical plugins do.
 
 ## Type mapping guidance
 
@@ -243,21 +268,14 @@ across all types. When in doubt, stringify and parse.
 
 ## Sending log events
 
-Use `EventSender` (provided by the SDK) to send log events and progress from
-within `next_batch()`:
+You don't emit progress yourself: after each `next_batch()` the SDK sends a
+`progress` event (and, for incremental sources, a `checkpoint` built from
+`current_watermark()`) on fd4.
 
-```rust
-async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-    let batch = fetch_rows()?;
-    // The SDK provides an EventSender before calling your methods.
-    // Access it via self.events if you stored it from the SDK's call.
-    Ok(Some(batch))
-}
-```
-
-The SDK passes an `EventSender` to lifecycle methods via the internal driver.
-Progress events are emitted by calling `events.progress_source(rows, batches)`.
-For simple log messages: `events.info("cursor opened").await`.
+The SDK does not hand plugins a handle for custom fd4 `log` events today — no
+`SourcePlugin` method receives an `EventSender`, and opening your own fd4 writer
+would race the SDK's. For diagnostics, log with `tracing` to stderr, which the
+plugin inherits from the core.
 
 ## Streaming, not slurping
 
@@ -291,8 +309,14 @@ async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
 Do not wire your new plugin into a pipeline by hand to test it. The right
 approach is a **loadsmith-lab** case:
 
-1. Create `../loadsmith-lab/cases/mysql-to-jsonl/case.yaml`
-2. Create a lab service image that seeds a MySQL database
-3. Run: `./target/debug/loadsmith-lab run --loadsmith ../loadsmith --select catalog/mysql-to-jsonl`
+1. Add a case under `cases/<name>/case.yaml` in
+   `loadsmith-lab-canonical-catalog` (or point `--cases-dir` at a directory of
+   ad-hoc cases). A `mysql-to-jsonl` case already exists there.
+2. Reference a lab service image that seeds the database — MySQL already has
+   `images/lab-mysql-8` in the `images` origin.
+3. Run it against your local build with `--plugin`, which builds the crate as a
+   static musl binary and overrides the cached canonical plugin (without it, the
+   lab runs the published canonical plugins):
+   `./target/debug/loadsmith-lab run --select catalog/mysql-to-jsonl --plugin ../loadsmith-canonical-plugins/mysql`
 
 See [Testing with loadsmith-lab](../getting-started/testing-with-lab.md).

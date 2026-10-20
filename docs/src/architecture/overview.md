@@ -6,21 +6,26 @@ hierarchy, plus plugin binaries that live outside the core dependency graph.
 ## Crate map
 
 ```
-loadsmith-cli               ← the loadsmith binary (clap)
-  └─ loadsmith-core         ← orchestration: spawner, lifecycle, pump, events, summary
-       └─ loadsmith-config  ← YAML parse, template resolution, secret masking
-       └─ loadsmith-arrow   ← Arrow IPC reader/writer, schema helpers, JSON conversion
-       └─ loadsmith-protocol← control message types (serialization/deserialization)
-       └─ loadsmith-transport← JSONL framing for control + event channels
+loadsmith-cli               ← the loadsmith binary (clap), plugin install/uninstall
+  └─ loadsmith-core         ← orchestration: discovery, spawner, lifecycle, pump, events,
+  │                           reporter, summary, sink supervisor, incremental state
+  │    └─ loadsmith-config  ← YAML parse, template resolution, secret masking
+  │    └─ loadsmith-arrow   ← Arrow IPC reader/writer, schema helpers, JSON conversion
+  │    └─ loadsmith-protocol← control message types (serialization/deserialization)
+  │    └─ loadsmith-transport← JSONL framing for control + event channels (uses protocol, arrow)
+  └─ loadsmith-config
+  └─ loadsmith-plugin-manifest ← plugin manifest schema + validation for `plugin install`
+  └─ loadsmith-tls          ← rustls ClientConfig + TLS modes (installer HTTPS; network plugins)
 
-loadsmith-plugin-sdk        ← drives plugin lifecycle; source/destination/provider entry points
+loadsmith-plugin-sdk        ← drives plugin lifecycle; source/destination/sink/config-provider entry points
   └─ loadsmith-protocol
   └─ loadsmith-transport
   └─ loadsmith-arrow
 ```
 
-Plugin binaries depend only on `loadsmith-plugin-sdk`. They do not depend on
-`loadsmith-core` — the protocol is the only coupling.
+Plugin binaries depend on `loadsmith-plugin-sdk` (plus, optionally,
+`loadsmith-arrow` and `loadsmith-tls`). They never depend on `loadsmith-core` —
+the protocol is the only coupling.
 
 ## The plugin model
 
@@ -28,18 +33,21 @@ A **plugin** is an ordinary OS binary that implements the loadsmith protocol ove
 file descriptors. The core spawns it as a child process, wires up the three
 communication channels, and orchestrates its lifecycle.
 
-There are three kinds of plugin:
+There are four runnable kinds of plugin:
 
 | Kind | Role | SDK entry point |
 |---|---|---|
 | `source` | Reads from an origin system and emits Arrow batches | `run_source` |
-| `destination` | Consumes Arrow batches and writes to a sink | `run_destination` |
-| `config-provider` | Loads configuration YAML content from a URI | `run_config_provider` |
+| `destination` | Consumes Arrow batches and writes them to a target | `run_destination` |
+| `sink` | Delivers finalized staged files to a target (see [Sink Delivery](./sink-delivery.md)) | `run_sink` |
+| `config-provider` | Loads configuration YAML content from a URI (not yet invoked by the core) | `run_config_provider` |
+
+`parser` is a reserved kind in the protocol, with no SDK runtime yet.
 
 ### Binary naming convention
 
 The core discovers plugins by resolving the binary name from the pipeline's
-`source.type` and `destination.type` fields:
+`source.type`, `destination.type` and (when present) `sink.type` fields:
 
 ```
 loadsmith-{kind}-{type}
@@ -51,16 +59,16 @@ Examples:
 |---|---|---|
 | `postgres` | source | `loadsmith-source-postgres` |
 | `jsonl` | destination | `loadsmith-destination-jsonl` |
-| `file` | config-provider | `loadsmith-config-provider-file` |
+| `local-copy` | sink | `loadsmith-sink-local-copy` |
 
 The core searches for the binary first in the plugin directory (default
-`~/.loadsmith/plugins/`, override with `--plugin-dir` or `LOADSMITH_PLUGIN_PATH`),
-then in `PATH`.
+`~/.loadsmith/plugins/`, override with `--plugin-dir`), then in `PATH`.
 
 ## Process isolation in practice
 
-Each `loadsmith run` spawns exactly two child processes: the source plugin and the
-destination plugin. The core communicates with them via file descriptors — no
+Each `loadsmith run` spawns two child processes — the source plugin and the
+destination plugin — plus a sink process when a `sink:` block is configured (see
+[Sink Delivery](./sink-delivery.md)). The core communicates with them via file descriptors — no
 network sockets, no shared memory, no IPC libraries.
 
 ```
@@ -78,8 +86,10 @@ network sockets, no shared memory, no IPC libraries.
 
 If a plugin crashes:
 - Its file descriptors are closed by the OS.
-- The core detects EOF on the control channel and reports the failure.
-- The other plugin receives a `Cancel` message and is given a chance to clean up.
+- The core detects EOF on the control channel and reports the failure; the run
+  ends with an error and a non-zero exit code.
+- The other plugin is not notified: propagating `cancel` to it is planned but not
+  yet implemented. (A crashed sink is the exception — its supervisor respawns it.)
 
 ## Why Rust
 
@@ -89,7 +99,9 @@ ownership model eliminates whole classes of bugs (double-close, use-after-free o
 raw fds) that plague C equivalents. Tokio's async runtime lets the core drain
 multiple channels concurrently without threads for each.
 
-The single `unsafe` block in the entire project is in
-[`spawner.rs`](https://github.com/loadsmith-el/loadsmith/blob/main/crates/loadsmith-core/src/spawner.rs), inside a `pre_exec`
-hook that runs in the forked child and must only call async-signal-safe functions
-(`dup2`, `close` via libc).
+`unsafe` is confined to file-descriptor plumbing: the pipe setup and the
+`pre_exec` hook in
+[`spawner.rs`](https://github.com/loadsmith-el/loadsmith/blob/main/crates/loadsmith-core/src/spawner.rs),
+and the SDK adopting fd3/fd4 (`File::from_raw_fd`) in the plugin runtimes. The
+`pre_exec` hook runs in the forked child and must only call async-signal-safe
+functions (`dup2`, `close` via libc).

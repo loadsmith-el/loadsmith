@@ -22,63 +22,73 @@ torn down and cleaned up after the run regardless of success or failure.
 ## Prerequisites
 
 - Docker (the Docker daemon must be running)
-- loadsmith built: `cargo build` in the loadsmith repo
 - loadsmith-lab built: `cargo build` in the loadsmith-lab repo
+
+The loadsmith core does not need a host build: `--loadsmith <project dir>` builds
+it inside Docker, and without `--loadsmith` the lab pulls a published image.
 
 ## Repository layout
 
+The lab itself is only the harness; cases, service images and seed data live in
+sibling repos that the lab fetches as **origins**:
+
 ```
-loadsmith-lab/
-  data/
-    spacecraft_telemetry_events.csv    ← 100,000 rows, seed=42
-    generate/
-      generate.py                      ← regenerate with Python
-      requirements.txt
-  images/
-    lab-postgres-15/
-      Dockerfile
-      init.sql
-  cases/
-    postgres-to-jsonl/
-      case.yaml
-      pipeline.yaml
+loadsmith-lab/                          ← the harness (this is what you build)
   crates/
     loadsmith-lab-cli/
     loadsmith-lab-runner/
     loadsmith-lab-docker/
     loadsmith-lab-report/
+  docs/
+
+loadsmith-lab-canonical-catalog/        ← origin `catalog`: cases and bundles
+  cases/
+    postgres-to-jsonl/
+      case.yaml
+      pipeline.yaml
+    …
+  bundles/
+
+loadsmith-lab-canonical-images/         ← origin `images`: service images
+  images/
+    lab-postgres-15/                    ← Dockerfile + init.sql
+    lab-mysql-8/
+    lab-oracle/
+    lab-mock-graph/
+
+loadsmith-lab-canonical-data/           ← the seed-data generator
+  generate.py                           ← stdlib-only, seed=42
 ```
+
+Cases are selected as `<origin>/<name>`, e.g. `catalog/postgres-to-jsonl`.
 
 ## Running a case
 
 ```bash
-# from the loadsmith repo first:
-cd ../loadsmith && cargo build
-
-# then run the lab:
 cd ../loadsmith-lab
 cargo build
 ./target/debug/loadsmith-lab run --loadsmith ../loadsmith --select catalog/postgres-to-jsonl
 ```
 
 `--loadsmith <path>` runs a local core — a project dir (built hermetically in
-Docker, as above) or a prebuilt binary. Without it, the lab uses a published
-image. You can likewise test a local plugin with
+Docker, as above) or a prebuilt binary. Without it, the lab pulls the published
+`ghcr.io/loadsmith-el/loadsmith:slim` image; `--tag` picks another published tag
+(e.g. `--tag v0.2.0-static`). You can likewise test a local plugin with
 `--plugin <binary|project>` (a plugin project is built as a static musl binary in a `rust:1-alpine`
 container, like a release).
 
 ## How a case is declared
 
-`cases/postgres-to-jsonl/case.yaml`:
+`cases/postgres-to-jsonl/case.yaml` in `loadsmith-lab-canonical-catalog`:
 
 ```yaml
 case:
   name: postgres-to-jsonl
-  description: "Read 100k rows from PostgreSQL and write to JSONL"
+  description: Reads 100k rows from PostgreSQL and writes them to JSONL
   tags: [postgres, jsonl, smoke]
 
 services:
-  - image: loadsmith-lab-postgres:15
+  - image: images/lab-postgres-15
     alias: pg
     readiness:
       tcp: 5432
@@ -89,12 +99,6 @@ services:
         password: lab
         probe_query: "SELECT 1 FROM spacecraft_telemetry_events LIMIT 1"
 
-loadsmith:
-  image: local
-  volumes:
-    - host: /tmp/ls-lab-output
-      container: /output
-
 pipeline:
   file: pipeline.yaml
 
@@ -103,7 +107,7 @@ expect:
   rows_read: 100000
   rows_written: 100000
   output:
-    file: /tmp/ls-lab-output/events.jsonl
+    file: events.jsonl   # validated under the host side of the /output mount
     row_count: 100000
 ```
 
@@ -112,6 +116,9 @@ expect:
 **`services`** — a list of Docker services to start before running loadsmith.
 Each service gets a hostname alias (`pg`) that the pipeline can use; loadsmith
 runs on the same Docker network and reaches services by that alias.
+
+**`services[].image`** — a service image as `<origin>/<name>`; here the
+`lab-postgres-15` directory of the `images` origin.
 
 **`readiness.tcp`** — the port to wait for. The lab polls `TcpStream::connect`
 every 500 ms until the port is open or the timeout expires.
@@ -127,24 +134,34 @@ Without this probe, loadsmith could start before the table has data.
 - `rows_read: 100000` — the summary box said "Rows read: 100,000"
 - `rows_written: 100000` — the summary box said "Rows written: 100,000"
 - `output.file` / `output.row_count` — the output file exists and has the right
-  number of lines
+  number of lines (`file` is relative to the run's `/output` mount)
+
+An optional `loadsmith:` block can set `loadsmith.image` to a full image
+reference, overriding the core image chosen by `--loadsmith` / `--tag`.
 
 ## Image resolution
 
-When the lab needs an image named `loadsmith-lab-postgres:15`, it tries in order:
+When a case references `images/lab-postgres-15`, the lab tags it locally as
+`loadsmith-lab/images/lab-postgres-15:local` and tries in order:
 
 1. **Local Docker cache** — if the image already exists locally, use it.
-2. **Pull from registry** — try `docker pull loadsmith-lab-postgres:15`.
-3. **Build from Dockerfile** — look for `images/lab-postgres-15/Dockerfile` and
-   build it. The build context always includes `data/spacecraft_telemetry_events.csv`.
+2. **Pull** — try to pull that tag (a local-only tag fails and falls through).
+3. **Build from the origin's Dockerfile** — build
+   `images/lab-postgres-15/Dockerfile` from the `images` origin.
 
-On first run, the `loadsmith-lab-postgres:15` image will be built automatically.
-This takes 2–3 minutes as it loads 100,000 rows into Postgres. Subsequent runs
-use the cached image and start in seconds.
+The postgres Dockerfile generates its own seed data: a build stage clones
+`loadsmith-lab-canonical-data` at a pinned `DATA_REF` and runs `generate.py`, so
+nothing is copied from your checkout. The same images are also published to GHCR
+by the images repo's CI.
+
+On first run, the image is built automatically. This takes a few minutes as it
+loads 100,000 rows into Postgres. Subsequent runs use the cached image and start
+in seconds.
 
 ## The canonical test dataset
 
-`data/spacecraft_telemetry_events.csv` contains 100,000 rows of synthetic
+`spacecraft_telemetry_events.csv` (generated by `loadsmith-lab-canonical-data`,
+never committed) contains 100,000 rows of synthetic
 spacecraft telemetry with 34 columns covering all Arrow-supported types:
 integers, bigints, doubles, booleans, decimals (as strings), dates, timestamps,
 times, and nullable variants of each.
@@ -155,10 +172,8 @@ precision, and timestamp parsing — the hardest parts of any EL tool.
 To regenerate it:
 
 ```bash
-cd loadsmith-lab/data/generate
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python generate.py
+cd loadsmith-lab-canonical-data
+python generate.py     # stdlib only, no pip install
 ```
 
 ## Report output
@@ -166,26 +181,35 @@ python generate.py
 A passing run looks like:
 
 ```
-loadsmith-lab v0.1.0   local mode
+loadsmith-lab 0.1.0  ·  local loadsmith
 
-postgres-to-jsonl
-  "Read 100k rows from PostgreSQL and write to JSONL"
+▶ catalog/postgres-to-jsonl  Reads 100k rows from PostgreSQL and writes them to JSONL
+  · waiting for pg at 172.18.0.2:5432…
+  · pg ready (2.0s)
+  │ loadsmith 0.2.0
+  │ postgres → jsonl
   │
-  │ Loadsmith v0.1.0  ·  postgres → jsonl
+  │ 2026-10-16T12:00:03.112408Z  INFO loadsmith_core::reporter: schema negotiated — 34 columns
+  │ ...
+  │ 2026-10-16T12:00:04.201733Z  INFO loadsmith_core::reporter: 2,000 rows · 1 batch
+  │ 2026-10-16T12:00:04.233019Z  INFO loadsmith_core::reporter: 4,000 rows · 2 batches
+  │ ...
+  │ 2026-10-16T12:01:17.950274Z  INFO loadsmith_core::reporter: 100,000 rows · 50 batches
   │
-  │   batch   1    2,000 rows
-  │   batch   2    4,000 rows
-  │   ...
-  │
-  │ ─────────────────────────────────────────
+  │ ───────────────────────────────────────────
   │ Pipeline:     postgres-to-jsonl-smoke
+  │ Route:        loadsmith-source-postgres → loadsmith-destination-jsonl
   │ Status:       success
   │ Rows read:    100,000
   │ Rows written: 100,000
-  │ Duration:     0:01:12
-  │
-  ✓ passed   100,000 rows read · 100,000 written
+  │ Batches:      50
+  │ Duration:     00:01:14.012
+  │ Throughput:   1,351 rows/s
+  │ ───────────────────────────────────────────
+  ✓ postgres-to-jsonl   100,000 read · 100,000 written   74.2s
 
-────────────────────────────────────────────
+──────────────────────────────────────────────────
 1 passed, 0 failed
 ```
+
+See the loadsmith-lab book's *Understanding the Output* page for every line.

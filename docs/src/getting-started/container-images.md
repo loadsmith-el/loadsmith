@@ -13,8 +13,9 @@ dependencies, so the flavor only decides what sits around it.
 | **bundled** | `vX.Y.Z-bundled` | `debian:bookworm-slim` | ~170MB (~60MB) | bash | all canonical plugins |
 
 Each flavor also has a rolling tag (`:static`, `:static-debug`, `:slim`,
-`:bundled`) that stable releases move, and `:latest` is `:slim`. Prereleases
-(`vX.Y.Z-<suffix>`) publish only their versioned tags.
+`:bundled`) that stable releases move, and `:latest` is `:slim`. Every release
+also publishes an immutable `sha-<short-sha>-<flavor>` tag per flavor. Prereleases
+(`vX.Y.Z-<suffix>`) publish only their versioned and `sha-` tags.
 
 ## Installing plugins on `-static`
 

@@ -35,8 +35,8 @@ loadsmith run pipeline.yaml --no-color
 | Flag | Default | Description |
 |---|---|---|
 | `--plugin-dir <path>` | `~/.loadsmith/plugins/` | Directory to search for plugin binaries |
-| `--dry-run` | off | Validate the pipeline, discover plugins, and exit without running |
-| `--print-resolved-config` | off | Print the resolved config (with secrets masked) to stdout and exit. Implies `--dry-run` |
+| `--dry-run` | off | Parse, resolve templates and validate the pipeline, then exit without spawning plugins (plugin binaries are not checked) |
+| `--print-resolved-config` | off | Print the resolved config (with secrets masked) to stdout and exit, without running |
 
 **Exit codes:**
 
@@ -47,10 +47,11 @@ loadsmith run pipeline.yaml --no-color
 
 **Output:**
 
-- **stdout** — the human report: header line, progress lines at doubling intervals,
-  and the summary box. Suitable for piping to a file.
-- **stderr** — tracing output at the configured log level. Includes the full
-  protocol handshake at `--log-level debug`.
+- **stdout** — the human report: the header (`loadsmith <version>`, then the
+  route) and the summary box. Suitable for piping to a file.
+- **stderr** — tracing output at the configured log level, including the schema
+  and the progress lines at doubling batch intervals (timestamped `INFO`
+  records). Includes the full protocol handshake at `--log-level debug`.
 
 **Examples:**
 
@@ -85,8 +86,9 @@ loadsmith run pipeline.yaml --log-level debug 2>handshake.log
 
 ## `loadsmith validate <pipeline>`
 
-Validate a pipeline file and check that the required plugin binaries exist.
-Does not connect to any system or run any data.
+Validate a pipeline file. Does not look for plugin binaries, connect to any
+system, or run any data — plugin-specific config is only checked by the plugin
+itself at run time.
 
 ```bash
 loadsmith validate pipeline.yaml
@@ -103,14 +105,17 @@ loadsmith validate pipeline.yaml --plugin-dir /opt/loadsmith/plugins
 
 | Flag | Default | Description |
 |---|---|---|
-| `--plugin-dir <path>` | `~/.loadsmith/plugins/` | Plugin directory for binary discovery check |
+| `--plugin-dir <path>` | `~/.loadsmith/plugins/` | Accepted but currently unused |
 
 **What is checked:**
 1. YAML syntax is valid
-2. Required fields are present (`pipeline.name`, `source.type`, `destination.type`)
-3. Template expressions (`{{ env(...) }}`, `{{ file(...) }}`) can be resolved
-4. Plugin binaries `loadsmith-source-{type}` and `loadsmith-destination-{type}`
-   exist in the plugin directory or PATH
+2. Template expressions (`{{ env(...) }}`, `{{ file(...) }}`) can be resolved
+3. Unknown keys at the top level, under `pipeline:` and under `state:` are
+   rejected (extra keys beside a plugin's `type`/`config` are not)
+4. `pipeline.name`, `source.type`, `destination.type` and (if present)
+   `sink.type` are non-empty
+5. With a `state:` block, `state.backend` is `local` and `state.path` is
+   non-empty
 
 ---
 
@@ -131,12 +136,14 @@ loadsmith plugin list --plugin-dir /opt/loadsmith/plugins
 
 **Output:**
 ```
-loadsmith-source-postgres (0.1.0)
-loadsmith-destination-jsonl (0.1.0)
-loadsmith-config-provider-file (0.1.0)
+Plugins in /home/u/.loadsmith/plugins:
+  loadsmith-source-postgres
+  loadsmith-destination-postgres
 ```
 
-The version is read from the binary's `--version` output.
+Every file in the directory whose name starts with `loadsmith-` is listed; the
+binaries are not run, so no versions are shown. An empty directory prints
+`No plugins found in <dir>`.
 
 ---
 
@@ -169,7 +176,7 @@ loadsmith plugin install --binary ./target/release/loadsmith-destination-jsonl  
 |---|---|---|
 | `--kind <kind>` | — | Install only this kind from the package (`source`/`destination`/`sink`/`parser`/`config-provider`). Same as the `:<kind>` spec suffix. |
 | `--all` | — | With no name: every package in the index. With a `<name>`: every plugin of that package. |
-| `--manifest <path\|URL>` | — | Install from a `loadsmith-plugin.yaml` |
+| `-f, --manifest <path\|URL>` | — | Install from a `loadsmith-plugin.yaml` |
 | `--binary <path>` | — | Install a single local plugin binary |
 | `--index <url>` | the canonical index | Override the plugin index |
 | `--plugin-dir <path>` | `~/.loadsmith/plugins/` | Target directory |
@@ -198,15 +205,60 @@ loadsmith plugin uninstall mysql:source        # just loadsmith-source-mysql
 loadsmith plugin uninstall mysql --kind source # same, via the flag
 ```
 
+**Flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--kind <kind>` | — | Remove only this kind (same as the `:<kind>` suffix) |
+| `--plugin-dir <path>` | `~/.loadsmith/plugins/` | Directory to remove from |
+
+An `@<version>` is rejected (`uninstall takes no @version`): only one version is
+installed at a time.
+
+---
+
+## `loadsmith state show <pipeline>`
+
+Print the incremental state persisted for a pipeline. The pipeline's `state:`
+block locates the state.
+
+```bash
+loadsmith state show pipeline.yaml
+```
+
+**Output:**
+```
+Pipeline:     orders-incremental
+Cursor value: "2026-06-09T08:00:00Z"
+Schema hash:  …
+Run id:       …
+Updated at:   1781078400000 (unix ms)
+```
+
+or `No state recorded for pipeline '<name>'.` when nothing has been persisted
+yet.
+
+## `loadsmith state rm <pipeline>`
+
+Clear a pipeline's persisted state, so the next run is a full read. It takes the
+state lock first, so it fails rather than clear state out from under a running
+pipeline. Prints `Cleared state for pipeline '<name>'.`
+
+```bash
+loadsmith state rm pipeline.yaml
+```
+
+Both commands fail with `pipeline '<name>' has no state: block` when the pipeline
+has no `state:` block.
+
 ---
 
 ## Environment variables
 
 | Variable | Equivalent to | Description |
 |---|---|---|
-| `NO_COLOR` | `--no-color` | Disable ANSI color (any non-empty value) |
-| `LOADSMITH_PLUGIN_PATH` | `--plugin-dir` | Override the plugin directory |
+| `NO_COLOR` | `--no-color` | Disable ANSI color (when set, to any value — even empty) |
 | Any variable in `{{ env('NAME') }}` | — | Injected into pipeline template resolution |
 
-`--no-color` and `--plugin-dir` flags take precedence over their corresponding
-environment variables when both are set.
+Either `--no-color` or `NO_COLOR` disables color. The plugin directory has no
+environment variable: use `--plugin-dir`.

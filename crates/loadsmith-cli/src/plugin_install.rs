@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::download;
 
-/// The canonical plugin index `loadsmith install <name>` reads by default.
+/// The canonical plugin index `loadsmith plugin install <name>` reads by default.
 pub const DEFAULT_INDEX_URL: &str =
     "https://raw.githubusercontent.com/loadsmith-el/loadsmith-canonical-plugins/main/index.json";
 

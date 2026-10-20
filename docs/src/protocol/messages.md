@@ -26,7 +26,7 @@ Sent by the **plugin** in response to `handshake`.
 {
   "type": "handshake_ack",
   "plugin_name": "loadsmith-source-postgres",
-  "plugin_version": "0.1.0",
+  "plugin_version": "0.2.1",
   "protocol_supported_versions": [1],
   "kind": "source"
 }
@@ -34,10 +34,10 @@ Sent by the **plugin** in response to `handshake`.
 
 | Field | Type | Description |
 |---|---|---|
-| `plugin_name` | string | Must match the binary name exactly |
+| `plugin_name` | string | Should match the binary name (convention, shown in the run summary). Not enforced by the core |
 | `plugin_version` | string | Semver version string |
 | `protocol_supported_versions` | array of integers | Protocol versions this plugin understands |
-| `kind` | string | One of: `"source"`, `"destination"`, `"sink"`, `"config_provider"` |
+| `kind` | string | One of: `"source"`, `"destination"`, `"sink"`, `"parser"` (reserved, no runtime yet), `"config_provider"` |
 
 ---
 
@@ -75,12 +75,25 @@ No fields.
 Sent by the **plugin** in response to `capabilities_request`.
 
 ```json
-{"type": "capabilities_response", "supports": []}
+{"type": "capabilities_response", "supports": ["batch_read", "schema_inference", "incremental_state"]}
 ```
 
 | Field | Type | Description |
 |---|---|---|
-| `supports` | array of strings | Capability identifiers, e.g. `"batch_write"`, `"object_output"` (a file-output destination whose files a sink can deliver), `"object_delivery"` (a sink) |
+| `supports` | array of strings | Capability identifiers (see below) |
+
+**Known capabilities:**
+
+| Capability | Advertised by | Enforced by the core |
+|---|---|---|
+| `batch_read` | sources (SDK default) | no |
+| `schema_inference` | sources (SDK default) | no |
+| `incremental_state` | incremental sources (postgres, mysql, oracle) | yes — required when the pipeline has a `state:` block |
+| `batch_write` | destinations (SDK default) | no |
+| `object_output` | file-output destinations whose files a sink can deliver (parquet) | yes — required when the pipeline has a `sink:` block |
+| `staged_merge` | postgres, mysql, oracle destinations | no |
+| `object_delivery` | sinks (SDK default) | no |
+| `fetch` | config providers (SDK default) | no |
 
 ---
 
@@ -127,8 +140,8 @@ Sent by the **plugin** in response to `configure`.
 {
   "type": "configure_ack",
   "status": "error",
-  "code": "invalid_config",
-  "message": "field 'host' is required"
+  "code": "CONFIGURE_FAILED",
+  "message": "invalid postgres source config: missing field `dbname`"
 }
 ```
 
@@ -177,7 +190,7 @@ receiving `start`, before writing any Arrow data to fd3.
 
 | Field | Type | Description |
 |---|---|---|
-| `fields` | array of Field | The Arrow schema |
+| `fields` | array of Field | A summary of the Arrow schema (see the note below) |
 
 **Field object:**
 
@@ -199,6 +212,13 @@ receiving `start`, before writing any Arrow data to fd3.
 | `"date32"` | `Date32` | Days since Unix epoch (1970-01-01) |
 | `"timestamp_ms"` | `Timestamp(Millisecond, None)` | Milliseconds since Unix epoch |
 | `"binary"` | `Binary` | Raw byte array |
+
+> **Note:** the `schema` message is a summary label set, not the authoritative
+> schema. The exact Arrow types travel in the IPC stream header on fd3. The SDK
+> derives this message from the real Arrow schema lossily: any
+> `Timestamp(unit, tz)` is labelled `timestamp_ms`, `LargeUtf8` becomes `utf8`,
+> `LargeBinary` becomes `binary`, and every other type falls back to `utf8`. The
+> core uses it for the run report and the incremental-state schema fingerprint.
 
 ---
 
@@ -323,8 +343,10 @@ covering all batches; one with incremental flush emits them during the run.
 
 ### `ping` / `pong`
 
-Sent by the **core** at any time; the plugin responds with `pong`. Used to
-detect liveness.
+A **sink-only** liveness check today. The core's sink supervisor sends `ping`
+every 5 s (fixed); the sink responds with `pong`. A missing `pong` by the next
+tick counts as a hang: the sink is respawned (up to 5 restarts) and every unacked
+object is re-sent. Sources and destinations are not pinged.
 
 ```json
 {"type": "ping"}
@@ -367,8 +389,9 @@ re-sends only the objects not yet acknowledged.
 
 ### `cancel`
 
-Sent by the **core** when the run is aborted (Ctrl+C, other plugin failed, etc.).
-The plugin must clean up and send `finished` with `status: "cancelled"`.
+Defined by the protocol but **not currently emitted by the core** (reserved for
+future cancel propagation on Ctrl+C or a failure in another plugin). Only the
+sink SDK reacts to it today, by sending `finished` with `status: "cancelled"`.
 
 ```json
 {"type": "cancel", "reason": "source plugin failed"}
@@ -382,7 +405,9 @@ The plugin must clean up and send `finished` with `status: "cancelled"`.
 
 ### `error`
 
-Sent by the **core** on a fatal protocol violation.
+Reserved — **not currently emitted by the core**. On a protocol violation (an
+unexpected message, a wrong `kind`, no compatible protocol version) the core
+aborts the run with a local error; the plugin just sees its stdin close.
 
 ```json
 {
@@ -431,7 +456,7 @@ sending this, the plugin must close fd3 and fd4 and exit.
 {
   "type": "finished",
   "status": "error",
-  "code": "cursor_failed",
+  "code": "BATCH_FAILED",
   "message": "connection reset by peer after 45,000 rows"
 }
 ```
@@ -449,4 +474,11 @@ sending this, the plugin must close fd3 and fd4 and exit.
 | `rows_written` | integer (optional) | Total rows written (destination only, on success) |
 | `batches_written` | integer (optional) | Total batches written (destination only, on success) |
 | `code` | string (optional) | Machine-readable error code (on error) |
-| `message` | string (optional) | Human-readable error message (on error) |
+| `message` | string (optional) | Human-readable error message (on error); for a config provider, the fetched document (see below) |
+
+**Sink form:** a sink reuses `finished` `success` with `rows_written` =
+`batches_written` = the number of objects delivered.
+
+**Config-provider form:** a config provider answers with `status: "success"` and
+carries the fetched document in `message`, as a (lossily converted) UTF-8 string —
+the only channel for the provider's payload.

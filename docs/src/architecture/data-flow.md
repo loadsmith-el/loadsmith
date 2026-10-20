@@ -79,7 +79,7 @@ batch   1  →   2,000 rows    (next_log: 2)
 batch   2  →   4,000 rows    (next_log: 4)
 batch   4  →   8,000 rows    (next_log: 8)
 batch   8  →  16,000 rows    (next_log: 16)
-batch  16  →  24,500 rows    ← final (24,500 / 2,000 = ~12.25 batches, not exact power)
+batch  13  →  24,500 rows    ← final (24,500 / 2,000 → 13 batches, not a power of two)
 ```
 
 ### PumpStats
@@ -93,7 +93,9 @@ pub struct PumpStats {
 }
 ```
 
-These values populate the `Summary` at the end of the run.
+These values drive the progress log and the `data pump completed` log line. The
+`Summary` counts (rows/batches read and written) come from each plugin's
+`finished` message instead.
 
 ## Concurrency model
 
@@ -107,7 +109,18 @@ handles:
 
 2. **Draining destination fd4** — same reasoning.
 
-3. **Awaiting `Finished` messages** — after the pump completes, the core reads
+3. **The sink supervisor** (only with a `sink:` block) — spawned before the
+   pump, it delivers each `object_ready` file as the destination finalizes it
+   (see [Sink Delivery](./sink-delivery.md)).
+
+4. **The state supervisor** (only with a `state:` block) — persists watermarks
+   as `checkpoint` / `committed` events arrive (see
+   [Incremental State](./incremental-state.md)).
+
+5. **The heartbeat** — logs `pipeline still running…` every
+   `pipeline.heartbeat_seconds` (default 30, `0` disables it) until the pump ends.
+
+6. **Awaiting `Finished` messages** — after the pump completes, the core reads
    the terminal `Finished` message from each plugin on the control channel.
 
 The full sequence after spawning both plugins is:
@@ -115,10 +128,17 @@ The full sequence after spawning both plugins is:
 ```
 tokio::spawn  drain_source_events    ─────────────────────────────────────────────► (async, concurrently)
 tokio::spawn  drain_destination_events ──────────────────────────────────────────► (async, concurrently)
+tokio::spawn  sink supervisor        (if sink:)  ──────────────────────────────────► (async, concurrently)
+tokio::spawn  state supervisor       (if state:) ──────────────────────────────────► (async, concurrently)
 spawn_blocking  pump                ────────────────────────────────────────────►  (blocks until done)
-await pump result
+tokio::spawn  heartbeat              (while the pump runs)
+await pump result, stop the heartbeat
 await Finished from source control channel
 await Finished from destination control channel
+await both event drains
+await the state supervisor (final watermark flush, lock released)
+await the sink supervisor (delivery queue drained)
+remove the core-allocated staging scratch dir (if any)
 ```
 
 ## What the `Finished` message carries

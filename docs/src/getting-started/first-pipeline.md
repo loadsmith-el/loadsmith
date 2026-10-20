@@ -41,7 +41,7 @@ destination:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `host` | string | — | Postgres server hostname |
+| `host` | string or list | `localhost` | Postgres server hostname (a list for multi-node clusters) |
 | `port` | integer | `5432` | Postgres server port |
 | `dbname` | string | — | Database name |
 | `user` | string | — | Login user |
@@ -73,18 +73,20 @@ Before running, validate the pipeline without executing it:
   --dry-run
 ```
 
-To see the fully resolved config with secrets masked:
+To see the fully resolved config with secrets masked (`--print-resolved-config`
+prints and exits on its own, so `--dry-run` is not needed):
 
 ```bash
 ./target/debug/loadsmith run pipeline.yaml \
-  --dry-run \
   --print-resolved-config
 ```
 
-Output:
+Output (the whole config, defaults included):
 ```yaml
 pipeline:
   name: my-first-pipeline
+  description: Export orders to JSONL
+  heartbeat_seconds: 30
 source:
   type: postgres
   config:
@@ -92,47 +94,54 @@ source:
     port: 5432
     dbname: mydb
     user: myuser
-    password: "***"
+    password: ***
     query: SELECT * FROM orders ORDER BY id
     batch_size: 2000
 destination:
   type: jsonl
   config:
     path: /tmp/orders.jsonl
+sink: null
+state: null
 ```
 
 ## Step 4 — Run
 
 ```bash
-./target/debug/loadsmith run pipeline.yaml```
+./target/debug/loadsmith run pipeline.yaml
+```
 
 You'll see:
 
 ```
-Loadsmith v0.1.0  ·  postgres → jsonl
+loadsmith 0.2.0
+postgres → jsonl
 
-  schema negotiated — 4 columns
-    id: int64
-    customer: utf8
-    total: float64
-    created_at: timestamp_ms
+2026-10-20T14:03:08.398204Z  INFO loadsmith_core::lifecycle: configured plugin=source name=loadsmith-source-postgres version=0.2.1
+…
+2026-10-20T14:03:08.412204Z  INFO loadsmith_core::reporter: schema negotiated — 4 columns
+2026-10-20T14:03:08.412204Z  INFO loadsmith_core::reporter: id: int64
+2026-10-20T14:03:08.412204Z  INFO loadsmith_core::reporter: customer: utf8
+2026-10-20T14:03:08.412204Z  INFO loadsmith_core::reporter: total: float64
+2026-10-20T14:03:08.412204Z  INFO loadsmith_core::reporter: created_at: timestamp_ms
+…
+2026-10-20T14:03:08.731204Z  INFO loadsmith_core::reporter: 2,000 rows · 1 batch
+2026-10-20T14:03:08.902204Z  INFO loadsmith_core::reporter: 4,000 rows · 2 batches
+2026-10-20T14:03:09.288204Z  INFO loadsmith_core::reporter: 8,000 rows · 4 batches
+2026-10-20T14:03:10.096204Z  INFO loadsmith_core::reporter: 16,000 rows · 8 batches
+2026-10-20T14:03:11.371204Z  INFO loadsmith_core::reporter: 24,500 rows · 13 batches
+…
 
-  batch   1    2,000 rows
-  batch   2    4,000 rows
-  batch   4    8,000 rows
-  batch   8   16,000 rows
-  batch  16   24,500 rows
-
-─────────────────────────────────────────────────────
+───────────────────────────────────────────
 Pipeline:     my-first-pipeline
 Route:        loadsmith-source-postgres → loadsmith-destination-jsonl
 Status:       success
 Rows read:    24,500
 Rows written: 24,500
-Batches:      16
-Duration:     0:00:03
-Throughput:   8,166 rows/s
-─────────────────────────────────────────────────────
+Batches:      13
+Duration:     00:00:03.012
+Throughput:   8,134 rows/s
+───────────────────────────────────────────
 ```
 
 **Stdout** carries the human report's header and final summary box.
@@ -157,19 +166,24 @@ To see every control message exchanged between the core and each plugin:
   --log-level debug
 ```
 
-This prints the full handshake sequence to stderr:
+This prints the full handshake sequence to stderr (timestamps trimmed):
 
 ```
-DEBUG loadsmith_core::lifecycle: → handshake (source)
-DEBUG loadsmith_core::lifecycle: ← handshake_ack name=loadsmith-source-postgres version=0.1.0 supported=[1]
-DEBUG loadsmith_core::lifecycle: → set_protocol_version version=1
-DEBUG loadsmith_core::lifecycle: ← capabilities_response supports=[]
-DEBUG loadsmith_core::lifecycle: → configure
-DEBUG loadsmith_core::lifecycle: ← configure_ack ok
-DEBUG loadsmith_core::lifecycle: → start
-DEBUG loadsmith_core::lifecycle: ← schema fields=34
+DEBUG loadsmith_core::lifecycle: → handshake plugin=source
+DEBUG loadsmith_core::lifecycle: ← handshake_ack plugin=source name=loadsmith-source-postgres version=0.2.1 supported=[1]
+DEBUG loadsmith_core::lifecycle: → set_protocol_version plugin=source protocol_version=1
+DEBUG loadsmith_core::lifecycle: ← capabilities plugin=source supports=["batch_read", "schema_inference", "incremental_state"]
+DEBUG loadsmith_core::lifecycle: → configure plugin=source
+DEBUG loadsmith_core::lifecycle: ← configure_ack ok plugin=source
+ INFO loadsmith_core::lifecycle: configured plugin=source name=loadsmith-source-postgres version=0.2.1
+...
+DEBUG loadsmith_core::lifecycle: → start plugin="source" has_resume=false
+DEBUG loadsmith_core::lifecycle: ← schema plugin="source" fields=4
 ...
 ```
+
+The `capabilities_request` the core sends is not logged; only the plugin's answer
+is.
 
 ## Using `--no-color`
 
@@ -177,6 +191,7 @@ When redirecting stdout to a file or running in a CI environment where ANSI
 escape codes appear as garbage:
 
 ```bash
-loadsmith run pipeline.yaml --no-color```
+loadsmith run pipeline.yaml --no-color
+```
 
 Or set the environment variable `NO_COLOR=1` (follows the [no-color.org](https://no-color.org) convention).

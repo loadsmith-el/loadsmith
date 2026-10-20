@@ -13,7 +13,7 @@ to change for it to be worth reconsidering.
 ## Unified read/write driver per plugin family
 
 **Idea:** Instead of separate `SourcePlugin` and `DestinationPlugin`
-implementations per backend (e.g. `plugins/postgres/src/source.rs` and
+implementations per backend (e.g. `loadsmith-canonical-plugins/postgres/src/source.rs` and
 `destination.rs`), have a single "driver" per backend that knows how to both
 read and write, implementing one combined trait.
 
@@ -35,9 +35,9 @@ match a core that deliberately keeps the two roles apart.
 **The right level of reuse:** shared low-level modules (connection, type
 conversion, wire format) per backend, with separate `SourcePlugin` /
 `DestinationPlugin` implementations on top. This generalizes cleanly to
-non-database backends too — e.g. a future `sources/parquet` would share a
-schema/type-conversion module with `destinations/parquet`, without needing a
-combined read+write trait.
+non-database backends too — e.g. a future parquet source in the `parquet`
+crate would share its type-conversion module with the parquet destination,
+without needing a combined read+write trait.
 
 **Reconsider if:** the core's plugin protocol itself changes to merge the
 source/destination roles into one process — unlikely, since that's the

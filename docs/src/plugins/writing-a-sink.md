@@ -100,8 +100,22 @@ impl SinkPlugin for LocalCopyPlugin {
 ```
 
 The binary name must be `loadsmith-sink-{type}` (e.g. `loadsmith-sink-local-copy`)
-so the core can discover it from `--plugin-dir`. Register the crate in the
-workspace root `Cargo.toml` and add it to the `Dockerfile`'s build/copy lists.
+so the core can discover it from `--plugin-dir` (or `PATH`). Add the package to
+`loadsmith-canonical-plugins` (or your own repo) with install metadata:
+
+```toml
+[package.metadata.loadsmith]
+name     = "<type>"
+summary  = "…"
+protocol = "^1"
+provides = [
+    { kind = "sink", bin = "loadsmith-sink-<type>" },
+]
+```
+
+and release it, so `loadsmith plugin install` can fetch it. A canonical plugin is
+also picked up by the `-bundled` image, which runs `loadsmith plugin install --all`
+against the canonical index.
 
 ## End-to-end testing
 

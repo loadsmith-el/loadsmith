@@ -18,10 +18,11 @@ and a clean separation between control, data, and event channels.
 
 ## Why Loadsmith
 
-- **Plugin-first.** Sources, destinations, parsers and config/secret providers are
-  separate executables. The core knows nothing about Postgres, S3 or Parquet —
-  that knowledge lives in plugins. Plugins can be written in any language that
-  speaks the protocol.
+- **Plugin-first.** Sources, destinations and sinks are separate executables. The
+  core knows nothing about Postgres, S3 or Parquet — that knowledge lives in
+  plugins. Plugins can be written in any language that speaks the protocol.
+  (Parser and config/secret-provider plugins are defined by the protocol and
+  SDK but not yet wired into the core.)
 - **Real streaming.** Data flows in Apache Arrow batches with server-side cursors
   where available, so a 100M-row table never has to fit in RAM.
 - **Three separate planes.** Control, data, and events each get their own channel,
@@ -49,8 +50,9 @@ Plugins (separate processes)
   ├── sources         read data        (e.g. postgres)
   ├── destinations    write data       (e.g. postgres, jsonl, parquet)
   ├── sinks           deliver files    (e.g. local-copy → later s3)
-  ├── parsers         raw → tabular
-  └── providers       config / secrets (e.g. file)
+  ├── parsers         raw → tabular       (protocol-level only, not yet run by the core)
+  └── providers       config / secrets (e.g. file — protocol/SDK only; the core
+                      resolves {{ env() }} / {{ file() }} templates itself)
 
 Channels
   ├── control plane : JSONL over stdin/stdout
@@ -67,6 +69,8 @@ The workspace is split into focused crates:
 | `loadsmith-arrow` | Arrow IPC read/write + schema helpers |
 | `loadsmith-plugin-sdk` | drive the full plugin lifecycle; you implement the data |
 | `loadsmith-config` | YAML parsing, validation, templates, secret masking |
+| `loadsmith-plugin-manifest` | the `loadsmith-plugin.yaml` manifest schema + validation, used by `plugin install` |
+| `loadsmith-tls` | shared rustls + rustls-rustcrypto TLS config for network plugins |
 | `loadsmith-core` | orchestration, the data pump, the run summary |
 | `loadsmith-cli` | the `loadsmith` binary |
 
@@ -157,24 +161,23 @@ destination:
 loadsmith run pipeline.yaml   # discovers plugins in ~/.loadsmith/plugins
 ```
 
+The header and the summary box go to stdout; schema and progress lines are
+timestamped `INFO` log lines on stderr (shortened here):
+
 ```text
-loadsmith 0.1.0
+loadsmith 0.2.0
 postgres → jsonl
 
-  schema negotiated — 34 columns
-  id: utf8
-  spacecraft_id: utf8
-  event_sequence: int64
-  sensor_name: utf8
-  reading_double: float64
-  is_anomaly: bool
-  event_timestamp: timestamp_ms
-  ...
-
-           2,000 rows · 1 batch
-           4,000 rows · 2 batches
-          ...
-         100,000 rows · 50 batches
+… INFO loadsmith_core::reporter: schema negotiated — 34 columns
+… INFO loadsmith_core::reporter: id: utf8
+… INFO loadsmith_core::reporter: spacecraft_id: utf8
+… INFO loadsmith_core::reporter: event_sequence: int64
+… INFO loadsmith_core::reporter: event_timestamp: timestamp_ms
+…
+… INFO loadsmith_core::reporter: 2,000 rows · 1 batch
+… INFO loadsmith_core::reporter: 4,000 rows · 2 batches
+…
+… INFO loadsmith_core::reporter: 100,000 rows · 50 batches
 
 ───────────────────────────────────────────
 Pipeline:     postgres-to-jsonl
@@ -182,8 +185,9 @@ Route:        loadsmith-source-postgres → loadsmith-destination-jsonl
 Status:       success
 Rows read:    100,000
 Rows written: 100,000
-Duration:     00:00:03
-Throughput:   31,888 rows/s
+Batches:      50
+Duration:     00:00:03.137
+Throughput:   31,877 rows/s
 ───────────────────────────────────────────
 ```
 
@@ -195,11 +199,16 @@ Throughput:   31,888 rows/s
 loadsmith run pipeline.yaml                 # run a pipeline
 loadsmith run pipeline.yaml --dry-run       # validate without executing
 loadsmith run pipeline.yaml --print-resolved-config   # show resolved config (secrets masked)
-loadsmith run pipeline.yaml --plugin-dir ./target/debug
+loadsmith run pipeline.yaml --plugin-dir ../loadsmith-canonical-plugins/target/debug
 
 loadsmith validate pipeline.yaml            # validate config only
 loadsmith plugin list                       # list installed plugins
-loadsmith plugin install ./my-plugin-binary # install a plugin
+loadsmith plugin install postgres           # a whole package (source + destination)
+loadsmith plugin install mysql:source@0.1.1 # one kind, pinned version (or --kind source)
+loadsmith plugin install --all              # every package in the canonical index
+loadsmith plugin install -f loadsmith-plugin.yaml      # from a manifest (path or URL)
+loadsmith plugin install --binary ./my-plugin-binary   # a local binary, no manifest
+loadsmith plugin uninstall postgres         # remove a package (or postgres:source)
 loadsmith state show pipeline.yaml          # show a pipeline's persisted watermark
 loadsmith state rm pipeline.yaml            # reset incremental state (next run is full)
 
@@ -208,9 +217,12 @@ loadsmith state rm pipeline.yaml            # reset incremental state (next run 
 --no-color                                  # plain output for files / CloudWatch
 ```
 
-Plugins are discovered in `~/.loadsmith/plugins/` by default (override with
-`LOADSMITH_PLUGIN_PATH` or `--plugin-dir`). The core only runs binaries that are
-explicitly installed — it never scans `PATH`.
+Plugins are looked up as `loadsmith-{kind}-{type}` in the plugin dir
+(`~/.loadsmith/plugins/` by default, override with `--plugin-dir`), then on `PATH`
+as a fallback (the `-bundled` image relies on it). `list`, `install`, `uninstall`,
+`run` and `validate` all take `--plugin-dir`; `install` also takes `--index` to
+use another plugin index. See the
+[CLI reference](docs/src/reference/cli.md) for every flag.
 
 ---
 
@@ -237,16 +249,26 @@ loadsmith-lab run --loadsmith ../loadsmith --select catalog/postgres-to-jsonl
 
 ## Status
 
-Loadsmith is at **v0.1.0** — the architecture is proven end-to-end:
+Loadsmith is at **v0.2.0** — the architecture is proven end-to-end:
 
 - ✅ Core orchestration, process-isolated plugins, the data pump
 - ✅ Control plane (JSONL), data plane (Arrow IPC), event plane (JSONL)
-- ✅ Plugins: `postgres` source (server-side cursor) & `postgres` destination
-  (`atomic` / `staged_merge`), `jsonl` & `parquet` destinations, `file` provider
+- ✅ Canonical plugins: `postgres`, `mysql` and `oracle` source + destination
+  (`atomic` / `staged_merge`), `sharepoint` source, `jsonl` / `null` / `parquet`
+  destinations, `local-copy` sink, and the `file` config provider (protocol-level
+  only — the core does not invoke config providers yet)
+- ✅ Sink delivery stage (supervised, respawn + resume from the delivery ledger)
+- ✅ `loadsmith plugin install` / `uninstall` from the canonical index
+  (sha256-verified, per-kind, pinned versions)
+- ✅ Static musl binaries and four image flavors (`-static`, `-static-debug`,
+  `-slim` = `:latest`, `-bundled`)
+- ✅ `{{ env() }}` / `{{ file() }}` config templates, secret masking in
+  `--print-resolved-config`
 - ✅ Live progress + run summary, `--log-level`, `--no-color`
 - ✅ Incremental state & checkpoints (core-owned watermark, locking, `loadsmith
   state`); at-least-once, exactly-once with an idempotent destination
-- 🔜 Templates & secret providers, remote (`s3`) state backend, more plugins
+- 🔜 Secret-provider plugins (vault, cloud secret managers), remote (`s3`) state
+  backend, `s3` sink, more plugins — see [ROADMAP.md](ROADMAP.md)
 
 The full design rationale lives in [`definitions/loadsmith.md`](definitions/loadsmith.md)
 and the protocol in [`definitions/protocol.md`](definitions/protocol.md).

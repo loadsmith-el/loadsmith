@@ -1,51 +1,51 @@
-# Loadsmith — Protocolo Core/Plugin
+# Loadsmith — Core/Plugin Protocol
 
-## 1. Visão geral
+## 1. Overview
 
-Este documento define o contrato de comunicação entre o Loadsmith Core e os plugins. Toda comunicação é orientada a mensagens. Há três canais separados por finalidade:
+This document defines the communication contract between the Loadsmith Core and its plugins. All communication is message-oriented. There are three channels, separated by purpose:
 
-| Canal | Direção | Formato | Propósito |
+| Channel | Direction | Format | Purpose |
 |---|---|---|---|
-| stdin (fd0) | Core → Plugin | JSONL | Mensagens de controle do core para o plugin |
-| stdout (fd1) | Plugin → Core | JSONL | Mensagens de controle do plugin para o core |
-| fd3 | Varia por kind* | Apache Arrow IPC | Batches de dados tabulares |
-| fd4 | Plugin → Core | JSONL | Logs e eventos estruturados |
+| stdin (fd0) | Core → Plugin | JSONL | Control messages from the core to the plugin |
+| stdout (fd1) | Plugin → Core | JSONL | Control messages from the plugin to the core |
+| fd3 | Depends on kind* | Apache Arrow IPC | Batches of tabular data |
+| fd4 | Plugin → Core | JSONL | Logs and structured events |
 
-*fd3 é de escrita para sources e de leitura para destinations.
+*fd3 is written by sources and read by destinations. Sinks have no fd3.
 
-`stderr` não é usado como canal de comunicação.
-
----
-
-## 2. Formato das mensagens
-
-Cada mensagem é um objeto JSON serializado em uma única linha, delimitado por `\n`.
-
-Regras:
-- Uma mensagem por linha
-- Sem JSON multiline
-- Sem JSON sem delimitação de linha
-- O campo `type` é obrigatório em todas as mensagens
-- Campos desconhecidos devem ser ignorados — garante compatibilidade futura
+`stderr` is not used as a communication channel.
 
 ---
 
-## 3. Versionamento
+## 2. Message format
 
-O protocolo usa **versionamento por inteiro ordinal**, começando em `1`. Incrementa a cada mudança incompatível.
+Each message is a JSON object serialized on a single line, delimited by `\n`.
 
-A versão é negociada no handshake. Uma vez definida via `set_protocol_version`, vale para toda a execução.
+Rules:
+- One message per line
+- No multi-line JSON
+- No JSON without a line delimiter
+- The `type` field is mandatory in every message
+- Unknown fields must be ignored — this guarantees forward compatibility
+
+---
+
+## 3. Versioning
+
+The protocol uses **ordinal integer versioning**, starting at `1`. It is incremented on every incompatible change.
+
+The version is negotiated in the handshake. Once set via `set_protocol_version`, it holds for the whole run.
 
 ---
 
 ## 4. Lifecycle
 
-### 4.1 Negociação de protocolo
+### 4.1 Protocol negotiation
 
 ```
 Core → Plugin   handshake
 Plugin → Core   handshake_ack
-Core → Plugin   set_protocol_version    (ou error se incompatível → processo encerrado)
+Core → Plugin   set_protocol_version    (if incompatible: the core aborts the run; nothing is sent)
 ```
 
 ### 4.2 Capabilities
@@ -55,28 +55,32 @@ Core → Plugin   capabilities_request
 Plugin → Core   capabilities_response
 ```
 
-### 4.3 Configuração
+### 4.3 Configuration
 
 ```
 Core → Plugin   configure
-Plugin → Core   configure_ack           (ok ou error → processo encerrado em caso de error)
+Plugin → Core   configure_ack           (ok or error; on error the core aborts the run)
 ```
 
-### 4.4 Execução
+### 4.4 Execution
 
 ```
-Core → Plugin   start                   (pode carregar resume para sources incrementais)
-Plugin → Core   schema                  (source: antes do primeiro batch)
-Plugin → Core   ready                   (destination: pronto para receber batches)
-                ... dados via fd3 ...
-                ... progress, log e ping/pong ocorrem durante a execução ...
-                ... checkpoint (source) e committed (destination) ocorrem no fd4 ...
+Core → Plugin   start                   (may carry resume for incremental sources)
+Plugin → Core   schema                  (source: before the first batch)
+Plugin → Core   ready                   (destination: ready to receive batches)
+                ... data over fd3 ...
+                ... progress and log happen during execution ...
+                ... checkpoint (source) and committed (destination) happen on fd4 ...
+                ... ping/pong happens with sinks only (see below) ...
 Plugin → Core   finished
 ```
 
-### 4.5 Cancelamento
+### 4.5 Cancellation
 
-Pode ocorrer a qualquer momento após `start`.
+> **Reserved — not currently emitted by the core.** The core never sends
+> `cancel` today; only the sink SDK reacts to it.
+
+Intended to be possible at any time after `start`:
 
 ```
 Core → Plugin   cancel
@@ -85,11 +89,11 @@ Plugin → Core   finished  (status: cancelled)
 
 ---
 
-## 5. Referência de mensagens
+## 5. Message reference
 
 ### `handshake`
 
-**Core → Plugin.** Primeira mensagem enviada pelo core após iniciar o processo do plugin.
+**Core → Plugin.** The first message the core sends after starting the plugin process.
 
 ```jsonl
 {"type":"handshake"}
@@ -99,28 +103,28 @@ Plugin → Core   finished  (status: cancelled)
 
 ### `handshake_ack`
 
-**Plugin → Core.** Resposta imediata ao `handshake`. O plugin declara as versões de protocolo que suporta, sua identidade e kind.
+**Plugin → Core.** Immediate reply to `handshake`. The plugin declares the protocol versions it supports, its identity and its kind.
 
 ```jsonl
 {"type":"handshake_ack","protocol_supported_versions":[1],"plugin_name":"loadsmith-source-csv","plugin_version":"0.1.0","kind":"source"}
 ```
 
-Campos:
+Fields:
 
-| Campo | Tipo | Descrição |
+| Field | Type | Description |
 |---|---|---|
-| `protocol_supported_versions` | `int[]` | Versões suportadas pelo plugin, em ordem crescente |
-| `plugin_name` | `string` | Identificador único do plugin |
-| `plugin_version` | `string` | Versão do binário do plugin |
-| `kind` | `string` | `"source"`, `"destination"`, `"sink"`, `"parser"` ou `"provider"` |
+| `protocol_supported_versions` | `int[]` | Versions supported by the plugin, in ascending order |
+| `plugin_name` | `string` | Plugin identifier (by convention the binary name; not enforced by the core) |
+| `plugin_version` | `string` | Version of the plugin binary |
+| `kind` | `string` | `"source"`, `"destination"`, `"sink"`, `"parser"` or `"config_provider"` |
 
 ---
 
 ### `set_protocol_version`
 
-**Core → Plugin.** O core escolhe a versão a usar — a mais alta presente em `protocol_supported_versions` que o core também suporta. A partir deste momento, o protocolo da versão escolhida está em vigor.
+**Core → Plugin.** The core picks the version to use — the highest one present in `protocol_supported_versions` that the core also supports. From this point on, the protocol of the chosen version is in force.
 
-Se não houver versão compatível, o core envia `error` e encerra o processo do plugin.
+If there is no compatible version, the core aborts the run with a `no compatible protocol version` error and sends nothing to the plugin (the plugin sees its stdin close).
 
 ```jsonl
 {"type":"set_protocol_version","protocol_version":1}
@@ -130,7 +134,7 @@ Se não houver versão compatível, o core envia `error` e encerra o processo do
 
 ### `capabilities_request`
 
-**Core → Plugin.** Solicita as capabilities do plugin.
+**Core → Plugin.** Requests the plugin's capabilities.
 
 ```jsonl
 {"type":"capabilities_request"}
@@ -146,21 +150,26 @@ Se não houver versão compatível, o core envia `error` e encerra o processo do
 {"type":"capabilities_response","supports":["schema_inference","batch_read","incremental_state"]}
 ```
 
-Capabilities definidas (extensível):
+Defined capabilities (extensible):
 
-| Capability | Descrição |
+| Capability | Description |
 |---|---|
-| `schema_inference` | O plugin consegue inferir o schema da fonte |
-| `batch_read` | Leitura em batches |
-| `incremental_state` | Source: aceita um cursor de resume e reporta watermarks via `checkpoint` |
-| `checkpointed_commit` | Destination: confirma durabilidade por chunk via `committed`, habilitando checkpoint intra-run |
-| `staged_merge` | Destination: grava em staging e faz `MERGE` por PK no fim — exactly-once efetivo |
+| `schema_inference` | The plugin can infer the source's schema |
+| `batch_read` | Reads in batches (source SDK default) |
+| `incremental_state` | Source: accepts a resume cursor and reports watermarks via `checkpoint`. Required by the core when the pipeline has a `state:` block |
+| `batch_write` | Writes in batches (destination SDK default) |
+| `object_output` | Destination: stages files and announces each via `object_ready`. Required by the core when the pipeline has a `sink:` block |
+| `staged_merge` | Destination: writes to staging and does a `MERGE` by PK at the end — exactly-once effective. Advertised, but not read by the core |
+| `object_delivery` | Sink: delivers staged objects (sink SDK default) |
+| `fetch` | Config provider: fetches a configuration document (config-provider SDK default) |
+
+Intra-run durability needs no capability: a destination reports it by emitting `committed` during the run (in the SDK, by implementing `durable_through()`).
 
 ---
 
 ### `configure`
 
-**Core → Plugin.** Envia o bloco de configuração do plugin — o conteúdo de `source.config`, `destination.config`, etc. O conteúdo de `config` é opaco para o core.
+**Core → Plugin.** Sends the plugin's configuration block — the contents of `source.config`, `destination.config`, etc. The contents of `config` are opaque to the core.
 
 ```jsonl
 {"type":"configure","config":{...}}
@@ -170,30 +179,31 @@ Capabilities definidas (extensível):
 
 ### `configure_ack`
 
-**Plugin → Core.** Resultado da validação interna da configuração.
+**Plugin → Core.** Result of the plugin's own validation of the configuration.
 
-Sucesso:
+Success:
 
 ```jsonl
 {"type":"configure_ack","status":"ok"}
 ```
 
-Erro:
+Error:
 
 ```jsonl
-{"type":"configure_ack","status":"error","code":"INVALID_CONFIG","message":"campo 'path' é obrigatório"}
+{"type":"configure_ack","status":"error","code":"INVALID_CONFIG","message":"field 'path' is required"}
 ```
 
-Se `status` for `error`, o core exibe `message` para o usuário e encerra a execução.
+If `status` is `error`, the core shows `message` to the user and aborts the run. (SDK-based plugins always use the code `CONFIGURE_FAILED`.)
 
 ---
 
 ### `start`
 
-**Core → Plugin.** Inicia a execução. Para um source incremental cujo pipeline
-tem estado persistido de um run anterior, o core inclui `resume` com o watermark
-opaco a retomar — o core nunca interpreta `cursor_value`, só o armazena e devolve.
-A forma curta `{"type":"start"}` continua válida (campo opcional).
+**Core → Plugin.** Starts execution. For an incremental source whose pipeline has
+state persisted from a previous run, the core includes `resume` with the opaque
+watermark to resume from — the core never interprets `cursor_value`, it only
+stores and returns it. The short form `{"type":"start"}` remains valid (the field
+is optional).
 
 ```jsonl
 {"type":"start"}
@@ -204,24 +214,24 @@ A forma curta `{"type":"start"}` continua válida (campo opcional).
 
 ### `schema`
 
-**Plugin → Core. Apenas sources.** Enviado antes do primeiro batch. Descreve o schema dos dados que serão produzidos.
+**Plugin → Core. Sources only.** Sent before the first batch. Describes the schema of the data that will be produced.
 
 ```jsonl
-{"type":"schema","fields":[{"name":"id","type":"int64"},{"name":"nome","type":"utf8"},{"name":"criado_em","type":"timestamp_ms"}]}
+{"type":"schema","fields":[{"name":"id","type":"int64"},{"name":"name","type":"utf8"},{"name":"created_at","type":"timestamp_ms"}]}
 ```
 
-Campos de `fields`:
+`fields` entries:
 
-| Campo | Tipo | Descrição |
+| Field | Type | Description |
 |---|---|---|
-| `name` | `string` | Nome da coluna |
-| `type` | `string` | Tipo Arrow: `int32`, `int64`, `float32`, `float64`, `utf8`, `bool`, `date32`, `timestamp_ms`, `binary` |
+| `name` | `string` | Column name |
+| `type` | `string` | Arrow type: `int32`, `int64`, `float32`, `float64`, `utf8`, `bool`, `date32`, `timestamp_ms`, `binary` |
 
 ---
 
 ### `ready`
 
-**Plugin → Core. Apenas destinations.** Enviado após `start`, indicando que o plugin está pronto para receber batches via fd3.
+**Plugin → Core. Destinations and sinks.** Sent after `start`, signalling that the plugin is ready to receive batches via fd3 (or, for a sink, objects to deliver).
 
 ```jsonl
 {"type":"ready"}
@@ -231,7 +241,7 @@ Campos de `fields`:
 
 ### `progress`
 
-**Plugin → Core.** Enviado periodicamente durante a execução.
+**Plugin → Core.** Sent periodically during execution.
 
 Source:
 
@@ -249,24 +259,24 @@ Destination:
 
 ### `log`
 
-**Plugin → Core. Via fd4 (canal de eventos). Nunca via stdout.**
+**Plugin → Core. Via fd4 (the event channel). Never via stdout.**
 
 ```jsonl
-{"type":"log","level":"info","message":"conectado ao banco"}
+{"type":"log","level":"info","message":"connected to the database"}
 ```
 
-Níveis: `trace`, `debug`, `info`, `warn`, `error`.
+Levels: `trace`, `debug`, `info`, `warn`, `error`.
 
 ---
 
 ### `checkpoint`
 
-**Source → Core. Via fd4 (canal de eventos).** O watermark mais alto da coluna
-de cursor produzido até o batch `batch_seq`. `cursor_value` é opaco para o core.
-O core só persiste esse valor depois que o destination confirma (via `committed`)
-que o batch correspondente está durável — é essa porta de durabilidade que torna
-o resume sem-gap (at-least-once; duplicatas de fronteira absorvidas por um
-destination idempotente).
+**Source → Core. Via fd4 (the event channel).** The highest watermark of the
+cursor column produced through batch `batch_seq`. `cursor_value` is opaque to the
+core. The core only persists this value after the destination confirms (via
+`committed`) that the matching batch is durable — this durability gate is what
+makes resume gap-free (at-least-once; boundary duplicates absorbed by an
+idempotent destination).
 
 ```jsonl
 {"type":"checkpoint","cursor_value":"2026-06-09T08:00:00Z","batch_seq":42}
@@ -276,10 +286,11 @@ destination idempotente).
 
 ### `committed`
 
-**Destination → Core. Via fd4 (canal de eventos).** Tudo até o batch `batch_seq`
-(inclusive) está duravelmente gravado. Um destination que só fica durável no
-final (ex.: staging + swap atômico) emite um único `committed` cobrindo todos os
-batches no `finalize`; um destination com flush incremental emite ao longo do run.
+**Destination → Core. Via fd4 (the event channel).** Everything through batch
+`batch_seq` (inclusive) is durably written. A destination that only becomes
+durable at the end (e.g. staging + atomic swap) emits a single `committed`
+covering every batch at `finalize`; a destination with incremental flush emits
+them during the run.
 
 ```jsonl
 {"type":"committed","batch_seq":42}
@@ -289,11 +300,11 @@ batches no `finalize`; um destination com flush incremental emite ao longo do ru
 
 ### `object_ready`
 
-**Destination → Core. Via fd4 (canal de eventos).** Enviado por um destination de
-arquivo quando um arquivo de staging é finalizado (footer escrito). O core
-encaminha o path ao supervisor do sink, que o entrega — assim a entrega se
-sobrepõe ao pump. Usar o canal de eventos (já drenado concorrentemente) é o que
-permite entregar um chunk no instante em que ele fecha.
+**Destination → Core. Via fd4 (the event channel).** Sent by a file-output
+destination when a staged file is finalized (footer written). The core forwards
+the path to the sink supervisor, which delivers it — so delivery overlaps the
+pump. Using the event channel (already drained concurrently) is what allows a
+chunk to be delivered the moment it closes.
 
 ```jsonl
 {"type":"object_ready","path":"/scratch/events.00000001.snappy.parquet"}
@@ -303,9 +314,9 @@ permite entregar um chunk no instante em que ele fecha.
 
 ### `deliver_object`
 
-**Core → Sink. Via canal de controle.** Uma por arquivo a entregar. O core fecha
-o stdin do sink (EOF) quando todos os objetos foram entregues, sinalizando ao
-sink para finalizar.
+**Core → Sink. Via the control channel.** One per file to deliver. The core
+closes the sink's stdin (EOF) once every object has been delivered, signalling
+the sink to finalize.
 
 ```jsonl
 {"type":"deliver_object","path":"/scratch/events.00000001.snappy.parquet"}
@@ -315,9 +326,9 @@ sink para finalizar.
 
 ### `object_delivered`
 
-**Sink → Core. Via canal de controle.** Ack por objeto entregue. Alimenta o
-ledger de entrega do core: se o sink cair, o core o respawna e reenvia apenas os
-objetos ainda não confirmados. `deliver` deve ser idempotente.
+**Sink → Core. Via the control channel.** Per-object delivery ack. It feeds the
+core's delivery ledger: if the sink dies, the core respawns it and re-sends only
+the objects not yet acknowledged. `deliver` must be idempotent.
 
 ```jsonl
 {"type":"object_delivered","path":"/scratch/events.00000001.snappy.parquet"}
@@ -327,7 +338,8 @@ objetos ainda não confirmados. `deliver` deve ser idempotente.
 
 ### `ping`
 
-**Core → Plugin.** Healthcheck. Enviado quando o plugin fica silencioso por mais tempo do que o timeout de healthcheck configurado.
+**Core → Sink.** Liveness check. Today only the sink supervisor sends `ping`, on
+a fixed 5-second interval; sources and destinations are never pinged.
 
 ```jsonl
 {"type":"ping"}
@@ -337,19 +349,24 @@ objetos ainda não confirmados. `deliver` deve ser idempotente.
 
 ### `pong`
 
-**Plugin → Core.** Resposta imediata ao `ping`.
+**Sink → Core.** Immediate reply to `ping`.
 
 ```jsonl
 {"type":"pong"}
 ```
 
-Se o core não receber `pong` dentro de um prazo configurável após o `ping`, considera o plugin morto, encerra o processo e reporta timeout.
+If the core has not received a `pong` by the next ping tick, it treats the sink
+as hung: it respawns the sink and re-sends every unacked object from the delivery
+ledger, up to 5 restarts, after which delivery fails. Nothing about this is
+configurable.
 
 ---
 
 ### `cancel`
 
-**Core → Plugin.** Solicita cancelamento. O plugin deve encerrar o mais rápido possível e enviar `finished`.
+**Core → Plugin. Reserved — not currently emitted by the core.** Requests
+cancellation: the plugin should stop as fast as possible and send `finished`.
+Only the sink SDK handles it today.
 
 ```jsonl
 {"type":"cancel","reason":"timeout"}
@@ -359,37 +376,40 @@ Se o core não receber `pong` dentro de um prazo configurável após o `ping`, c
 
 ### `error`
 
-**Core → Plugin.** Erro irrecuperável emitido pelo core antes ou durante o handshake. O processo é encerrado após este envio.
+**Core → Plugin. Reserved — not currently emitted by the core.** Meant for an
+unrecoverable error raised by the core before or during the handshake. Today the
+core instead aborts the run with a local error (e.g. `no compatible protocol
+version: …`) and the plugin just sees its stdin close.
 
 ```jsonl
-{"type":"error","code":"UNSUPPORTED_PROTOCOL_VERSION","message":"plugin suporta versões [2, 3], core suporta apenas [1]"}
+{"type":"error","code":"UNSUPPORTED_PROTOCOL_VERSION","message":"plugin supports versions [2, 3], core supports only [1]"}
 ```
 
 ---
 
 ### `finished`
 
-**Plugin → Core.** Última mensagem enviada pelo plugin.
+**Plugin → Core.** The last message the plugin sends.
 
-Sucesso (source):
+Success (source):
 
 ```jsonl
 {"type":"finished","status":"success","rows_read":21473000,"batches_read":2148}
 ```
 
-Sucesso (destination):
+Success (destination):
 
 ```jsonl
 {"type":"finished","status":"success","rows_written":21473000,"batches_written":2148}
 ```
 
-Erro:
+Error:
 
 ```jsonl
-{"type":"finished","status":"error","code":"CONNECTION_FAILED","message":"falha ao conectar: connection refused"}
+{"type":"finished","status":"error","code":"CONNECTION_FAILED","message":"failed to connect: connection refused"}
 ```
 
-Cancelado:
+Cancelled:
 
 ```jsonl
 {"type":"finished","status":"cancelled"}
@@ -397,8 +417,8 @@ Cancelado:
 
 ---
 
-## 6. Compatibilidade futura
+## 6. Forward compatibility
 
-Campos desconhecidos em qualquer mensagem devem ser ignorados. Novos campos opcionais podem ser adicionados dentro de uma mesma versão de protocolo.
+Unknown fields in any message must be ignored. New optional fields may be added within the same protocol version.
 
-A adição de novos tipos de mensagem obrigatórios, ou mudança de semântica de mensagens existentes, requer incremento da versão de protocolo.
+Adding new mandatory message types, or changing the semantics of existing messages, requires incrementing the protocol version.

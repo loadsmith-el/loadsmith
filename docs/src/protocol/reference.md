@@ -10,7 +10,7 @@ while providing strong guarantees about lifecycle ordering.
 fd0 (stdin)  — JSONL, core → plugin  — lifecycle commands
 fd1 (stdout) — JSONL, plugin → core  — lifecycle responses
 fd3          — Arrow IPC stream       — data (source writes, destination reads)
-fd4          — JSONL, plugin → core  — events (logs, progress)
+fd4          — JSONL, plugin → core  — events (logs, progress, object_ready, checkpoint, committed)
 ```
 
 fd0 and fd1 are the standard Unix stdin/stdout. fd3 and fd4 are created by the
@@ -20,24 +20,17 @@ starts — they are set up by the core.
 
 ## Message framing
 
-All JSONL messages are prefixed with their byte length as a decimal ASCII string
-followed by a newline, then the JSON payload followed by a newline:
+Messages are plain JSON Lines: each message is a single-line JSON object
+terminated by `\n`, with no length prefix:
 
 ```
-<length>\n
-<json>\n
-```
-
-Example:
-```
-28
 {"type": "handshake"}
 ```
 
-This framing allows reading messages without scanning for newlines in the JSON
-body (which would be problematic for embedded strings with `\n`). The
-`loadsmith-transport` crate implements `ControlReader`/`ControlWriter` and
-`EventWriter` to handle this framing automatically. Plugin authors never write
+Newlines inside string values are JSON-escaped (`\n`), so splitting on line
+breaks is always safe. Blank lines are ignored. The `loadsmith-transport` crate
+implements `ControlReader`/`ControlWriter` and `EventWriter` to handle this
+framing automatically. Plugin authors never write
 raw bytes to these channels — the SDK handles all framing.
 
 ## Protocol version
@@ -83,10 +76,17 @@ core                                 destination plugin
                                      ← finished
 ```
 
-Both plugins are spawned concurrently. The core sends the handshake/configure
-sequence to each plugin in parallel, waits for both to reach their respective
-readiness signals (schema from the source, ready from the destination), then
-starts the data pump.
+Both plugins are spawned up front, but the core drives them in a fixed order:
+
+1. handshake / configure the source, then the destination;
+2. capability gates: `incremental_state` on the source if the pipeline has a
+   `state:` block, `object_output` on the destination if it has a `sink:` block;
+3. spawn the sink supervisor (only with `sink:`), which brings the sink up to
+   `ready`;
+4. `start` the source and wait for its `schema`;
+5. schema-drift check and state supervisor (only with `state:`);
+6. `start` the destination and wait for `ready`;
+7. start the data pump.
 
 ## Sink delivery (optional stage)
 
@@ -125,22 +125,27 @@ destination, delivering its queue at its own pace. See
 
 ## Error handling
 
-If `configure_ack` carries `status: "error"`, the core sends `cancel` to any
-other plugin already configured, waits for their `finished`, and exits with a
-non-zero code.
+If `configure_ack` carries `status: "error"`, or a plugin violates the protocol,
+the core aborts the run with an error (`plugin rejected config: …`) and exits
+with a non-zero code. No `cancel` is sent to the other plugin.
 
-If either plugin sends `finished` with `status: "error"`, the core sends `cancel`
-to the other plugin and reports the failure.
+If either plugin sends `finished` with `status: "error"`, the run is marked
+failed in the summary and the exit code is non-zero.
 
-If a plugin process exits unexpectedly (crashes), the core detects EOF on the
-control channel (fd0 read side closes when the child exits), treats it as an
-error, and cancels the other plugin.
+If a plugin process exits unexpectedly (crashes), the core sees EOF on the
+plugin's stdout (fd1) before `finished` (`EOF while waiting for …` or `plugin
+closed control channel without sending finished`) and treats it as a protocol
+error.
+
+Propagating `cancel` to the other plugin on failure is planned but not yet
+implemented.
 
 ## Implementing the protocol in another language
 
 The protocol is transport-agnostic JSON. Any language that can:
-- Read/write length-prefixed JSONL from stdin/stdout
-- Write Apache Arrow IPC to fd3 (via `arrow::ipc::writer::StreamWriter`)
+- Read/write newline-delimited JSON (JSONL) on stdin/stdout
+- Write Apache Arrow IPC to fd3 (via `arrow::ipc::writer::StreamWriter`), or,
+  for a destination, read an Arrow IPC stream from fd3
 - Write JSONL to fd4
 
 can implement a loadsmith plugin. The message schema is in

@@ -2,7 +2,7 @@
 
 Loadsmith is a **plugin-first EL (Extract & Load) tool** written in Rust. Its core
 is intentionally small: it orchestrates process-isolated plugins — sources,
-destinations, and config providers — that move data in Apache Arrow batches from
+destinations, and sinks — that move data in Apache Arrow batches from
 one place to another.
 
 ## What problem it solves
@@ -47,9 +47,10 @@ other plugin.
   aggregations, and analytical transformations belong in the database or in a
   query layer on top of the loaded data. The core will never embed DuckDB or dbt.
 
-- **Not a scheduler.** Loadsmith runs a single pipeline on demand. Scheduling,
-  incremental loads, and orchestration are concerns for the operator (cron,
-  Airflow, whatever).
+- **Not a scheduler.** Loadsmith runs a single pipeline on demand. Incremental
+  loads are built in (see [Incremental State](./architecture/incremental-state.md));
+  scheduling and orchestration are the operator's concern (cron, Airflow,
+  whatever).
 
 - **Not a streaming platform.** Each `loadsmith run` is a bounded job with a
   clear start and end. Continuous/CDC streaming is a future concern and will
@@ -63,7 +64,7 @@ other plugin.
 | Data format | Apache Arrow IPC (streaming variant) |
 | Control protocol | JSONL (newline-delimited JSON) |
 | Plugin isolation | Separate OS process per plugin |
-| Plugin discovery | Binary named `loadsmith-{kind}-{type}` in plugin dir |
+| Plugin discovery | Binary named `loadsmith-{kind}-{type}` in the plugin dir, then `PATH` |
 | Plugin dir default | `~/.loadsmith/plugins/` |
 | Protocol version | 1 (current) |
 
@@ -94,25 +95,32 @@ destination:
 ```
 $ loadsmith run pipeline.yaml
 
-Loadsmith v0.1.0  ·  postgres → jsonl
-  batch   1   2,000 rows
-  batch   2   4,000 rows
-  batch   4   8,000 rows
-  batch   8  16,000 rows
-  batch  16  24,500 rows
+loadsmith 0.2.0
+postgres → jsonl
 
-─────────────────────────────────────────────────────
+2026-10-20T14:03:08.412204Z  INFO loadsmith_core::reporter: schema negotiated — 6 columns
+…
+2026-10-20T14:03:08.731204Z  INFO loadsmith_core::reporter: 2,000 rows · 1 batch
+2026-10-20T14:03:08.902204Z  INFO loadsmith_core::reporter: 4,000 rows · 2 batches
+2026-10-20T14:03:09.288204Z  INFO loadsmith_core::reporter: 8,000 rows · 4 batches
+2026-10-20T14:03:10.096204Z  INFO loadsmith_core::reporter: 16,000 rows · 8 batches
+2026-10-20T14:03:11.371204Z  INFO loadsmith_core::reporter: 24,500 rows · 13 batches
+
+───────────────────────────────────────────
 Pipeline:     pg-to-jsonl
 Route:        loadsmith-source-postgres → loadsmith-destination-jsonl
 Status:       success
 Rows read:    24,500
 Rows written: 24,500
-Batches:      16
-Duration:     0:00:03
-Throughput:   8,166 rows/s
-─────────────────────────────────────────────────────
+Batches:      13
+Duration:     00:00:03.012
+Throughput:   8,134 rows/s
+───────────────────────────────────────────
 ```
 
+The header and the summary box are printed on stdout; the timestamped `INFO`
+lines (schema and progress, shown abridged) are the run log on stderr.
+
 The `{{ env('PG_PASSWORD') }}` template is resolved by the core before any plugin
-sees the config. The raw value is masked in logs and in `--print-resolved-config`
+sees the config. The raw value is masked as `***` in `--print-resolved-config`
 output.

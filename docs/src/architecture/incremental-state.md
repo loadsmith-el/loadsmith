@@ -52,13 +52,20 @@ is closed for free.
 
 ## Commit granularity = resume granularity
 
-A destination advertises how durable it is:
+How often a destination becomes durable decides how often the watermark can
+advance:
 
-| Capability | When durable | Watermark cadence | Guarantee |
+| Destination behavior | When durable | Watermark cadence | Guarantee |
 |---|---|---|---|
-| *(none)* | at `finalize` | end of run | at-least-once |
-| `checkpointed_commit` | incremental flush | intra-run | at-least-once |
-| `staged_merge` | atomic swap at end | end of run | exactly-once effective |
+| default | at `finalize` | end of run | at-least-once |
+| implements `durable_through()` | incremental flush | intra-run | at-least-once |
+| `mode: staged_merge` | atomic swap at end | end of run | exactly-once effective |
+
+The core reads no durability capability: intra-run durability is reported by
+implementing `DestinationPlugin::durable_through()`, after which the SDK emits a
+`committed` whenever the durable prefix advances. (`staged_merge` also appears in the
+postgres/mysql/oracle destinations' capability lists, but the core does not use
+it.)
 
 All three flow through the same `committed` mechanism — a destination that only
 becomes durable at the end simply emits a single final `committed` covering every
@@ -75,11 +82,12 @@ it preserves that serial order at the protocol boundary.
 
 **Source side.** A source may fan out fetches across connections/partitions
 internally, but must **reorder results back into cursor order** before returning
-them from `next_batch()` — and therefore before calling `events.checkpoint()`.
+them from `next_batch()` — and therefore before the SDK reads `current_watermark()`
+and emits the checkpoint.
 The core never sees out-of-order batches or a non-monotonic watermark.
 
-**Destination side.** `committed { batch_seq }` must report the **highest
-contiguous prefix** that is durable — the largest `N` such that batches `1..=N`
+**Destination side.** `committed { batch_seq }` (reported through
+`durable_through()`) must report the **highest contiguous prefix** that is durable — the largest `N` such that batches `1..=N`
 are *all* durable — not simply "the most recently finished batch". If a
 destination completes batches 5, 3, 2 (in that order) while 1 and 4 are still in
 flight, it must not yet emit `committed { 5 }`; nothing has advanced past 0 until
@@ -105,9 +113,12 @@ wasted work, never a duplicate.
 
 State lives behind a `StateBackend` trait. The shipped backend is **local**: a
 JSON state file written atomically (temp file + `rename`), with a sibling
-`<path>.lock` created via `O_EXCL`. A lock held by a *live* process fails the
-second run fast (so two concurrent runs of one pipeline can't corrupt the
-watermark); a lock left by a *dead* process is stolen with a warning. A remote
+`<path>.lock` created via `O_EXCL` that holds a time-based lease, renewed every
+20s by the running pipeline. A second run fails fast while the lease is fresh (so
+two concurrent runs of one pipeline can't corrupt the watermark); a lease not
+renewed for 60s (a crashed run) is stolen with a warning. There is no
+process-liveness check — after a crash, the next run is refused for up to 60s. A
+remote
 `s3` backend (conditional PUT for a distributed lock) slots in behind the same
 trait later.
 

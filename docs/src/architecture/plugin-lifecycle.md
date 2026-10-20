@@ -16,23 +16,27 @@ wire fd0/fd1/fd3/fd4
 → {"type": "handshake"}
                         ← {"type": "handshake_ack",
                               "plugin_name": "loadsmith-source-postgres",
-                              "plugin_version": "0.1.0",
+                              "plugin_version": "0.2.1",
                               "protocol_supported_versions": [1],
                               "kind": "source"}
 
 → {"type": "set_protocol_version", "protocol_version": 1}
 
 → {"type": "capabilities_request"}
-                        ← {"type": "capabilities_response", "supports": []}
+                        ← {"type": "capabilities_response",
+                              "supports": ["batch_read", "schema_inference",
+                                           "incremental_state"]}
 
 → {"type": "configure", "config": { ... }}
                         ← {"type": "configure_ack", "status": "ok"}
                              or
                            {"type": "configure_ack", "status": "error",
-                              "code": "invalid_config",
-                              "message": "host is required"}
+                              "code": "CONFIGURE_FAILED",
+                              "message": "invalid postgres source config: missing field `dbname`"}
 
 → {"type": "start"}
+     (an incremental source may get {"type": "start",
+                                     "resume": {"cursor_value": ...}})
 
 [source only]:
                         ← {"type": "schema", "fields": [
@@ -41,14 +45,14 @@ wire fd0/fd1/fd3/fd4
                                ...
                            ]}
                         ← [Arrow IPC stream on fd3: schema header + batches]
-                        ← [progress events on fd4]
+                        ← [progress (and checkpoint) events on fd4]
                         ← {"type": "finished", "status": "success",
                               "rows_read": 100000, "batches_read": 50}
 
 [destination only]:
                         ← {"type": "ready"}
                         ← [consumes Arrow IPC on fd3]
-                        ← [progress events on fd4]
+                        ← [progress (and committed) events on fd4]
                         ← {"type": "finished", "status": "success",
                               "rows_written": 100000, "batches_written": 50}
 ```
@@ -58,10 +62,12 @@ wire fd0/fd1/fd3/fd4
 The core sends `{"type": "handshake"}` immediately after spawning the plugin.
 The plugin responds with `HandshakeAck` announcing:
 
-- `plugin_name` — must match the binary name exactly (e.g., `loadsmith-source-postgres`)
+- `plugin_name` — by convention the binary name (e.g., `loadsmith-source-postgres`);
+  shown in the run summary, not enforced by the core
 - `plugin_version` — semver string from `Cargo.toml`
 - `protocol_supported_versions` — the protocol versions this plugin understands
-- `kind` — `source`, `destination`, or `config_provider`
+- `kind` — `source`, `destination`, `sink`, `parser` or `config_provider`; the
+  core rejects a plugin whose kind is not the one it expects
 
 ## Phase 2 — Version negotiation
 
@@ -72,9 +78,16 @@ version is **1**.
 ## Phase 3 — Capabilities
 
 The core asks for a capabilities list. Plugins respond with the `supports` array.
-In protocol version 1, no capabilities are defined; the array is always empty.
-This phase exists as an extension point for future features (e.g., `"incremental"`,
-`"parallel_writes"`).
+The SDK defaults are `batch_read` + `schema_inference` for sources and
+`batch_write` for destinations; plugins add their own (e.g. `incremental_state`,
+`object_output`, `staged_merge`). The core enforces two of them:
+
+- `incremental_state` on the source, required when the pipeline has a `state:`
+  block;
+- `object_output` on the destination, required when the pipeline has a `sink:`
+  block.
+
+The full list is in the [Message Reference](../protocol/messages.md#capabilities_response).
 
 ## Phase 4 — Configure
 
@@ -97,8 +110,11 @@ it into its own config struct and validates it:
 If validation fails, the plugin responds with:
 
 ```json
-{"type": "configure_ack", "status": "error", "code": "invalid_config", "message": "host is required"}
+{"type": "configure_ack", "status": "error", "code": "CONFIGURE_FAILED", "message": "invalid postgres source config: missing field `dbname`"}
 ```
+
+Error codes are free-form strings; SDK-based plugins always use
+`CONFIGURE_FAILED` here.
 
 And the core aborts the run immediately, printing the error. If validation
 succeeds, the plugin may open connections, validate credentials, and prepare
@@ -106,12 +122,19 @@ cursors during this phase.
 
 ## Phase 5 — Start
 
-The core sends `{"type": "start"}`. This is the signal to begin execution.
+The core sends `{"type": "start"}`. This is the signal to begin execution. The
+source is started first; the destination only gets `start` once the source has
+declared its schema.
 
-**For sources:** the plugin sends `Schema` on the control channel (declaring the
-Arrow schema of the data it will emit), then begins writing Arrow IPC batches to
-fd3. The `Schema` message is sent *before* the first batch so the destination
-can prepare its sink.
+**For sources:** for an incremental pipeline with prior state, `start` carries
+`"resume": {"cursor_value": ...}`, which the SDK hands to the plugin's
+`resume_from()`. The plugin sends `Schema` on the control channel (declaring the
+schema of the data it will emit), then begins writing Arrow IPC batches to fd3.
+The core uses the `Schema` message to report the schema and to fingerprint it for
+incremental-state drift checks; it is not forwarded to the destination, which
+reads the exact Arrow schema from the IPC stream header on its fd3. During the
+run the SDK also emits `checkpoint` events on fd4, and the destination emits
+`committed` — see [Incremental State](./incremental-state.md).
 
 **For destinations:** the plugin sends `{"type": "ready"}`, signaling that it has
 completed preparation and is ready to receive Arrow batches on fd3. The core
@@ -146,17 +169,29 @@ A successful destination finished:
 
 If a plugin encounters an unrecoverable error at any point, it sends:
 ```json
-{"type": "finished", "status": "error", "code": "cursor_failed", "message": "connection reset"}
+{"type": "finished", "status": "error", "code": "BATCH_FAILED", "message": "connection reset"}
 ```
+
+The SDK's codes are `BATCH_FAILED` (source) and `WRITE_FAILED` /
+`IPC_READ_FAILED` (destination); hand-written plugins may use their own.
 
 ## Cancellation
 
-If the user sends SIGINT (Ctrl+C) or the core encounters an error from one
-plugin, it sends `Cancel` to the other:
+> **Planned — not yet wired up.** The protocol defines `cancel`, but the core
+> never sends it and has no SIGINT handler; only the sink SDK reacts to it today.
+> The source and destination `cancel()` trait methods are never called.
+
+Current behavior: when a plugin fails, the core returns an error and the run
+ends with a non-zero exit code. A terminal Ctrl+C sends SIGINT to the whole
+foreground process group — plugins are not put in their own group — so every
+process exits without running `cancel()`. A signal sent only to the loadsmith pid
+(e.g. `kill`, some container stops) is not forwarded to the plugins.
+
+The intended design: on SIGINT or a failure in one plugin, the core sends
 
 ```json
 {"type": "cancel", "reason": "source plugin failed"}
 ```
 
-Each plugin's `cancel()` trait method is responsible for aborting promptly —
-closing cursors, rolling back transactions, removing partial output files.
+to the other, and each plugin's `cancel()` aborts promptly — closing cursors,
+rolling back transactions, removing partial output files.

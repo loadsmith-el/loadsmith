@@ -1,293 +1,319 @@
-# Loadsmith — Documento de Arquitetura Inicial
+# Loadsmith — Initial Architecture Document
 
-## 1. Visão
+> This is the original design document. Where it describes behavior, it has been
+> updated to match the code; the user-facing reference is the
+> [documentation](../docs/src) and the [README](../README.md). Items marked
+> *planned* are not implemented yet.
 
-O **Loadsmith** é uma ferramenta moderna de **EL** — *Extract and Load* — criada para executar pipelines declarativos de ingestão e carga de dados.
+## 1. Vision
 
-A proposta é ser uma alternativa moderna ao Embulk, mantendo a ideia de configuração declarativa e plugins, mas com uma arquitetura mais limpa, extensível, performática e segura.
+**Loadsmith** is a modern **EL** — *Extract and Load* — tool built to run declarative data ingestion and loading pipelines.
 
-O Loadsmith deve ser construído em torno de um princípio central:
+The goal is to be a modern alternative to Embulk, keeping the idea of declarative configuration and plugins, but with a cleaner, more extensible, faster and safer architecture.
 
-> **Core pequeno, estável e genérico; plugins especializados fazendo o trabalho específico.**
+Loadsmith must be built around one central principle:
 
-O objetivo não é criar uma ferramenta de transformação pesada, nem substituir dbt, Spark ou engines SQL. O Loadsmith deve focar em mover dados de uma origem para um destino com previsibilidade, streaming real, boa observabilidade e suporte a fontes/destinos modernos.
+> **A small, stable, generic core; specialized plugins doing the specific work.**
 
----
-
-## 2. Objetivos
-
-### 2.1 Objetivos principais
-
-* Executar pipelines declarativos de ingestão e carga.
-* Suportar fontes e destinos variados por meio de plugins.
-* Usar streaming/batches para evitar carregar datasets inteiros em memória.
-* Permitir plugins escritos em múltiplas linguagens.
-* Separar claramente controle, dados e eventos/logs.
-* Usar formatos simples e eficientes para comunicação:
-
-  * **JSONL** para controle.
-  * **Apache Arrow IPC** para dados.
-* Usar **YAML** como formato canônico de configuração.
-* Usar structs Rust tipadas como modelo interno de configuração.
-* Ter uma arquitetura portável, começando por Linux, mas sem bloquear suporte futuro a Windows.
-* Suportar configuração local e remota via **configuration providers**.
-* Suportar resolução segura de secrets via providers.
-* Ter boa observabilidade desde o início.
-
-### 2.2 Não objetivos iniciais
-
-* Não ser uma engine de transformação pesada.
-* Não substituir dbt.
-* Não criar uma DSL complexa para SQL, joins ou transformações analíticas.
-* Não executar processamento distribuído no MVP.
-* Não buscar compatibilidade 100% com Embulk.
-* Não carregar plugins como bibliotecas dinâmicas dentro do processo principal.
-* Não usar `stderr` como canal normal de logs.
-* Não usar MessagePack no protocolo de controle inicial.
-* Não aceitar JSON multiline ou JSON sem delimitação no protocolo de controle.
+The goal is not to build a heavy transformation tool, nor to replace dbt, Spark or SQL engines. Loadsmith must focus on moving data from a source to a destination with predictability, real streaming, good observability and support for modern sources/destinations.
 
 ---
 
-## 3. Motivação
+## 2. Goals
 
-A motivação principal vem das limitações observadas no Embulk e em seus plugins:
+### 2.1 Main goals
 
-* plugins antigos ou desatualizados;
-* dificuldade com drivers modernos;
-* comportamento inconsistente de fetch e streaming;
-* risco de estouro de memória;
-* pouca previsibilidade em cargas grandes;
-* dificuldade de evolução do ecossistema;
-* baixa ergonomia para criar ou manter plugins;
-* ausência de uma separação clara entre plano de controle e plano de dados.
+* Run declarative ingestion and loading pipelines.
+* Support varied sources and destinations through plugins.
+* Use streaming/batches to avoid loading whole datasets into memory.
+* Allow plugins written in multiple languages.
+* Clearly separate control, data and events/logs.
+* Use simple, efficient formats for communication:
 
-Um caso concreto foi o comportamento de leitura em bancos via JDBC/MySQL, especialmente em relação a `fetch_rows`, cursor server-side e uso de memória. Esse tipo de problema reforça a necessidade de uma ferramenta com streaming real, contratos claros e comportamento previsível.
+  * **JSONL** for control.
+  * **Apache Arrow IPC** for data.
+* Use **YAML** as the canonical configuration format.
+* Use typed Rust structs as the internal configuration model.
+* Have a portable architecture, starting with Linux, but without blocking future Windows support.
+* Support local and remote configuration via **configuration providers** (*planned*).
+* Support safe secret resolution via providers.
+* Have good observability from the start.
+
+### 2.2 Initial non-goals
+
+* Not to be a heavy transformation engine.
+* Not to replace dbt.
+* Not to create a complex DSL for SQL, joins or analytical transformations.
+* Not to run distributed processing in the MVP.
+* Not to aim for 100% compatibility with Embulk.
+* Not to load plugins as dynamic libraries inside the main process.
+* Not to use `stderr` as the normal log channel.
+* Not to use MessagePack in the initial control protocol.
+* Not to accept multi-line JSON or undelimited JSON in the control protocol.
 
 ---
 
-## 4. Arquitetura geral
+## 3. Motivation
 
-A arquitetura do Loadsmith é baseada em três partes principais:
+The main motivation comes from limitations observed in Embulk and its plugins:
+
+* old or outdated plugins;
+* difficulty with modern drivers;
+* inconsistent fetch and streaming behavior;
+* risk of running out of memory;
+* little predictability on large loads;
+* difficulty evolving the ecosystem;
+* poor ergonomics for creating or maintaining plugins;
+* no clear separation between the control plane and the data plane.
+
+A concrete case was the read behavior on databases via JDBC/MySQL, especially regarding `fetch_rows`, server-side cursors and memory use. This kind of problem reinforces the need for a tool with real streaming, clear contracts and predictable behavior.
+
+---
+
+## 4. General architecture
+
+Loadsmith's architecture is based on three main parts:
 
 ```text
 Loadsmith Core
-  ├── Configuração YAML
-  ├── Resolução de templates
-  ├── Resolução de providers/secrets
-  ├── Modelo interno tipado em Rust
-  ├── Orquestração de plugins
-  ├── Controle de execução
-  ├── Observabilidade
-  └── Estado/checkpoints
+  ├── YAML configuration
+  ├── Template resolution
+  ├── Provider/secret resolution
+  ├── Typed internal model in Rust
+  ├── Plugin orchestration
+  ├── Execution control
+  ├── Observability
+  └── State/checkpoints
 
 Plugins
   ├── Sources
   ├── Destinations
-  ├── Parsers
-  └── Configuration/Secret Providers
+  ├── Sinks
+  ├── Parsers                        (protocol-level only, not yet run by the core)
+  └── Configuration/Secret Providers (protocol/SDK only, not yet run by the core)
 
-Protocolos
+Protocols
   ├── Control plane: JSONL
   ├── Data plane: Apache Arrow IPC
-  └── Event/log plane: JSONL/eventos estruturados
+  └── Event/log plane: JSONL/structured events
 ```
 
-O core não deve conhecer detalhes internos de Oracle, MySQL, Snowflake, S3, Excel, CSV ou qualquer outra tecnologia específica. Esses detalhes pertencem aos plugins.
+The core must not know internal details of Oracle, MySQL, Snowflake, S3, Excel, CSV or any other specific technology. Those details belong to the plugins.
 
 ---
 
 ## 5. Core
 
-O **Loadsmith Core** é o orquestrador da execução.
+The **Loadsmith Core** is the execution orchestrator.
 
-Responsabilidades:
+Responsibilities:
 
-* ler a configuração YAML;
-* fazer parse seguro da configuração;
-* resolver templates;
-* resolver referências externas de configuração;
-* resolver secrets;
-* converter a configuração resolvida para structs Rust tipadas;
-* validar o pipeline;
-* descobrir plugins disponíveis;
-* iniciar plugins como processos filhos;
-* negociar protocolo e capabilities;
-* coordenar fluxo entre source e destination;
-* controlar lifecycle dos plugins;
-* aplicar cancelamento, timeout e tratamento de falhas;
-* receber eventos, progresso e logs;
-* consolidar métricas;
-* gerenciar estado/checkpoints quando aplicável.
+* read the YAML configuration;
+* parse the configuration safely;
+* resolve templates;
+* resolve external configuration references (*planned*);
+* resolve secrets;
+* convert the resolved configuration into typed Rust structs;
+* validate the pipeline;
+* discover available plugins;
+* start plugins as child processes;
+* negotiate protocol and capabilities;
+* coordinate the flow between source and destination;
+* control the plugins' lifecycle;
+* apply cancellation, timeouts and failure handling;
+* receive events, progress and logs;
+* consolidate metrics;
+* manage state/checkpoints when applicable.
 
-O core deve permanecer pequeno e genérico.
+The core must remain small and generic.
 
 ---
 
-## 6. Modelo de configuração
+## 6. Configuration model
 
-O formato canônico de configuração do Loadsmith será **YAML**.
+Loadsmith's canonical configuration format is **YAML**.
 
-YAML significa **YAML Ain’t Markup Language**.
+YAML stands for **YAML Ain't Markup Language**.
 
-A escolha por YAML foi feita porque pipelines reais tendem a conter listas grandes e estruturas repetidas, como:
+YAML was chosen because real pipelines tend to contain large lists and repeated structures, such as:
 
-* colunas de arquivos XLSX/CSV;
+* columns of XLSX/CSV files;
 * transforms;
-* validações;
-* múltiplas abas;
-* múltiplos outputs;
-* regras de rejeição;
-* políticas de schema drift;
-* metadados;
-* steps ordenados.
+* validations;
+* multiple sheets;
+* multiple outputs;
+* rejection rules;
+* schema drift policies;
+* metadata;
+* ordered steps.
 
-Esses casos são mais legíveis e mais fáceis de manter em YAML do que em TOML.
+These cases are more readable and easier to maintain in YAML than in TOML.
 
-### 6.1 Modelo interno
+### 6.1 Internal model
 
-Internamente, o Loadsmith não deve trabalhar com mapas dinâmicos soltos.
+Internally, Loadsmith must not work with loose dynamic maps.
 
-O modelo interno será composto por **structs Rust tipadas**, com serialização e desserialização via **Serde**.
+The internal model is made of **typed Rust structs**, serialized and deserialized via **Serde**.
 
-Serde não é um formato. Serde é o framework/ecossistema padrão em Rust para serializar e desserializar structs.
+Serde is not a format. Serde is the standard Rust framework/ecosystem for serializing and deserializing structs.
 
-Fluxo conceitual:
+Conceptual flow:
 
 ```text
 pipeline.yaml
-  -> parse seguro de YAML
-  -> resolução de templates
-  -> resolução de configuration providers
-  -> resolução de secrets
-  -> desserialização para structs Rust tipadas
-  -> validação forte
-  -> execução
+  -> safe YAML parse
+  -> template resolution
+  -> configuration provider resolution (planned)
+  -> secret resolution
+  -> deserialization into typed Rust structs
+  -> strong validation
+  -> execution
 ```
 
-### 6.2 Separação entre config do core e config dos plugins
+### 6.2 Separating core config from plugin config
 
-O core valida os blocos que pertencem ao próprio Loadsmith:
+The core validates the blocks that belong to Loadsmith itself:
 
 ```yaml
 pipeline:
-  name: vendas_mysql_to_s3
+  name: sales_mysql_to_s3
 
 state:
-  backend: s3
-  path: s3://bucket/state.json
+  backend: local
+  path: .loadsmith/state/sales.json
 ```
 
-O core também conhece o envelope dos plugins:
+(`local` is the only state backend today; an `s3` backend is planned.)
+
+The core also knows the plugins' envelope:
 
 ```yaml
 source:
-  type: jdbc
+  type: postgres
   config:
     ...
 ```
 
-Mas o conteúdo de `source.config`, `destination.config`, `parser.config` ou `provider.config` deve ser validado pelo plugin responsável.
+But the contents of `source.config`, `destination.config` and `sink.config` must be validated by the responsible plugin.
 
-Modelo conceitual em Rust:
+The model in Rust (`crates/loadsmith-config/src/model.rs`, abridged):
 
 ```rust
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     pub pipeline: PipelineMeta,
     pub source: PluginRef,
     pub destination: PluginRef,
+    #[serde(default)]
+    pub sink: Option<PluginRef>,
+    #[serde(default)]
     pub state: Option<StateConfig>,
-    pub rejects: Option<RejectsConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineMeta {
     pub name: String,
+    #[serde(default)]
     pub description: Option<String>,
+    #[serde(default = "default_heartbeat_seconds")] // 30
+    pub heartbeat_seconds: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginRef {
     #[serde(rename = "type")]
     pub plugin_type: String,
-
+    #[serde(default)]
     pub config: serde_yaml::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateConfig {
+    pub backend: String, // only "local" passes validation today
+    pub path: String,
+    #[serde(default)]
+    pub on_schema_change: SchemaChangePolicy, // refuse (default) | continue
+    #[serde(default)]
+    pub checkpoint_interval: u64,
 }
 ```
 
-O ponto importante é que o core é tipado onde ele manda, e flexível onde precisa delegar ao plugin.
+The important point is that the core is typed where it is in charge, and flexible where it must delegate to the plugin.
 
 ---
 
-## 7. YAML controlado
+## 7. Controlled YAML
 
-O Loadsmith deve usar YAML como formato canônico, mas não deve aceitar YAML “livre e selvagem”.
+Loadsmith must use YAML as the canonical format, but must not accept "free and wild" YAML.
 
-Regras propostas:
+Proposed rules:
 
-* usar parser seguro;
-* preferir compatibilidade com YAML 1.2 quando possível;
-* validar tudo com schema interno;
-* campos desconhecidos devem gerar erro;
-* tipos devem ser validados pelas structs Rust;
-* templates devem ser resolvidos antes da validação final, ou em fases bem definidas;
-* anchors, aliases e merge keys devem ser evitados no MVP;
-* strings ambíguas devem ser explicitamente strings;
-* a configuração resolvida deve poder ser impressa com `--print-resolved-config`.
+* use a safe parser;
+* prefer YAML 1.2 compatibility when possible;
+* validate everything against the internal schema;
+* unknown fields must produce an error;
+* types must be validated by the Rust structs;
+* templates must be resolved before final validation, or in well-defined phases;
+* anchors, aliases and merge keys should be avoided in the MVP;
+* ambiguous strings must be explicitly strings;
+* the resolved configuration must be printable with `--print-resolved-config`.
 
-Exemplos de valores que devem ser tratados com cuidado:
+Examples of values that must be handled carefully:
 
 ```yaml
-codigo: "00123"
-data_referencia: "2026-06-05"
-ativo: true
+code: "00123"
+reference_date: "2026-06-05"
+active: true
 ```
 
 ---
 
 ## 8. Plugins
 
-Os plugins são executáveis separados, iniciados pelo core como processos filhos.
+Plugins are separate executables, started by the core as child processes.
 
-Essa decisão evita problemas de ABI, runtime, dependências nativas e compatibilidade entre linguagens.
+This decision avoids ABI, runtime, native-dependency and cross-language compatibility problems.
 
-ABI significa **Application Binary Interface**.
+ABI stands for **Application Binary Interface**.
 
-### 8.0 Descoberta de plugins
+### 8.0 Plugin discovery
 
-O Loadsmith gerencia plugins em um diretório dedicado.
+Loadsmith manages plugins in a dedicated directory.
 
-Diretório padrão:
+Default directory:
 
 ```text
 ~/.loadsmith/plugins/
 ```
 
-Sobrescrito pela variável de ambiente:
-
-```text
-LOADSMITH_PLUGIN_PATH=/caminho/alternativo
-```
-
-Comandos de gerenciamento:
-
-```bash
-loadsmith plugin install ./meu-plugin-binario
-loadsmith plugin list
-loadsmith plugin remove jdbc
-```
-
-O comando `install` copia ou linka o binário para o diretório gerenciado. O core busca plugins somente nesse diretório — não faz varredura de PATH.
-
-Para desenvolvimento local, é possível apontar para um diretório alternativo:
+Overridden only by the `--plugin-dir` flag (there is no environment variable):
 
 ```bash
 loadsmith run pipeline.yaml --plugin-dir ./plugins/
 ```
 
-Essa separação garante que o ambiente de produção seja auditável e reproduzível: apenas binários explicitamente instalados são usados.
+A plugin binary is looked up as `loadsmith-{kind}-{type}` in the plugin directory
+first, then on `PATH` as a fallback. The `-bundled` container image relies on
+that fallback: it installs every canonical plugin into `/usr/local/bin`.
 
-Plugins podem ser escritos em:
+Management commands:
+
+```bash
+loadsmith plugin install postgres                     # from the canonical index: <name>[:<kind>][@<version>]
+loadsmith plugin install --all                        # every package in the index
+loadsmith plugin install -f ./loadsmith-plugin.yaml   # from a manifest (path or URL)
+loadsmith plugin install --binary ./my-plugin-binary  # a local binary, no manifest
+loadsmith plugin list
+loadsmith plugin uninstall postgres                   # or postgres:source
+```
+
+Index and manifest installs download a per-platform artifact, verify its sha256,
+and check the manifest's protocol range against the core before fetching.
+
+Plugins can be written in:
 
 * Rust;
 * Python;
@@ -295,15 +321,15 @@ Plugins podem ser escritos em:
 * Java;
 * C#;
 * Node;
-* qualquer linguagem capaz de implementar o protocolo do Loadsmith.
+* any language able to implement the Loadsmith protocol.
 
-### 8.1 Tipos principais de plugin
+### 8.1 Main plugin kinds
 
 #### Source
 
-Responsável por ler dados de uma origem.
+Reads data from an origin.
 
-Exemplos:
+Examples:
 
 * JDBC;
 * MySQL;
@@ -311,19 +337,19 @@ Exemplos:
 * Oracle;
 * Snowflake;
 * S3;
-* arquivo local;
+* local file;
 * SharePoint;
-* APIs HTTP.
+* HTTP APIs.
 
 #### Destination
 
-Responsável por escrever dados em um destino. Para bancos, grava via protocolo
-nativo (consome Arrow direto). Para arquivos, escreve em um diretório de staging
-local; a entrega remota fica a cargo de um **sink** (abaixo).
+Writes data to a target. For databases, it writes via the native protocol
+(consuming Arrow directly). For files, it writes to a local staging directory;
+remote delivery is the job of a **sink** (below).
 
-Exemplos:
+Examples:
 
-* arquivo local/staging em Parquet, CSV, JSONL;
+* local file/staging in Parquet, CSV, JSONL;
 * stdout;
 * PostgreSQL;
 * Snowflake;
@@ -331,16 +357,17 @@ Exemplos:
 
 #### Sink
 
-Fase opcional de **entrega**, fora do data plane. Separa *formato* (o destination)
-de *localização* (o sink), evitando a explosão N×M de plugins tipo `s3_parquet`.
-Um destination de arquivo escreve os arquivos no staging e anuncia cada um pronto
-via `object_ready` (fd4); o sink entrega cada arquivo finalizado ao destino remoto.
-Só é válido com destinations que anunciam a capability `object_output`. O core é o
-dono do ledger de entrega — se o sink cair, é respawnado e retoma de onde parou.
+An optional **delivery** stage, outside the data plane. It separates *format*
+(the destination) from *location* (the sink), avoiding the N×M explosion of
+plugins such as `s3_parquet`. A file-output destination writes files to staging
+and announces each one as ready via `object_ready` (fd4); the sink delivers each
+finalized file to the remote target. It is only valid with destinations that
+advertise the `object_output` capability. The core owns the delivery ledger — if
+the sink dies, it is respawned and resumes where it left off.
 
-Exemplos:
+Examples:
 
-* cópia local (`local-copy`);
+* local copy (`local-copy`, shipped);
 * S3;
 * Google Cloud Storage;
 * sftp;
@@ -348,9 +375,10 @@ Exemplos:
 
 #### Parser
 
-Responsável por converter um formato bruto em dados tabulares.
+Converts a raw format into tabular data. (Reserved kind in the protocol; no SDK
+runtime and not run by the core yet.)
 
-Exemplos:
+Examples:
 
 * CSV;
 * JSON;
@@ -360,132 +388,129 @@ Exemplos:
 
 #### Configuration Provider
 
-Responsável por carregar configuração externa.
+Loads external configuration. (The SDK runtime and the canonical `file` provider
+exist, but the core does not invoke config providers yet.)
 
-Exemplos:
+Examples:
 
-* arquivo local;
+* local file;
 * S3;
 * Google Cloud Storage;
 * Azure Blob Storage;
 * HTTP/HTTPS;
 * AWS Secrets Manager;
-* variáveis de ambiente.
+* environment variables.
 
 ---
 
-## 9. Comunicação entre core e plugins
+## 9. Communication between core and plugins
 
-A comunicação deve ser separada por finalidade.
+Communication must be separated by purpose.
 
 ### 9.1 Control plane
 
-O plano de controle usa **JSONL**.
+The control plane uses **JSONL**.
 
-JSONL significa **JSON Lines**.
-JSON significa **JavaScript Object Notation**.
+JSONL stands for **JSON Lines**.
+JSON stands for **JavaScript Object Notation**.
 
-Cada mensagem de controle é um objeto JSON serializado em uma única linha e delimitado por `\n`.
+Each control message is a JSON object serialized on a single line and delimited by `\n`.
 
-Exemplo:
+Example:
 
 ```jsonl
-{"type":"handshake","protocol_version":1,"plugin":"loadsmith-source-jdbc"}
+{"type":"handshake"}
+{"type":"handshake_ack","protocol_supported_versions":[1],"plugin_name":"loadsmith-source-postgres","plugin_version":"0.2.1","kind":"source"}
+{"type":"set_protocol_version","protocol_version":1}
 {"type":"capabilities_request"}
-{"type":"progress","rows_read":10000,"batches":1}
-{"type":"finished","status":"success"}
+{"type":"finished","status":"success","rows_read":10000,"batches_read":1}
 ```
 
-O Loadsmith não considera JSON sem delimitação nem JSON multiline como formato de protocolo de controle. Sempre que o documento mencionar JSON no control plane, a decisão correta é **JSONL**.
+Loadsmith does not consider undelimited JSON or multi-line JSON a control-protocol format. Whenever this document mentions JSON on the control plane, the right decision is **JSONL**.
 
-Responsabilidades do control plane:
+Control plane responsibilities:
 
 * handshake;
 * capabilities;
-* configuração;
-* início de execução;
-* cancelamento;
+* configuration;
+* starting execution;
+* cancellation;
 * schema;
 * status;
-* progresso;
-* erro;
-* finalização.
+* progress;
+* errors;
+* completion.
 
-Exemplos conceituais de mensagens:
+The message set (full shapes in [`definitions/protocol.md`](protocol.md)):
 
 ```text
-Handshake
-CapabilitiesRequest
-CapabilitiesResponse
-Configure
-Start
-Schema
-Progress
-LogEvent
-Error
-Finished
-Cancel
+control (fd0/fd1):  handshake, handshake_ack, set_protocol_version,
+                    capabilities_request, capabilities_response,
+                    configure, configure_ack, start, schema, ready,
+                    deliver_object, object_delivered, ping, pong,
+                    cancel (reserved), error (reserved), finished
+events (fd4):       progress, log, object_ready, checkpoint, committed
 ```
 
-### 9.2 Por que JSONL no controle
+### 9.2 Why JSONL for control
 
-A escolha por JSONL favorece:
+Choosing JSONL favors:
 
-* simplicidade;
-* debugabilidade;
-* interoperabilidade entre linguagens;
-* facilidade para logging;
-* inspeção direta com `cat`, `tail`, `jq` e ferramentas comuns;
-* menor barreira para criação de plugins comunitários.
+* simplicity;
+* debuggability;
+* cross-language interoperability;
+* ease of logging;
+* direct inspection with `cat`, `tail`, `jq` and common tools;
+* a lower barrier for community plugins.
 
-Como o volume pesado de dados trafega pelo data plane usando Apache Arrow IPC, o overhead de JSONL no plano de controle é aceitável.
+Since the heavy data volume travels over the data plane using Apache Arrow IPC, the overhead of JSONL on the control plane is acceptable.
 
-O MessagePack pode ser reavaliado futuramente se o control plane virar gargalo, mas não será o formato inicial.
+MessagePack may be re-evaluated in the future if the control plane becomes a bottleneck, but it will not be the initial format.
 
 ### 9.3 Data plane
 
-O plano de dados usa **Apache Arrow IPC**.
+The data plane uses **Apache Arrow IPC**.
 
-IPC significa **Inter-Process Communication**.
+IPC stands for **Inter-Process Communication**.
 
-Responsável por transportar batches tabulares entre plugins.
+It carries tabular batches between plugins.
 
-O source deve produzir batches Arrow. O destination deve consumir batches Arrow.
+The source must produce Arrow batches. The destination must consume Arrow batches.
 
 ### 9.4 Event/log plane
 
-Logs e eventos devem trafegar por canal dedicado, não por `stderr`.
+Logs and events must travel over a dedicated channel, not `stderr`.
 
-O formato natural para eventos/logs estruturados também será **JSONL**.
+The natural format for structured events/logs is also **JSONL**.
 
-Eventos desejados:
+Desired events:
 
-* início de etapa;
-* fim de etapa;
-* progresso;
-* linhas processadas;
-* bytes lidos/escritos;
+* step start;
+* step end;
+* progress;
+* rows processed;
+* bytes read/written;
 * warnings;
-* erros estruturados;
-* métricas.
+* structured errors;
+* metrics.
 
 ---
 
-## 10. Transporte local
+## 10. Local transport
 
-No Linux, o desenho inicial pode usar:
+On Linux, the initial design can use:
 
 ```text
-stdin/stdout -> controle JSONL
-fd3          -> dados Arrow IPC
-fd4          -> eventos/logs JSONL
+stdin/stdout -> JSONL control
+fd3          -> Arrow IPC data
+fd4          -> JSONL events/logs
 ```
 
-Porém, isso deve ficar atrás de uma abstração de transporte.
+However, this must sit behind a transport abstraction.
 
-A ideia é suportar Linux primeiro, mas sem impedir Windows no futuro.
+The idea is to support Linux first, without preventing Windows in the future.
 
-Possíveis implementações:
+Possible implementations:
 
 ```text
 LinuxTransport
@@ -495,151 +520,165 @@ WindowsTransport
   -> named pipes
 
 FallbackTransport
-  -> TCP local, apenas se necessário
+  -> local TCP, only if needed
 ```
 
-TCP local não é a preferência, mas pode ser avaliado como fallback.
+Local TCP is not the preference, but may be evaluated as a fallback.
 
 ---
 
 ## 11. Templates
 
-O Loadsmith suporta templates na configuração via um **parser de expressões interno**, sem dependência de engines externas como Jinja2, Liquid ou Tera.
+Loadsmith supports templates in the configuration via an **internal expression parser**, with no dependency on external engines such as Jinja2, Liquid or Tera.
 
-A sintaxe usa `{{ }}` como delimitador. As expressões suportadas são:
+The syntax uses `{{ }}` as the delimiter. The expressions implemented today are:
 
-* chamada de função: `{{ env('VAR') }}`
-* acesso encadeado com argumento: `{{ aws.sm('/path').field }}`
-* combinações: `{{ aws.sm('/dev/segredo').username }}`
+* `{{ env('VAR') }}` — the value of an environment variable;
+* `{{ file('/path') }}` — the raw contents of a local file, with trailing whitespace trimmed.
 
-Exemplos:
+Templates are resolved in any string value of the YAML document, before it is
+deserialized.
+
+Examples:
 
 ```yaml
 url: "{{ env('DATABASE_URL') }}"
 ```
 
+*Planned, not implemented:* chained access with an argument, such as
+`{{ aws.sm('/path').field }}` (today `aws.sm` fails with "provider not
+available"), and dot-field access on `file()`:
+
 ```yaml
-username: "{{ aws.sm('/dev/segredo').username }}"
-password: "{{ aws.sm('/dev/segredo').password }}"
+username: "{{ aws.sm('/dev/secret').username }}"
+password: "{{ aws.sm('/dev/secret').password }}"
 ```
 
-O parser resolve expressões dentro de valores string do YAML. Ele não suporta loops, condicionais, filtros ou herança — esses recursos não fazem parte do escopo. O surface area é intencional e pequeno: chamada de função, acesso a campo por ponto, literal de string como argumento.
+The parser resolves expressions inside YAML string values. It does not support loops, conditionals, filters or inheritance — these features are out of scope. The surface area is intentionally small: a function call with a string-literal argument (plus, when implemented, field access by dot).
 
-Se a necessidade crescer no futuro, a migração para MiniJinja é viável sem quebrar a sintaxe, já que o delimitador `{{ }}` é compatível.
+If the need grows in the future, migrating to MiniJinja is viable without breaking the syntax, since the `{{ }}` delimiter is compatible.
 
 ---
 
 ## 12. Configuration Providers
 
-Configuration providers permitem carregar a configuração a partir de fontes externas. Providers são plugáveis — a comunidade pode criar novos.
+> **Planned — not implemented.** The SDK defines a config-provider plugin kind and
+> the canonical `file` provider exists, but the core never invokes one, and the
+> `LOADSMITH_CONFIG_REF` variable and `--config-ref` flag below do not exist. This
+> section is the intended design.
 
-### 12.1 Formato de referência
+Configuration providers let the configuration be loaded from external sources. Providers are pluggable — the community can create new ones.
 
-A regra é: se o scheme URI identifica o provider de forma única, usa URI puro. Se o provider usa `https` por baixo (e o scheme não identifica sozinho), usa `provider|url`.
+### 12.1 Reference format
 
-| Referência | Provider |
+The rule is: if the URI scheme uniquely identifies the provider, use a plain URI. If the provider uses `https` underneath (and the scheme alone does not identify it), use `provider|url`.
+
+| Reference | Provider |
 |---|---|
-| `file:///opt/config.yml` | arquivo local |
+| `file:///opt/config.yml` | local file |
 | `s3://bucket/key` | S3 |
 | `gs://bucket/key` | Google Cloud Storage |
-| `https://exemplo.com/config.yml` | HTTP simples (download direto, sem auth especial) |
+| `https://example.com/config.yml` | plain HTTP (direct download, no special auth) |
 | `azure\|https://account.blob.core.windows.net/container/blob` | Azure Blob Storage |
 
-`https://` puro significa HTTP download direto sem lógica proprietária. Qualquer provider que use HTTPS mas precise de autenticação ou lógica própria (Azure, SharePoint, OAuth etc.) usa o prefixo `provider|` explícito.
+A plain `https://` means a direct HTTP download with no proprietary logic. Any provider that uses HTTPS but needs authentication or its own logic (Azure, SharePoint, OAuth etc.) uses the explicit `provider|` prefix.
 
-### 12.2 Uso
+### 12.2 Usage (planned)
 
-Via variável de ambiente:
+Via environment variable:
 
 ```bash
 LOADSMITH_CONFIG_REF="s3://bucket/path/config.yml"
 LOADSMITH_CONFIG_REF="azure|https://account.blob.core.windows.net/container/config.yml"
 ```
 
-Via flag CLI:
+Via CLI flag:
 
 ```bash
 loadsmith run --config-ref "s3://bucket/path/config.yml"
 ```
 
-### 12.3 Providers built-in previstos
+### 12.3 Planned providers
 
-* `file://` — arquivo local
+* `file://` — local file (exists as the canonical `file` plugin)
 * `s3://` — Amazon S3
 * `gs://` — Google Cloud Storage
-* `https://` / `http://` — HTTP simples
+* `https://` / `http://` — plain HTTP
 * `azure|https://` — Azure Blob Storage
 
-Providers adicionais podem ser implementados como plugins seguindo o mesmo contrato.
+Additional providers can be implemented as plugins following the same contract.
 
 ---
 
 ## 13. Secrets
 
-Secrets não devem ficar hardcoded na configuração.
+Secrets must not be hardcoded in the configuration.
 
-Secrets são resolvidos **inline no template**, usando a mesma sintaxe `{{ }}` dos templates de configuração. Não há bloco separado de secrets — o valor é resolvido no lugar onde é referenciado.
+Secrets are resolved **inline in the template**, using the same `{{ }}` syntax as configuration templates. There is no separate secrets block — the value is resolved where it is referenced.
 
 ```yaml
 source:
-  type: jdbc
+  type: postgres
   config:
-    username: "{{ aws.sm('/dev/mysql').username }}"
-    password: "{{ aws.sm('/dev/mysql').password }}"
+    user: "{{ env('PG_USER') }}"
+    password: "{{ env('PG_PASSWORD') }}"
 ```
 
 ```yaml
 url: "{{ env('DATABASE_URL') }}"
 ```
 
-Providers possíveis:
+Providers:
 
-* `env('VAR')` — variável de ambiente;
-* `aws.sm('/path').field` — AWS Secrets Manager;
-* `aws.ssm('/path')` — AWS SSM Parameter Store;
-* `file('/path').field` — arquivo local;
-* Vault, futuramente;
-* Azure Key Vault, futuramente;
-* Google Secret Manager, futuramente.
+* `env('VAR')` — environment variable (implemented);
+* `file('/path')` — raw contents of a local file (implemented; `.field` access is planned);
+* `aws.sm('/path').field` — AWS Secrets Manager (planned);
+* `aws.ssm('/path')` — AWS SSM Parameter Store (planned);
+* Vault, in the future;
+* Azure Key Vault, in the future;
+* Google Secret Manager, in the future.
 
-Secrets nunca devem aparecer em logs, eventos ou na saída de `--print-resolved-config`. O core é responsável por mascarar qualquer valor resolvido via provider de secret.
+Values resolved via `env()` are masked as `***` in the output of
+`--print-resolved-config`. Today that is the only place the mask is applied — run
+logs and events are not masked, and `file()` values are not added to the mask.
+Masking every resolved secret everywhere remains the goal.
 
 ---
 
-## 14. Pipeline interno
+## 14. Internal pipeline
 
-Modelo conceitual simples:
+Simple conceptual model:
 
 ```text
 Source -> Parser -> Buffer -> Destination
 ```
 
-Modelo possível no futuro:
+A possible future model:
 
 ```text
 Source -> Parser -> Filter -> Buffer -> Destination
 ```
 
-O cuidado principal é não transformar o Loadsmith em ferramenta de transformação pesada.
+The main concern is not to turn Loadsmith into a heavy transformation tool.
 
-Transformações aceitáveis:
+Acceptable transformations:
 
 * parsing;
-* normalização de tipos;
-* inferência de schema;
-* conversão de formatos;
-* ajustes simples necessários para carga.
+* type normalization;
+* schema inference;
+* format conversion;
+* simple adjustments needed for loading.
 
-Transformações não desejadas no core:
+Transformations not wanted in the core:
 
-* joins complexos;
-* regras analíticas pesadas;
-* DSL própria para SQL;
-* engine relacional interna.
+* complex joins;
+* heavy analytical rules;
+* a custom SQL DSL;
+* an internal relational engine.
 
-DSL significa **Domain-Specific Language**.
+DSL stands for **Domain-Specific Language**.
 
-Para SQL complexo, o ideal é deixar o banco fazer:
+For complex SQL, the ideal is to let the database do it:
 
 ```yaml
 source:
@@ -653,22 +692,22 @@ source:
 
 ---
 
-## 15. Apache Arrow e batches
+## 15. Apache Arrow and batches
 
-O Loadsmith deve usar batches tabulares como unidade de processamento.
+Loadsmith must use tabular batches as the unit of processing.
 
-Características desejadas:
+Desired characteristics:
 
-* leitura em lotes;
-* escrita em lotes;
+* batched reads;
+* batched writes;
 * backpressure;
-* baixo uso de memória;
-* controle de tamanho de batch;
-* schema explícito;
-* compatibilidade com Parquet;
-* interoperabilidade entre linguagens.
+* low memory use;
+* batch size control;
+* explicit schema;
+* Parquet compatibility;
+* cross-language interoperability.
 
-O formato escolhido para o data plane é:
+The format chosen for the data plane is:
 
 ```text
 Apache Arrow IPC
@@ -676,61 +715,61 @@ Apache Arrow IPC
 
 ---
 
-## 16. Performance e memória
+## 16. Performance and memory
 
-Requisitos importantes:
+Important requirements:
 
-* não carregar tudo em memória;
-* suportar datasets grandes;
-* evitar estouro de heap/memória;
-* permitir batch size configurável;
-* controlar backpressure;
-* permitir escrita incremental;
-* expor métricas de throughput;
-* permitir diagnóstico de gargalos.
+* do not load everything into memory;
+* support large datasets;
+* avoid heap/memory exhaustion;
+* allow a configurable batch size;
+* control backpressure;
+* allow incremental writes;
+* expose throughput metrics;
+* allow diagnosing bottlenecks.
 
-Métricas desejadas:
+Desired metrics:
 
-* linhas lidas;
-* linhas escritas;
-* bytes lidos;
-* bytes escritos;
-* batches processados;
-* tempo por etapa;
-* velocidade média;
-* velocidade recente;
-* uso aproximado de memória, se possível.
+* rows read;
+* rows written;
+* bytes read;
+* bytes written;
+* batches processed;
+* time per step;
+* average speed;
+* recent speed;
+* approximate memory use, if possible.
 
 ---
 
-## 17. Estado e checkpoints
+## 17. State and checkpoints
 
-O Loadsmith deve ter espaço para estado, principalmente para cargas incrementais.
+Loadsmith has room for state, mainly for incremental loads.
 
-**O core é o único dono do estado.** Plugins são ferramentas sem memória — eles executam, reportam progresso via JSONL, e encerram. Quem persiste, lê e gerencia o estado é sempre o core.
+**The core is the sole owner of the state.** Plugins are memoryless tools — they run, report progress, and exit. Whoever persists, reads and manages the state is always the core.
 
-Casos de uso:
+Use cases:
 
-* último timestamp processado;
-* último ID;
+* last processed timestamp;
+* last ID;
 * offset;
 * cursor;
-* paginação;
+* pagination;
 * `search_after`;
-* último arquivo processado;
-* checkpoint de escrita.
+* last processed file;
+* write checkpoint.
 
-O plugin pode reportar ao core o valor de estado que deve ser persistido (ex: último ID lido), mas a decisão de quando e como persistir é do core.
-
-Possível configuração futura:
+The plugin reports to the core the state value to persist, but the decision of when and how to persist it belongs to the core. This has shipped:
 
 ```yaml
 state:
   backend: local
-  path: .loadsmith/state
+  path: .loadsmith/state/orders.json
+  on_schema_change: refuse     # or continue
+  checkpoint_interval: 50      # 0 ⇒ persist only at the end of the run
 ```
 
-Ou:
+A remote backend is planned (not yet available — `backend: s3` fails validation):
 
 ```yaml
 state:
@@ -738,29 +777,36 @@ state:
   path: s3://bucket/loadsmith/state/
 ```
 
-Pontos ainda em aberto:
+How the formerly open points were settled:
 
-* como o plugin comunica ao core o valor de estado que deseja persistir;
-* como garantir consistência em falha parcial;
-* como fazer retry idempotente;
-* formato exato do arquivo de estado.
+* **How the plugin reports state:** the source emits `checkpoint { cursor_value,
+  batch_seq }` and the destination emits `committed { batch_seq }`, both on fd4;
+  the core persists a watermark only once the matching batch is durable.
+* **Consistency on partial failure:** the guarantee is at-least-once (exactly-once
+  with an idempotent destination such as `staged_merge`); a lease-based lock file
+  stops concurrent runs of one pipeline.
+* **Exact state file format:** a JSON `StateDoc` (pipeline, cursor value, schema
+  fingerprint, run id, update time), written atomically.
+* **Idempotent retry:** still open — there is no retry in the core.
+
+See [Incremental State](../docs/src/architecture/incremental-state.md).
 
 ---
 
-## 18. Observabilidade
+## 18. Observability
 
-O Loadsmith deve ter observabilidade desde o início.
+Loadsmith must have observability from the start.
 
-Saídas desejadas:
+Desired outputs:
 
-* logs humanos no terminal;
-* logs estruturados em JSONL;
-* eventos de progresso em JSONL;
-* erros com contexto;
-* métricas por etapa;
-* resumo final da execução.
+* human logs in the terminal;
+* structured JSONL logs;
+* JSONL progress events;
+* errors with context;
+* per-step metrics;
+* a final run summary.
 
-Exemplo de resumo final:
+Example of the final summary:
 
 ```text
 Pipeline: mysql_to_s3
@@ -773,52 +819,53 @@ Average throughput: 19,139 rows/s
 Destination: s3://bucket/raw/table/
 ```
 
-Possível suporte futuro:
+Possible future support:
 
 * Prometheus;
 * OpenTelemetry;
 * CloudWatch;
 * Datadog;
-* arquivo JSONL;
-* eventos para orquestradores externos.
+* JSONL file;
+* events for external orchestrators.
 
 ---
 
-## 19. Compatibilidade com Embulk
+## 19. Embulk compatibility
 
-O Loadsmith é inspirado pelo Embulk, mas não precisa ser compatível com ele.
+Loadsmith is inspired by Embulk, but does not need to be compatible with it.
 
-Compatibilidades desejáveis:
+Desirable similarities:
 
-* configuração declarativa;
-* conceito de input/output;
+* declarative configuration;
+* the input/output concept;
 * templates;
 * plugins;
-* execução de pipelines.
+* pipeline execution.
 
-Não objetivos:
+Non-goals:
 
-* compatibilidade total com YAML de Embulk;
-* compatibilidade com plugins de Embulk;
-* replicar o runtime antigo;
-* manter decisões arquiteturais problemáticas.
+* full compatibility with Embulk YAML;
+* compatibility with Embulk plugins;
+* replicating the old runtime;
+* keeping problematic architectural decisions.
 
 ---
 
 ## 20. CLI
 
-Comandos possíveis:
+The command tree:
 
 ```bash
 loadsmith run pipeline.yaml
-loadsmith run --config-ref "s3|s3://bucket/config.yaml"
 loadsmith validate pipeline.yaml
-loadsmith plugins list
-loadsmith plugins inspect jdbc
-loadsmith capabilities jdbc
+loadsmith plugin list
+loadsmith plugin install <name>[:<kind>][@<version>] | --all | -f <manifest> | --binary <path>
+loadsmith plugin uninstall <name>[:<kind>]
+loadsmith state show pipeline.yaml
+loadsmith state rm pipeline.yaml
 ```
 
-Comandos úteis para debug:
+Useful debugging commands:
 
 ```bash
 loadsmith run pipeline.yaml --log-level debug
@@ -826,87 +873,90 @@ loadsmith run pipeline.yaml --dry-run
 loadsmith run pipeline.yaml --print-resolved-config
 ```
 
+Ideas, not implemented: `loadsmith run --config-ref <ref>` (see §12),
+`loadsmith plugin inspect <name>` and `loadsmith capabilities <name>`.
+
 ---
 
-## 21. Estrutura inicial do projeto
+## 21. Project structure
 
-Estrutura possível:
+The engine repository:
 
 ```text
 loadsmith/
   crates/
-    loadsmith-core/
-    loadsmith-cli/
     loadsmith-protocol/
     loadsmith-transport/
-    loadsmith-config/
     loadsmith-arrow/
     loadsmith-plugin-sdk/
-  plugins/
-    sources/
-      jdbc/
-      local-file/
-      s3/
-    destinations/
-      local-parquet/
-      s3-parquet/
-      stdout/
-    providers/
-      file/
-      s3/
-      http/
-      aws-secrets-manager/
-  examples/
+    loadsmith-config/
+    loadsmith-plugin-manifest/
+    loadsmith-core/
+    loadsmith-cli/
+    loadsmith-tls/
+  definitions/
   docs/
 ```
 
-Separação conceitual:
+Plugins live in the separate
+[`loadsmith-canonical-plugins`](https://github.com/loadsmith-el/loadsmith-canonical-plugins)
+repository: `file`, `jsonl`, `null`, `parquet`, `local-copy`, `mysql`,
+`sharepoint`, `postgres` and `oracle`.
+
+Conceptual split:
 
 ```text
 loadsmith-protocol
-  Tipos das mensagens de controle JSONL.
+  JSONL control message types.
 
 loadsmith-transport
-  Abstração de pipes, file descriptors, named pipes etc.
-
-loadsmith-plugin-sdk
-  Helpers para criar plugins.
-
-loadsmith-core
-  Orquestração da execução.
-
-loadsmith-cli
-  Interface de linha de comando.
-
-loadsmith-config
-  Configuração YAML, templates e providers.
+  Pipes, file descriptors, named pipes, etc.; JSONL framing.
 
 loadsmith-arrow
-  Utilidades de Arrow IPC e schemas.
+  Arrow IPC utilities and schemas.
+
+loadsmith-plugin-sdk
+  Helpers to build plugins.
+
+loadsmith-config
+  YAML configuration, templates and secret masking.
+
+loadsmith-plugin-manifest
+  The loadsmith-plugin.yaml manifest schema and validation, used by
+  `plugin install`.
+
+loadsmith-core
+  Execution orchestration.
+
+loadsmith-cli
+  Command-line interface.
+
+loadsmith-tls
+  Shared rustls + rustls-rustcrypto TLS configuration for network plugins.
 ```
 
 ---
 
 ## 22. MVP
 
-Um MVP realista deve validar a arquitetura sem tentar resolver tudo.
+A realistic MVP must validate the architecture without trying to solve everything.
 
-### 22.1 MVP mínimo
+### 22.1 Minimal MVP
 
-* CLI `loadsmith run`;
-* leitura de YAML local;
-* templates básicos;
-* variáveis de ambiente;
-* modelo interno em structs Rust;
-* plugins como processos filhos;
-* control plane com JSONL;
-* data plane com Arrow IPC;
-* canal dedicado para eventos/logs em JSONL;
-* source simples;
-* destination simples;
-* logs e resumo final.
+* `loadsmith run` CLI;
+* reading local YAML;
+* basic templates;
+* environment variables;
+* internal model in Rust structs;
+* plugins as child processes;
+* JSONL control plane;
+* Arrow IPC data plane;
+* dedicated JSONL event/log channel;
+* a simple source;
+* a simple destination;
+* logs and a final summary.
 
-Plugins possíveis para MVP mínimo:
+Possible plugins for the minimal MVP:
 
 ```text
 source:
@@ -917,18 +967,18 @@ destination:
   stdout
 ```
 
-### 22.2 MVP mais útil para ambiente corporativo
+### 22.2 A more useful MVP for corporate environments
 
-* source JDBC;
-* destination S3 Parquet;
-* configuration provider local e S3;
-* secrets via env e AWS Secrets Manager;
-* batch size configurável;
-* logs estruturados;
-* resumo final;
-* tratamento básico de erro.
+* JDBC source;
+* S3 Parquet destination;
+* local and S3 configuration provider;
+* secrets via env and AWS Secrets Manager;
+* configurable batch size;
+* structured logs;
+* final summary;
+* basic error handling.
 
-Pipeline alvo:
+Target pipeline:
 
 ```text
 JDBC -> Arrow batches -> S3 Parquet
@@ -936,80 +986,82 @@ JDBC -> Arrow batches -> S3 Parquet
 
 ---
 
-## 23. Decisões consolidadas
+## 23. Settled decisions
 
-* Nome do projeto: **Loadsmith**.
-* Identidade visual/conceitual: forja, bigorna, ferreiro.
-* Ferramenta focada em EL.
-* Não deve virar engine de transformação pesada.
-* Core pequeno e genérico.
-* Arquitetura plugin-first.
-* Plugins como executáveis/processos separados.
-* Configuração canônica em YAML.
-* Modelo interno em structs Rust tipadas.
-* Serde como camada de serialização/desserialização.
-* Controle via JSONL.
-* Dados via Apache Arrow IPC.
-* Logs/eventos em canal dedicado.
-* Logs/eventos estruturados em JSONL.
-* Não usar `stderr` como canal normal de logs.
+* Project name: **Loadsmith**.
+* Visual/conceptual identity: forge, anvil, blacksmith.
+* A tool focused on EL.
+* Must not become a heavy transformation engine.
+* Small, generic core.
+* Plugin-first architecture.
+* Plugins as separate executables/processes.
+* Canonical configuration in YAML.
+* Internal model in typed Rust structs.
+* Serde as the serialization/deserialization layer.
+* Control via JSONL.
+* Data via Apache Arrow IPC.
+* Logs/events on a dedicated channel.
+* Structured logs/events in JSONL.
+* Do not use `stderr` as the normal log channel.
 * Linux first.
-* Windows depois, por abstração de transporte.
-* TCP localhost não é preferência.
-* Templates são necessários.
-* Configuration providers devem ser plugáveis.
-* Secrets providers são necessários.
-* Plugins em outras linguagens devem ser possíveis.
-* SQL complexo deve ficar no banco/query, não em DSL própria do Loadsmith.
-* **Linguagem do core: Rust.**
-* **Runtime assíncrono: Tokio.**
-* **Templates via parser de expressões interno** — sem engine externa; sintaxe `{{ func(arg) }}` e `{{ obj.method(arg).field }}`; MiniJinja como opção de migração futura se necessário.
-* **Descoberta de plugins via diretório gerenciado** — `~/.loadsmith/plugins/` por padrão; sobrescrito por `LOADSMITH_PLUGIN_PATH`; instalação via `loadsmith plugin install`; flag `--plugin-dir` para desenvolvimento local.
-* **Core é o único dono do estado** — plugins reportam progresso e valores de estado ao core via JSONL, mas não persistem nada diretamente.
-* **Protocolo JSONL formalizado** — versionamento por inteiro ordinal começando em `1`; handshake iniciado pelo core; shapes de todas as mensagens definidos em `definitions/protocol.md`.
-* **Secrets resolvidos inline no template** — mesma sintaxe `{{ }}`, sem bloco separado; core é responsável por mascarar valores em logs e eventos.
-* **Formato de referência de configuration providers** — URI puro quando o scheme identifica o provider (`s3://`, `gs://`, `file://`, `https://`); prefixo `provider|url` quando o provider usa HTTPS mas tem lógica própria (`azure|https://...`).
-* **Multi-arch first** — imagens publicadas para `linux/amd64` e `linux/arm64` (AWS Graviton); a regra não é "sem TLS", é **sem código nativo/assembly por arquitetura**. O build é `cargo build`-nativo dentro de cada arch (sob QEMU), então crypto em C/assembly significaria build emulado lento e toolchain frágil (`cmake`/`perl`/`nasm`).
-* **TLS via `rustls` + `rustls-rustcrypto`** — protocolo TLS pela camada madura `rustls` (decisão foundational); primitivas pelo provider puro-Rust `rustls-rustcrypto`. Banidos por serem crypto nativo: `native-tls`, `openssl-sys`, `ring`, `aws-lc-rs`. O provider é trocável via `CryptoProvider::install_default` (knob reversível, blast radius por-binário pela isolação de processo); vale uniformemente para todos os plugins de rede (postgres, mysql, s3).
+* Windows later, through a transport abstraction.
+* Localhost TCP is not the preference.
+* Templates are required.
+* Configuration providers must be pluggable.
+* Secret providers are required.
+* Plugins in other languages must be possible.
+* Complex SQL must stay in the database/query, not in a Loadsmith DSL.
+* **Core language: Rust.**
+* **Async runtime: Tokio.**
+* **Templates via an internal expression parser** — no external engine; `{{ env('VAR') }}` and `{{ file('/path') }}` today, with `{{ obj.method(arg).field }}` (e.g. `aws.sm`) planned; MiniJinja as a future migration option if needed.
+* **Plugin discovery via a managed directory** — `~/.loadsmith/plugins/` by default, overridden with `--plugin-dir`; lookup is the plugin directory, then `PATH`; managed with `loadsmith plugin install` (index / `--manifest` / `--binary`), `plugin list` and `plugin uninstall`.
+* **The core is the sole owner of state** — plugins report progress and state values to the core via JSONL, but persist nothing directly.
+* **Formalized JSONL protocol** — ordinal integer versioning starting at `1`; handshake initiated by the core; the shapes of every message are defined in `definitions/protocol.md`.
+* **Secrets resolved inline in the template** — same `{{ }}` syntax, no separate block; the core masks `env()` values in `--print-resolved-config` (masking in logs and events is still a goal).
+* **Configuration provider reference format** (*planned*) — a plain URI when the scheme identifies the provider (`s3://`, `gs://`, `file://`, `https://`); a `provider|url` prefix when the provider uses HTTPS but has its own logic (`azure|https://...`).
+* **Multi-arch first** — images published for `linux/amd64` and `linux/arm64` (AWS Graviton); the rule is not "no TLS", it is **no per-architecture native/assembly code**. Releases build natively on a dedicated runner per architecture (`ubuntu-latest` / `ubuntu-24.04-arm`, no QEMU) inside `rust:1-alpine`, producing a static musl binary; C/assembly crypto would still mean a fragile toolchain (`cmake`/`perl`/`nasm`).
+* **TLS via `rustls` + `rustls-rustcrypto`** — the TLS protocol through the mature `rustls` layer (a foundational decision); primitives through the pure-Rust `rustls-rustcrypto` provider. Banned as native crypto: `native-tls`, `openssl-sys`, `ring`, `aws-lc-rs`. The provider is swappable via `CryptoProvider::install_default` (a reversible knob, with per-binary blast radius thanks to process isolation); it applies uniformly to every network plugin (postgres, mysql, oracle, sharepoint, s3).
+* **State communication** — the source reports watermarks with `checkpoint` and the destination reports durability with `committed`, both on fd4.
+* **State file format and partial-failure guarantee** — a JSON `StateDoc` written atomically, guarded by a lease-based lock file; at-least-once, exactly-once with an idempotent destination.
+* **Idempotency** — provided by `staged_merge` destinations (staging + `MERGE` by key).
+* **Plugin packaging and distribution** — a `loadsmith-plugin.yaml` manifest, a canonical `index.json`, sha256-verified installs, and per-plugin release tags in `loadsmith-canonical-plugins`.
 
 ---
 
-## 24. Decisões em aberto
+## 24. Open decisions
 
-* Definir contrato formal de capabilities (extensão futura além das built-in).
-* Definir como o plugin comunica ao core o valor de estado que deseja persistir.
-* Definir formato do arquivo de estado e garantias em falha parcial.
-* Definir retry e idempotência.
-* Definir backpressure.
-* Definir plugin JDBC genérico vs plugins nativos por banco.
-* Definir empacotamento e distribuição de plugins.
-* Definir validação de configuração por plugin (JSON Schema, contrato próprio, etc).
-* Definir estratégia de testes de compatibilidade entre core e plugins.
+* Define a formal capabilities contract (future extension beyond the built-in ones).
+* Define retry (none exists today).
+* Define backpressure.
+* Decide between a generic JDBC plugin and native per-database plugins.
+* Define a schema contract for per-plugin configuration validation (JSON Schema, a custom contract, etc.); today each plugin validates in `configure_ack`.
+* Define a compatibility-testing strategy between core and plugins.
 
 ---
 
-## 25. Contrato inicial core/plugin
+## 25. Initial core/plugin contract
 
-Ponto prioritário para aprofundar.
+The priority point to deepen. (The formal contract is now
+[`definitions/protocol.md`](protocol.md).)
 
-Fluxo conceitual:
+Conceptual flow:
 
 ```text
-1. Core inicia plugin.
-2. Plugin participa do handshake via JSONL.
-3. Core verifica versão do protocolo.
-4. Core pede capabilities.
-5. Plugin responde capabilities.
-6. Core envia configuração.
-7. Plugin valida/prepara.
-8. Core inicia execução.
-9. Plugin source produz batches Arrow.
-10. Plugin destination consome batches Arrow.
-11. Plugins emitem progresso, logs e eventos em JSONL.
-12. Core finaliza execução ou cancela em caso de erro.
+1. The core starts the plugin.
+2. The plugin takes part in the JSONL handshake.
+3. The core checks the protocol version.
+4. The core requests capabilities.
+5. The plugin answers with its capabilities.
+6. The core sends the configuration.
+7. The plugin validates/prepares.
+8. The core starts execution.
+9. The source plugin produces Arrow batches.
+10. The destination plugin consumes Arrow batches.
+11. Plugins emit progress, logs and events in JSONL.
+12. The core finishes the run, or aborts it on error.
 ```
 
-Capabilities possíveis:
+Possible capabilities:
 
 ```yaml
 plugin:
@@ -1024,39 +1076,43 @@ plugin:
     ...
 ```
 
-Exemplo conceitual de mensagem JSONL:
+Example JSONL messages:
 
 ```jsonl
-{"type":"handshake","protocol_version":1,"plugin_name":"jdbc","plugin_version":"0.1.0"}
-{"type":"capabilities_response","kind":"source","supports":["schema_inference","batch_read"]}
+{"type":"handshake"}
+{"type":"handshake_ack","protocol_supported_versions":[1],"plugin_name":"loadsmith-source-jdbc","plugin_version":"0.1.0","kind":"source"}
+{"type":"set_protocol_version","protocol_version":1}
+{"type":"capabilities_response","supports":["schema_inference","batch_read"]}
 {"type":"progress","rows_read":10000,"batches_read":1}
-{"type":"error","code":"JDBC_CONNECTION_FAILED","message":"failed to connect to database"}
-{"type":"finished","status":"success"}
+{"type":"finished","status":"error","code":"JDBC_CONNECTION_FAILED","message":"failed to connect to database"}
 ```
 
 ---
 
-## 26. Perguntas para próxima etapa
+## 26. Questions for the next stage
 
-1. O core será oficialmente em Rust?
-2. Tokio será o runtime assíncrono padrão?
-3. O primeiro source será `local_csv` ou `jdbc`?
-4. O primeiro destination será `stdout`, `local_parquet` ou `s3_parquet`?
-5. O MVP deve validar arquitetura ou já resolver um caso corporativo real?
-6. O plugin SDK será parte do MVP?
-7. Como os plugins serão encontrados?
-8. Qual será o formato mínimo de uma mensagem de erro?
-9. Como o core vai saber que um plugin é compatível?
-10. Como versionar o protocolo JSONL?
-11. Como separar mensagens de controle, eventos e logs?
-12. O canal de eventos/logs será obrigatório desde o MVP ou pode começar junto do controle?
+These were the open questions at the start of the project; most are answered by
+§23 and the protocol.
+
+1. Will the core officially be in Rust?
+2. Will Tokio be the default async runtime?
+3. Will the first source be `local_csv` or `jdbc`?
+4. Will the first destination be `stdout`, `local_parquet` or `s3_parquet`?
+5. Should the MVP validate the architecture or already solve a real corporate case?
+6. Will the plugin SDK be part of the MVP?
+7. How will plugins be found?
+8. What will the minimal error message format be?
+9. How will the core know a plugin is compatible?
+10. How to version the JSONL protocol?
+11. How to separate control messages, events and logs?
+12. Will the event/log channel be mandatory from the MVP, or can it start together with control?
 
 ---
 
-## 27. Frase de visão
+## 27. Vision statement
 
-> **Loadsmith é uma ferramenta moderna de EL, plugin-first, que orquestra extrações e cargas de dados usando configuração YAML, plugins isolados por processo, controle via JSONL e dados tabulares via Apache Arrow IPC.**
+> **Loadsmith is a modern, plugin-first EL tool that orchestrates data extraction and loading using YAML configuration, process-isolated plugins, JSONL control and tabular data via Apache Arrow IPC.**
 
-Outra formulação:
+Another formulation:
 
-> **Um Embulk moderno, mais seguro, performático e extensível, feito para pipelines declarativos de ingestão de dados em ambientes locais, cloud e corporativos.**
+> **A modern Embulk — safer, faster and more extensible — built for declarative data ingestion pipelines in local, cloud and corporate environments.**

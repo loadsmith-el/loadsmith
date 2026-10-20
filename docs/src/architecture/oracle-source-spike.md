@@ -19,7 +19,7 @@ constraint that drives the whole analysis.
 ## The constraint
 
 Loadsmith's foundational rule is **pure-Rust, multi-arch** (`linux/amd64` +
-`linux/arm64`, built `cargo build`-native inside each arch under QEMU). No
+`linux/arm64`, built natively on a per-arch runner, no QEMU). No
 native/assembly-per-arch code, no C toolchains in the plugin build. TLS is done
 with `rustls` + the pure-Rust `rustls-rustcrypto` provider; `native-tls`,
 `openssl-sys`, `ring`, and `aws-lc-rs` are all banned. The postgres and mysql

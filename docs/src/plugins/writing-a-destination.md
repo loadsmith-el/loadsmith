@@ -15,6 +15,7 @@ pub trait DestinationPlugin: Send {
     // Optional — defaults shown.
     fn capabilities(&self) -> Vec<String> { /* ["batch_write"] */ }
     fn durable_through(&mut self) -> Option<u64> { None }
+    fn take_ready_objects(&mut self) -> Vec<PathBuf> { Vec::new() }
 
     async fn configure(&mut self, config: serde_json::Value) -> Result<()>;
     async fn prepare(&mut self) -> Result<()>;
@@ -26,15 +27,16 @@ pub trait DestinationPlugin: Send {
 
 | Method | When called | What to do |
 |---|---|---|
-| `plugin_name()` | During handshake | Return `"loadsmith-destination-{type}"` exactly |
+| `plugin_name()` | During handshake | Return `"loadsmith-destination-{type}"` (convention, shown in the run summary) |
 | `plugin_version()` | During handshake | Return the semver version string |
 | `capabilities()` | During handshake | Add `"object_output"` (stages files for a sink) or `"staged_merge"` as applicable |
 | `configure(config)` | After protocol negotiation | Deserialize and validate config. Do not open resources yet |
 | `prepare()` | After `start` signal, before first batch | Open files, connections, writers. Send `Ready` when done |
 | `write_batch(batch)` | Once per incoming batch | Write this `RecordBatch` to the sink |
 | `durable_through()` | After each batch | Highest batch ordinal now **durably** committed — gates the core's watermark persistence. Leave `None` if only durable at `finalize` |
+| `take_ready_objects()` | After each `write_batch()` and after `finalize()` | Return (and clear) the paths of files finalized since the last call — the SDK emits an `object_ready` for each. Required with `object_output`: advertising the capability alone delivers nothing to the sink |
 | `finalize()` | After the IPC stream ends | Flush buffers, close resources, return total `rows_written` |
-| `cancel()` | On abort | Clean up partial output (delete files, rollback, etc.) |
+| `cancel()` | Not currently invoked | Reserved for future cancel propagation — the core never sends `cancel` to destinations yet |
 
 > **Durability & incremental state.** The SDK emits a `committed` event whenever
 > `durable_through()` advances, plus a final one at `finalize()`. That ack is
@@ -50,10 +52,11 @@ The destination lifecycle has three distinct phases:
 files are opened, no connections made. If validation fails, `configure()` returns
 `Err` and the core aborts before any data flows.
 
-**Phase 2 — Prepare.** After the source has declared its schema and the core has
-started the pump, the plugin opens its sink (creates the output file, opens the
-database connection, initializes the writer). When `prepare()` returns `Ok(())`,
-the SDK sends `Ready` to the core and data begins flowing.
+**Phase 2 — Prepare.** After the source has declared its schema, the core sends
+`start` and the plugin opens its output (creates the output file, opens the
+database connection, initializes the writer). The pump starts only once
+`prepare()` returns `Ok(())` and the SDK sends `Ready` to the core; then data
+begins flowing.
 
 **Phase 3 — Stream.** `write_batch()` is called once per `RecordBatch`. Write
 incrementally — do not accumulate. When the IPC stream ends (source exhausted),
@@ -72,8 +75,13 @@ incrementally — do not accumulate. When the IPC stream ends (source exhausted)
 
 ### 1. Create the crate
 
+Plugins don't live in the loadsmith repo: create the package in your own repo or
+as a member of
+[`loadsmith-canonical-plugins`](https://github.com/loadsmith-el/loadsmith-canonical-plugins),
+where the real one lives at `parquet/`.
+
 ```
-plugins/destinations/parquet/
+parquet/
   Cargo.toml
   src/
     main.rs
@@ -82,31 +90,46 @@ plugins/destinations/parquet/
 
 ### 2. `Cargo.toml`
 
+The SDK crates are git dependencies pinned by `rev`, and
+`[package.metadata.loadsmith]` is the install metadata a release turns into the
+published `loadsmith-plugin.yaml` read by `loadsmith plugin install`.
+
 ```toml
 [package]
 name = "loadsmith-destination-parquet"
 version = "0.1.0"
 edition = "2021"
 
+[package.metadata.loadsmith]
+name     = "parquet"
+summary  = "Parquet destination"
+protocol = "^1"
+provides = [
+    { kind = "destination", bin = "loadsmith-destination-parquet" },
+]
+
 [[bin]]
 name = "loadsmith-destination-parquet"
 path = "src/main.rs"
 
 [dependencies]
-tokio        = { workspace = true }
-anyhow       = { workspace = true }
-tracing      = { workspace = true }
-serde        = { workspace = true }
-serde_json   = { workspace = true }
-async-trait  = { workspace = true }
-arrow-array  = { workspace = true }
-loadsmith-plugin-sdk = { path = "../../../crates/loadsmith-plugin-sdk" }
-loadsmith-arrow      = { path = "../../../crates/loadsmith-arrow" }
+tokio        = { version = "1", features = ["full"] }
+anyhow       = "1"
+tracing      = "0.1"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+async-trait  = "0.1"
+arrow-array  = "54"
+loadsmith-plugin-sdk = { git = "https://github.com/loadsmith-el/loadsmith", rev = "<commit>" }
+loadsmith-arrow      = { git = "https://github.com/loadsmith-el/loadsmith", rev = "<commit>" }
 
 # Parquet writer. The `parquet` crate is released in lockstep with `arrow`
-# (shared major version), so it must match the workspace's `arrow = "54"`.
+# (shared major version), so it must match `arrow = "54"`.
 parquet = "54"
 ```
+
+(Inside `loadsmith-canonical-plugins`, use `{ workspace = true }`; the workspace
+root pins the SDK `rev` once for every plugin.)
 
 ### 3. `src/main.rs`
 
@@ -211,7 +234,8 @@ impl DestinationPlugin for ParquetPlugin {
     }
 
     async fn cancel(&mut self) {
-        // Drop the writer and delete the partial file.
+        // Not invoked yet (the core does not send `cancel` to destinations
+        // today). Intended: drop the writer and delete the partial file.
         self.writer = None;
         if let Some(cfg) = &self.config {
             let _ = std::fs::remove_file(&cfg.path);
@@ -220,19 +244,10 @@ impl DestinationPlugin for ParquetPlugin {
 }
 ```
 
-### 5. Register in workspace root `Cargo.toml`
-
-```toml
-members = [
-    # ... existing members ...
-    "plugins/destinations/parquet",
-]
-```
-
-### 6. Build and verify
+### 5. Build and verify
 
 ```bash
-cargo build -p loadsmith-destination-parquet
+cargo build --release    # → target/release/loadsmith-destination-parquet
 ```
 
 ## `finalize()` is the official row count
@@ -265,13 +280,14 @@ async fn write_batch(&mut self, batch: RecordBatch) -> Result<()> {
 ## Using Arrow helpers
 
 `loadsmith-arrow` provides `record_batch_to_json_rows` for converting a
-`RecordBatch` to a `Vec<serde_json::Map>` (used by the JSONL destination):
+`RecordBatch` to a `Vec<serde_json::Value>` — one JSON object per row (used by
+the JSONL destination):
 
 ```rust
 use loadsmith_arrow::record_batch_to_json_rows;
 
 async fn write_batch(&mut self, batch: RecordBatch) -> Result<()> {
-    let rows = record_batch_to_json_rows(&batch)?;
+    let rows = record_batch_to_json_rows(&batch);
     for row in rows {
         let line = serde_json::to_string(&row)?;
         writeln!(self.writer, "{}", line)?;
@@ -283,24 +299,34 @@ async fn write_batch(&mut self, batch: RecordBatch) -> Result<()> {
 
 ## End-to-end testing
 
-Add a loadsmith-lab case to verify your destination against a real source:
+Add a loadsmith-lab case (in `loadsmith-lab-canonical-catalog/cases/`, or a
+directory passed with `--cases-dir`) to verify your destination against a real
+source. The catalog already has `postgres-to-parquet-single`, `-chunked` and
+`-localcopy` cases:
 
 ```yaml
-# cases/postgres-to-parquet/case.yaml
+# cases/postgres-to-parquet-single/case.yaml
 case:
-  name: postgres-to-parquet
+  name: postgres-to-parquet-single
 services:
-  - image: loadsmith-lab-postgres:15
+  - image: images/lab-postgres-15
     alias: pg
     readiness:
       tcp: 5432
       postgres:
+        dbname: lab
+        user: lab
+        password: lab
         probe_query: "SELECT 1 FROM spacecraft_telemetry_events LIMIT 1"
-# ...
+pipeline:
+  file: pipeline.yaml
 expect:
   status: success
   rows_read: 100000
   rows_written: 100000
 ```
+
+Pass `--plugin <path to your plugin crate>` to `loadsmith-lab run` to test your
+local destination build instead of the published one.
 
 See [Testing with loadsmith-lab](../getting-started/testing-with-lab.md).

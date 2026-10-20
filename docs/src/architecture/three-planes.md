@@ -30,10 +30,10 @@ messages are JSONL (newline-delimited JSON) with a type discriminator field:
 {"type": "set_protocol_version", "protocol_version": 1}
 ```
 
-The transport layer (`loadsmith-transport`) adds a length prefix to each line and
-reads/writes with `BufReader`/`BufWriter` for efficiency. The core uses
-`ControlReader` to deserialize incoming messages and `ControlWriter` to serialize
-outgoing ones.
+Each message is one JSON object terminated by a newline — there is no length
+prefix. In the transport layer (`loadsmith-transport`), `ControlWriter` serializes
+each message, appends `\n`, and writes and flushes the line; `ControlReader` reads
+line by line and deserializes each one.
 
 **Why stdin/stdout?** They are universally available, work across all Unix
 platforms, and require no additional setup. A plugin author can test their plugin
@@ -67,8 +67,10 @@ This is mandatory. See [Data Flow](./data-flow.md).
 
 ## Event plane — fd4
 
-The event plane carries **plugin-emitted events**: log messages and progress
-updates. Plugins write JSONL events to fd4 at any point during execution; the
+The event plane carries **plugin-emitted events**: log messages, progress
+updates, and the incremental-state messages `checkpoint` (source) and `committed`
+(destination), which the core routes to its state supervisor (see
+[Incremental State](./incremental-state.md)). Plugins write JSONL events to fd4 at any point during execution; the
 core drains this channel concurrently and routes each event to the tracing system.
 
 ```json
@@ -101,10 +103,10 @@ makes progress.
 
 | Channel | Format | Direction | What goes here |
 |---|---|---|---|
-| fd0 (stdin) | JSONL | core → plugin | Lifecycle commands (configure, start, cancel) |
+| fd0 (stdin) | JSONL | core → plugin | Lifecycle commands (handshake, configure, start; `deliver_object` / `ping` for sinks) |
 | fd1 (stdout) | JSONL | plugin → core | Lifecycle responses (ack, schema, ready, finished) |
 | fd3 | Arrow IPC | source→core, core→dest | Record batches (a sink has no fd3) |
-| fd4 | JSONL | plugin → core | Log events, progress updates, `object_ready` |
+| fd4 | JSONL | plugin → core | Log events, progress updates, `object_ready`, `checkpoint`, `committed` |
 
 No other information crosses these boundaries. A plugin does not know what the
 core will do with its data, and the core does not know how the plugin stores its

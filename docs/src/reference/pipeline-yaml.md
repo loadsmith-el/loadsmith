@@ -14,12 +14,12 @@ pipeline:
 
 source:
   type: string            # required — source plugin type (e.g., "postgres")
-  config:                 # required — arbitrary object passed to the source plugin
+  config:                 # optional — arbitrary object passed to the source plugin
     # plugin-specific fields
 
 destination:
   type: string            # required — destination plugin type (e.g., "jsonl")
-  config:                 # required — arbitrary object passed to the destination plugin
+  config:                 # optional — arbitrary object passed to the destination plugin
     # plugin-specific fields
 
 sink:                     # optional — delivery stage; only valid with a
@@ -50,14 +50,14 @@ state:                    # optional — incremental state (core-owned watermark
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `type` | string | yes | Source plugin type. Resolved to binary `loadsmith-source-{type}` |
-| `config` | object | yes | Passed verbatim to the source plugin's `configure()` after template resolution |
+| `config` | object | no | Passed verbatim to the source plugin's `configure()` after template resolution. Defaults to empty; the plugin decides which of its fields are required |
 
 ### `destination`
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `type` | string | yes | Destination plugin type. Resolved to binary `loadsmith-destination-{type}` |
-| `config` | object | yes | Passed verbatim to the destination plugin's `configure()` after template resolution |
+| `config` | object | no | Passed verbatim to the destination plugin's `configure()` after template resolution. Defaults to empty; the plugin decides which of its fields are required |
 
 ### `sink`
 
@@ -70,7 +70,7 @@ with a destination that advertises the `object_output` capability (e.g.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `type` | string | yes | Sink plugin type. Resolved to binary `loadsmith-sink-{type}` |
-| `config` | object | yes | Passed verbatim to the sink plugin's `configure()` after template resolution |
+| `config` | object | no | Passed verbatim to the sink plugin's `configure()` after template resolution. Defaults to empty; the plugin decides which of its fields are required |
 
 When a sink is present and the destination has no explicit `path`, the core
 allocates a staging scratch dir (removed after delivery). Point the
@@ -111,13 +111,16 @@ state rm pipeline.yaml` clears it (the next run is a full read).
 
 ## Template syntax
 
-Any string value in the `config` sections can include template expressions.
-Templates are resolved by the core before sending config to plugins.
+Any string value anywhere in the file (including the `config` sections,
+`pipeline.name`, `state.path`, …) can include template expressions. Templates are
+resolved by the core over the whole document before it is parsed, and before any
+config is sent to plugins.
 
 ### `{{ env('VAR_NAME') }}`
 
 Reads the value of environment variable `VAR_NAME`. The variable is added to the
-mask list; it will appear as `***` in `--print-resolved-config` output and in logs.
+mask list; it will appear as `***` in `--print-resolved-config` output. (The
+mask is applied only there — run logs are not masked.)
 
 ```yaml
 source:
@@ -130,15 +133,18 @@ If the variable is not set, the pipeline fails before spawning any plugin.
 
 ### `{{ file('/path/to/file') }}`
 
-Reads the contents of the file at `/path/to/file` as a UTF-8 string. The file
-contents are used verbatim. Useful for reading key files, certificates, or
-multi-line secrets.
+Reads the contents of the file at `/path/to/file` as a UTF-8 string. The
+contents are inserted with trailing whitespace and newlines trimmed. Unlike
+`env()`, the value is not masked in `--print-resolved-config`. Useful for reading
+key files, certificates, or multi-line secrets.
 
 ```yaml
 source:
   type: postgres
   config:
-    ssl_cert: "{{ file('/etc/ssl/certs/pg.crt') }}"
+    tls:
+      mode: verify-full
+      root_cert: "{{ file('/etc/ssl/certs/pg-ca.crt') }}"
 ```
 
 ### Combining templates
@@ -146,8 +152,10 @@ source:
 Multiple templates can appear in a single string:
 
 ```yaml
-config:
-  connection_string: "host={{ env('PG_HOST') }} port={{ env('PG_PORT') }} dbname=mydb"
+destination:
+  type: jsonl
+  config:
+    path: "/data/{{ env('ENV') }}-{{ env('TABLE') }}.jsonl"
 ```
 
 ## Plugin `config:` blocks
@@ -157,7 +165,8 @@ The fields each plugin accepts **inside** its `source`/`destination`/`sink`
 plugins docs:
 
 > **[Plugin Configuration Reference](https://loadsmith-el.github.io/loadsmith-canonical-plugins/config/overview.html)**
-> — `postgres`, `mysql`, `jsonl`, `parquet`, `null`, `local-copy`, `file`.
+> — `postgres`, `mysql`, `oracle`, `sharepoint`, `jsonl`, `parquet`, `null`,
+> `local-copy`, `file`.
 
 This split is deliberate: a plugin's config is **opaque to the core** (passed
 through verbatim after template resolution), so its schema lives where the
