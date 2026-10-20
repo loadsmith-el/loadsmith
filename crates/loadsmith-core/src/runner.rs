@@ -33,7 +33,7 @@ use std::time::Duration;
 use loadsmith_arrow::ipc::IpcError;
 use loadsmith_arrow::IpcReader;
 use loadsmith_config::{validate_pipeline, ConfigError, MaskList, PipelineConfig, Timeouts};
-use loadsmith_protocol::{capabilities, error_codes, FinishedStatus, Message, PluginKind};
+use loadsmith_protocol::{capabilities, error_codes, FinishedStatus, Message, PluginKind, UnknownKeys};
 use loadsmith_transport::ControlReader;
 use tokio::io::BufReader;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -96,6 +96,10 @@ pub struct RunOpts {
     /// Resolved template values (from the pipeline loader) to redact from
     /// plugin logs, plugin error texts, the abort log and the root cause.
     pub mask: MaskList,
+    /// What every plugin does with unknown keys in its `config:` (sent in
+    /// `configure`). `Error` unless the operator ran with
+    /// `--ignore-unknown-keys`.
+    pub unknown_keys: UnknownKeys,
 }
 
 impl RunOpts {
@@ -110,6 +114,7 @@ impl RunOpts {
             human_report: true,
             facts: FactsHandle::default(),
             mask: MaskList::new(),
+            unknown_keys: UnknownKeys::Error,
         }
     }
 }
@@ -351,6 +356,7 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
                 }
                 Ok(source_config)
             },
+            opts.unknown_keys,
             PluginKind::Source,
             &timeouts,
             &mut shutdown,
@@ -362,7 +368,9 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         });
         let prs_info = match (prs.as_mut(), parser_config) {
             (Some(peer), Some(cfg)) => {
-                let info = run_handshake_and_configure(peer, cfg, PluginKind::Parser, &timeouts, &mut shutdown).await?;
+                let info =
+                    run_handshake_and_configure(peer, cfg, opts.unknown_keys, PluginKind::Parser, &timeouts, &mut shutdown)
+                        .await?;
                 facts.update(|f| {
                     f.parser.name = Some(info.name.clone());
                     f.parser.version = Some(info.version.clone());
@@ -374,6 +382,7 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         let dst_info = run_handshake_and_configure(
             &mut dst,
             dest_config,
+            opts.unknown_keys,
             PluginKind::Destination,
             &timeouts,
             &mut shutdown,
@@ -413,7 +422,7 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         // ObjectReady paths forwarded by the destination's event drain.
         if let (Some(bin), Some(cfg), Some(rx)) = (sink_bin, sink_config, object_rx) {
             sink_task =
-                Some(tokio::spawn(run_sink_supervisor(bin, cfg, rx, timeouts, sink_shutdown, opts.mask.clone())));
+                Some(tokio::spawn(run_sink_supervisor(bin, cfg, opts.unknown_keys, rx, timeouts, sink_shutdown, opts.mask.clone())));
         }
 
         // Start the producer. A plain source answers `start` with its schema.

@@ -3,11 +3,12 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use loadsmith_protocol::{ConfigureAck, Finished, Message, ObjectDelivered, PluginKind};
+use loadsmith_protocol::{Finished, Message, ObjectDelivered, PluginKind};
 use tokio::io::AsyncWrite;
 
 use crate::context::EventSender;
-use crate::control::{conclude, handshake, recv_configure, recv_start, unexpected, Control, Flow};
+use crate::config::PluginConfig;
+use crate::control::{answer_configure, conclude, handshake, recv_configure, recv_start, unexpected, Control, Flow};
 
 /// Implemented by sink plugins.
 ///
@@ -30,7 +31,7 @@ pub trait SinkPlugin: Send {
     }
 
     /// Called after `configure`. Plugin validates config and prepares.
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()>;
+    async fn configure(&mut self, config: PluginConfig) -> Result<()>;
 
     /// Called after `start`, before the first object. Open connections, etc.
     async fn prepare(&mut self) -> Result<()>;
@@ -80,13 +81,9 @@ async fn drive_sink<P: SinkPlugin, W: AsyncWrite + Unpin>(
     .await?;
 
     // ── Configure ────────────────────────────────────────────────────────
-    let config = recv_configure(ctl).await?;
-    if let Err(e) = plugin.configure(config).await {
-        ctl.send(Message::ConfigureAck(ConfigureAck::error("CONFIGURE_FAILED", format!("{e:#}"))))
-            .await?;
-        return Err(Flow::fatal("CONFIGURE_FAILED", e.context("configure rejected")));
-    }
-    ctl.send(Message::ConfigureAck(ConfigureAck::ok())).await?;
+    let (config, warnings) = recv_configure(ctl).await?;
+    let outcome = plugin.configure(config).await;
+    answer_configure(ctl, &mut events, &warnings, outcome).await?;
 
     // ── Start + Prepare ───────────────────────────────────────────────────
     recv_start(ctl).await?;

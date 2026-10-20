@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use loadsmith_config::{ConfigError, MaskList, ProviderRef, SecretRef, SecretValues, Timeouts};
-use loadsmith_protocol::{capabilities, error_codes, FinishedStatus, Message, PluginKind, Resolve};
+use loadsmith_protocol::{capabilities, error_codes, FinishedStatus, Message, PluginKind, Resolve, UnknownKeys};
 use loadsmith_transport::ControlReader;
 use tokio::io::BufReader;
 
@@ -52,6 +52,8 @@ pub struct ProviderJob {
     pub provider: ProviderRef,
     /// Distinct references, in document order.
     pub references: Vec<String>,
+    /// The unknown-keys policy sent with its `configure`.
+    pub unknown_keys: UnknownKeys,
 }
 
 /// Groups `secrets` by instance into jobs, taking each instance's block from
@@ -59,6 +61,7 @@ pub struct ProviderJob {
 pub fn jobs_for(
     secrets: &[SecretRef],
     providers: &std::collections::BTreeMap<String, ProviderRef>,
+    unknown_keys: UnknownKeys,
 ) -> Vec<ProviderJob> {
     let mut jobs: Vec<ProviderJob> = Vec::new();
     for call in secrets {
@@ -74,6 +77,7 @@ pub fn jobs_for(
                     instance: call.instance.clone(),
                     provider: provider.clone(),
                     references: vec![call.reference.clone()],
+                    unknown_keys,
                 });
             }
         }
@@ -204,7 +208,7 @@ async fn session(
     let mut peer = Peer::new(label, sp).with_mask(mask.clone());
 
     let limit = job.provider.timeout();
-    let conversation = converse(&mut peer, config, &job.references, &timeouts, &mut shutdown, &mask);
+    let conversation = converse(&mut peer, config, job.unknown_keys, &job.references, &timeouts, &mut shutdown, &mask);
     let result = match limit {
         None => conversation.await,
         Some(limit) => match tokio::time::timeout(limit, conversation).await {
@@ -252,13 +256,14 @@ async fn session(
 async fn converse(
     peer: &mut Peer,
     config: serde_json::Value,
+    unknown_keys: UnknownKeys,
     references: &[String],
     timeouts: &Timeouts,
     shutdown: &mut Shutdown,
     mask: &MaskList,
 ) -> Result<Vec<(String, String)>, Failure> {
     let label = peer.label();
-    let info = run_handshake_and_configure(peer, config, PluginKind::Provider, timeouts, shutdown).await?;
+    let info = run_handshake_and_configure(peer, config, unknown_keys, PluginKind::Provider, timeouts, shutdown).await?;
     if !info.supports.iter().any(|c| c == capabilities::RESOLVE) {
         return Err(Failure::of(
             label,
@@ -396,9 +401,10 @@ mod tests {
                 ProviderRef { plugin_type: "file".into(), config: Default::default(), timeout_seconds: None },
             );
         }
-        let jobs = jobs_for(&[r("b", "x"), r("a", "y"), r("b", "z"), r("b", "x")], &providers);
+        let jobs = jobs_for(&[r("b", "x"), r("a", "y"), r("b", "z"), r("b", "x")], &providers, UnknownKeys::Warn);
         let shape: Vec<_> = jobs.iter().map(|j| (j.instance.as_str(), j.references.clone())).collect();
         assert_eq!(shape, [("b", vec!["x".to_string(), "z".to_string()]), ("a", vec!["y".to_string()])]);
+        assert!(jobs.iter().all(|j| j.unknown_keys == UnknownKeys::Warn));
     }
 
     #[test]
@@ -433,6 +439,7 @@ mod tests {
                 timeout_seconds: None,
             },
             references: vec!["a".into()],
+            unknown_keys: UnknownKeys::Error,
         };
         let err = resolve_providers(vec![job], &dir, &Timeouts::default(), &MaskList::new(), &Shutdown::never())
             .await

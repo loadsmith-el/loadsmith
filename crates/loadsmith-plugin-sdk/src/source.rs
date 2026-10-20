@@ -4,11 +4,12 @@ use anyhow::Result;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use loadsmith_protocol::{ConfigureAck, Finished, Message, PluginKind};
+use loadsmith_protocol::{Finished, Message, PluginKind};
 use tokio::io::AsyncWrite;
 
 use crate::context::EventSender;
-use crate::control::{conclude, handshake, recv_configure, recv_start, Control, Flow};
+use crate::config::PluginConfig;
+use crate::control::{answer_configure, conclude, handshake, recv_configure, recv_start, Control, Flow};
 
 /// Implemented by source plugins. The SDK drives the full lifecycle;
 /// implementors only provide data and metadata.
@@ -32,7 +33,7 @@ pub trait SourcePlugin: Send {
 
     /// Called after `configure`. Plugin validates its config and prepares.
     /// Return `Err` to send `configure_ack { error }` and exit.
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()>;
+    async fn configure(&mut self, config: PluginConfig) -> Result<()>;
 
     /// Return the Arrow schema of the data this source will produce.
     async fn schema(&mut self) -> Result<Schema>;
@@ -90,13 +91,9 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin>(
     .await?;
 
     // ── Configure ────────────────────────────────────────────────────────
-    let config = recv_configure(ctl).await?;
-    if let Err(e) = plugin.configure(config).await {
-        ctl.send(Message::ConfigureAck(ConfigureAck::error("CONFIGURE_FAILED", format!("{e:#}"))))
-            .await?;
-        return Err(Flow::fatal("CONFIGURE_FAILED", e.context("configure rejected")));
-    }
-    ctl.send(Message::ConfigureAck(ConfigureAck::ok())).await?;
+    let (config, warnings) = recv_configure(ctl).await?;
+    let outcome = plugin.configure(config).await;
+    answer_configure(ctl, &mut events, &warnings, outcome).await?;
 
     // ── Start ─────────────────────────────────────────────────────────────
     let params = recv_start(ctl).await?;

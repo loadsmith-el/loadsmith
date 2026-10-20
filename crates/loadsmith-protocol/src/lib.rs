@@ -123,6 +123,54 @@ pub struct CapabilitiesResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Configure {
     pub config: serde_json::Value,
+    /// What the plugin does with keys in `config` it does not recognise.
+    /// Optional and additive: absent means [`UnknownKeys::Error`], and so
+    /// does a value this build does not know (a newer core's), so a plugin
+    /// never becomes less strict than asked. Older plugins ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_unknown_keys")]
+    pub unknown_keys: Option<UnknownKeys>,
+}
+
+impl Configure {
+    /// A `configure` with the default policy (unknown keys are an error).
+    pub fn new(config: serde_json::Value) -> Self {
+        Self { config, unknown_keys: None }
+    }
+
+    /// The policy the plugin must apply: `unknown_keys`, or the default.
+    pub fn unknown_keys(&self) -> UnknownKeys {
+        self.unknown_keys.unwrap_or_default()
+    }
+}
+
+/// The unknown-keys policy for a plugin's config block: whether a key the
+/// plugin does not recognise fails `configure` (`error`, the default) or is
+/// logged as a warning and ignored (`warn`). The operator chooses it when
+/// running a pipeline (`--ignore-unknown-keys`); it applies to every plugin.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownKeys {
+    /// An unknown key fails `configure`, naming every unknown key path.
+    #[default]
+    Error,
+    /// Each unknown key is logged as a warning (fd4) and ignored.
+    Warn,
+}
+
+impl UnknownKeys {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnknownKeys::Error => "error",
+            UnknownKeys::Warn => "warn",
+        }
+    }
+}
+
+/// Tolerant reader for `configure.unknown_keys`: a value this build does not
+/// know (or of the wrong type) reads as absent, i.e. the strict default.
+fn lenient_unknown_keys<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<UnknownKeys>, D::Error> {
+    let raw = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(raw).ok())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -629,13 +677,30 @@ mod tests {
 
     #[test]
     fn configure_roundtrip() {
-        let msg = Message::Configure(Configure {
-            config: serde_json::json!({"host": "localhost", "port": 5432}),
-        });
+        let msg = Message::Configure(Configure::new(serde_json::json!({"host": "localhost", "port": 5432})));
         if let Message::Configure(c) = roundtrip(&msg) {
             assert_eq!(c.config["host"], "localhost");
+            assert_eq!(c.unknown_keys(), UnknownKeys::Error);
         } else {
             panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn configure_unknown_keys_is_optional_and_tolerant() {
+        let parse = |line: &str| match serde_json::from_str::<Message>(line).unwrap() {
+            Message::Configure(c) => c,
+            other => panic!("wrong variant: {other:?}"),
+        };
+        // Absent: the strict default, and nothing is written back.
+        let c = parse(r#"{"type":"configure","config":{}}"#);
+        assert_eq!((c.unknown_keys, c.unknown_keys()), (None, UnknownKeys::Error));
+        assert_eq!(serde_json::to_string(&Message::Configure(c)).unwrap(), r#"{"type":"configure","config":{}}"#);
+        assert_eq!(parse(r#"{"type":"configure","config":{},"unknown_keys":"warn"}"#).unknown_keys(), UnknownKeys::Warn);
+        // A value from a newer core (or of the wrong type) reads as the default.
+        for odd in [r#""ignore""#, "1", "null", r#"{"mode":"warn"}"#] {
+            let c = parse(&format!(r#"{{"type":"configure","config":{{}},"unknown_keys":{odd}}}"#));
+            assert_eq!(c.unknown_keys(), UnknownKeys::Error, "{odd}");
         }
     }
 

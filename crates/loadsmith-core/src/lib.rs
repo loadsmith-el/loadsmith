@@ -21,4 +21,5 @@ pub use load::{load_pipeline, read_document, resolve_document, LoadOpts, Mode};
 pub use runner::{run_pipeline, RunOpts};
 pub use summary::{FactsHandle, PluginFacts, RunFacts, Summary, SummaryStatus};
 pub use error::CoreError;
+pub use loadsmith_protocol::UnknownKeys;
 pub use shutdown::{listen_for_signals, Halt, Shutdown, ShutdownTrigger, StopSignal};

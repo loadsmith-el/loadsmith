@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use loadsmith_config::Timeouts;
-use loadsmith_protocol::{DeliverObject, FinishedStatus, Message, PluginKind};
+use loadsmith_protocol::{DeliverObject, FinishedStatus, Message, PluginKind, UnknownKeys};
 use tokio::io::BufReader;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -71,6 +71,7 @@ enum Driven {
 pub async fn run_sink_supervisor(
     binary: PathBuf,
     config: serde_json::Value,
+    unknown_keys: UnknownKeys,
     mut object_rx: UnboundedReceiver<PathBuf>,
     timeouts: Timeouts,
     mut shutdown: Shutdown,
@@ -103,6 +104,7 @@ pub async fn run_sink_supervisor(
             let info = run_handshake_and_configure(
                 &mut peer,
                 config.clone(),
+                unknown_keys,
                 PluginKind::Sink,
                 &timeouts,
                 &mut shutdown,

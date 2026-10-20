@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use loadsmith_config::{ConfigError, Document, MaskList, PipelineConfig, SecretValues};
+use loadsmith_config::{ConfigError, Document, MaskList, PipelineConfig, SecretValues, UnknownKeys};
 
 use crate::error::CoreError;
 use crate::providers::{jobs_for, resolve_providers};
@@ -39,19 +39,34 @@ pub struct LoadOpts {
     /// Receives every resolved value. A shared handle: pass the one the rest
     /// of the run masks with.
     pub mask: MaskList,
+    /// Unknown keys in the file's own blocks, and in each provider
+    /// instance's `config:` (sent in its `configure`): an error, or a warning
+    /// per key (`--ignore-unknown-keys`).
+    pub unknown_keys: UnknownKeys,
 }
 
 impl LoadOpts {
     pub fn new(plugin_dir: impl Into<PathBuf>) -> Self {
-        Self { plugin_dir: plugin_dir.into(), shutdown: Shutdown::never(), mask: MaskList::new() }
+        Self {
+            plugin_dir: plugin_dir.into(),
+            shutdown: Shutdown::never(),
+            mask: MaskList::new(),
+            unknown_keys: UnknownKeys::Error,
+        }
     }
 }
 
-/// Reads and statically checks a pipeline file ([`Mode::Static`]).
-pub fn read_document(path: &Path) -> Result<Document, CoreError> {
+/// Reads and statically checks a pipeline file ([`Mode::Static`]). Unknown
+/// keys in the file's own blocks fail it under [`UnknownKeys::Error`]; under
+/// [`UnknownKeys::Warn`] each is logged as a warning and ignored.
+pub fn read_document(path: &Path, unknown_keys: UnknownKeys) -> Result<Document, CoreError> {
     let content = std::fs::read_to_string(path)
         .map_err(|error| ConfigError::Read { path: path.display().to_string(), error })?;
-    Ok(Document::parse(&content)?)
+    let doc = Document::parse_with(&content, unknown_keys)?;
+    for key in doc.ignored_keys() {
+        tracing::warn!(key = %key, "ignoring unknown key `{key}` in the pipeline file");
+    }
+    Ok(doc)
 }
 
 /// Resolves an already read document to `mode`.
@@ -71,7 +86,7 @@ pub async fn resolve_document(doc: &Document, mode: Mode, opts: &LoadOpts) -> Re
                     "provider instance '{unused}' is declared but no secret() uses it; not starting it"
                 );
             }
-            let jobs = jobs_for(doc.secrets(), &partial.providers);
+            let jobs = jobs_for(doc.secrets(), &partial.providers, opts.unknown_keys);
             let values = if jobs.is_empty() {
                 SecretValues::new()
             } else {
@@ -86,7 +101,7 @@ pub async fn resolve_document(doc: &Document, mode: Mode, opts: &LoadOpts) -> Re
 /// Reads `path` and resolves it to `mode`. Returns the config and the mask
 /// holding every value resolved on the way (the same handle as `opts.mask`).
 pub async fn load_pipeline(path: &Path, mode: Mode, opts: &LoadOpts) -> Result<(PipelineConfig, MaskList), CoreError> {
-    let doc = read_document(path)?;
+    let doc = read_document(path, opts.unknown_keys)?;
     let config = resolve_document(&doc, mode, opts).await?;
     Ok((config, opts.mask.clone()))
 }

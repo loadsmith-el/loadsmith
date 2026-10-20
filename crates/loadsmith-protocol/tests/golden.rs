@@ -96,6 +96,30 @@ fn parser_messages_match_golden_fixture() {
     assert_eq!((parsed[0].rows, parsed[0].batches, parsed[0].last_batch_seq), (1500, 2, 2));
 }
 
+/// `configure` with and without the optional `unknown_keys` policy.
+#[test]
+fn configure_messages_match_golden_fixture() {
+    use loadsmith_protocol::{ConfigureStatus, UnknownKeys};
+    let msgs = check_fixture("configure_v1.jsonl", include_str!("fixtures/configure_v1.jsonl"));
+    let policies: Vec<_> = msgs
+        .iter()
+        .filter_map(|m| match m {
+            Message::Configure(c) => Some((c.unknown_keys, c.unknown_keys())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        policies,
+        [
+            (None, UnknownKeys::Error),
+            (Some(UnknownKeys::Error), UnknownKeys::Error),
+            (Some(UnknownKeys::Warn), UnknownKeys::Warn),
+        ]
+    );
+    let Some(Message::ConfigureAck(a)) = msgs.last() else { panic!("ends with configure_ack") };
+    assert_eq!((a.status.clone(), a.code.as_deref()), (ConfigureStatus::Error, Some("UNKNOWN_CONFIG_KEYS")));
+}
+
 #[test]
 fn schema_vocabulary_matches_golden_fixture() {
     let msgs = check_fixture("schema_v1.jsonl", include_str!("fixtures/schema_v1.jsonl"));

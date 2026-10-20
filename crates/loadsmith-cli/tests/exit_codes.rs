@@ -37,6 +37,10 @@ fn main() {
         ("provider_failures_exit_3_and_4", provider_failures_exit_3_and_4),
         ("validate_is_static_unless_resolve", validate_is_static_unless_resolve),
         ("state_commands_start_no_provider", state_commands_start_no_provider),
+        ("unknown_keys_exit_3_by_default", unknown_keys_exit_3_by_default),
+        ("ignore_unknown_keys_flag_warns_and_succeeds", ignore_unknown_keys_flag_warns_and_succeeds),
+        ("ignore_unknown_keys_env_var_warns_and_succeeds", ignore_unknown_keys_env_var_warns_and_succeeds),
+        ("ignore_unknown_keys_flag_wins_over_env_var", ignore_unknown_keys_flag_wins_over_env_var),
     ];
     let filter: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
     let mut failed = Vec::new();
@@ -95,6 +99,8 @@ impl Env {
     fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_loadsmith"));
         cmd.args(args).arg("--no-color").stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Strict by default, whatever the developer's shell exports.
+        cmd.env_remove("LOADSMITH_IGNORE_UNKNOWN_KEYS");
         cmd
     }
 
@@ -641,4 +647,98 @@ fn state_commands_start_no_provider() {
     assert!(out.contains("No state recorded for pipeline 'cli'"), "{out}");
     let (code, out) = exit_code(env.command(&["state", "rm"]).arg(&pipeline));
     assert_eq!(code, 0, "{out}");
+}
+
+// ── Unknown keys ─────────────────────────────────────────────────────────────
+
+impl Env {
+    /// The fake source → `destination-typed` (which parses its config with
+    /// the SDK helper), with a typo in the destination's config (`fail_aftr`)
+    /// when `plugin_typo`, and an unknown top-level key (`x-generator`) when
+    /// `envelope_typo`. With a `state:` block for the state commands.
+    fn with_unknown_keys(&self, plugin_typo: bool, envelope_typo: bool) -> PathBuf {
+        let mut dst = json!({ "journal": self.journal_path("destination") });
+        if plugin_typo {
+            dst["fail_aftr"] = json!(0);
+        }
+        let state = self.scratch.path("state.json");
+        let mut yaml = format!(
+            "pipeline:\n  name: cli\n  heartbeat_seconds: 0\n\
+             source:\n  type: fake\n  config: {{ batches: 1, incremental: true }}\n\
+             destination:\n  type: typed\n  config: {dst}\n\
+             state:\n  backend: local\n  path: {}\n",
+            state.display()
+        );
+        if envelope_typo {
+            yaml.push_str("x-generator:\n  tool: gen\n");
+        }
+        self.write_pipeline(&yaml)
+    }
+}
+
+const IGNORE_ENV: &str = "LOADSMITH_IGNORE_UNKNOWN_KEYS";
+
+fn unknown_keys_exit_3_by_default() {
+    let env = Env::new("keys-default");
+    // A typo in a plugin's config: the plugin rejects it in `configure`.
+    let plugin = env.with_unknown_keys(true, false);
+    let (code, out) = exit_code(&mut env.run(&plugin));
+    assert_eq!(code, 3, "{out}");
+    assert!(out.contains("UNKNOWN_CONFIG_KEYS") && out.contains("`fail_aftr`"), "{out}");
+    assert!(out.contains("--ignore-unknown-keys"), "the error names the way out: {out}");
+    assert_eq!(journal(&env.journal_path("destination")), ["unknown_keys=error"]);
+    // An unknown key in the file's own blocks: every command that reads the
+    // file fails, before any plugin starts.
+    let envelope = env.with_unknown_keys(false, true);
+    for args in [&["validate"][..], &["state", "show"], &["state", "rm"]] {
+        let (code, out) = exit_code(env.command(args).arg(&envelope));
+        assert_eq!(code, 3, "{args:?}: {out}");
+        assert!(out.contains("`x-generator`"), "{args:?}: {out}");
+    }
+    let (code, out) = exit_code(&mut env.run(&envelope));
+    assert_eq!(code, 3, "{out}");
+    assert_eq!(journal(&env.journal_path("destination")), ["unknown_keys=error"], "nothing new ran");
+}
+
+fn ignore_unknown_keys_flag_warns_and_succeeds() {
+    let env = Env::new("keys-flag");
+    let pipeline = env.with_unknown_keys(true, true);
+    let (code, out) = exit_code(env.run(&pipeline).arg("--ignore-unknown-keys"));
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("ignoring unknown key `x-generator` in the pipeline file"), "{out}");
+    assert!(out.contains("ignoring unknown config key `fail_aftr`"), "{out}");
+    assert_eq!(journal(&env.journal_path("destination"))[..2], ["unknown_keys=warn", "configure"]);
+    for args in [&["validate"][..], &["state", "show"], &["state", "rm"]] {
+        let (code, out) = exit_code(env.command(args).arg("--ignore-unknown-keys").arg(&pipeline));
+        assert_eq!(code, 0, "{args:?}: {out}");
+        assert!(out.contains("`x-generator`"), "{args:?} warns: {out}");
+    }
+}
+
+fn ignore_unknown_keys_env_var_warns_and_succeeds() {
+    let env = Env::new("keys-env");
+    let pipeline = env.with_unknown_keys(true, true);
+    for on in ["1", "true", "YES"] {
+        let (code, out) = exit_code(env.run(&pipeline).env(IGNORE_ENV, on));
+        assert_eq!(code, 0, "{IGNORE_ENV}={on}: {out}");
+        assert!(out.contains("ignoring unknown config key `fail_aftr`"), "{out}");
+    }
+    for off in ["0", "false", ""] {
+        let (code, out) = exit_code(env.run(&pipeline).env(IGNORE_ENV, off));
+        assert_eq!(code, 3, "{IGNORE_ENV}={off}: {out}");
+    }
+}
+
+fn ignore_unknown_keys_flag_wins_over_env_var() {
+    let env = Env::new("keys-precedence");
+    let pipeline = env.with_unknown_keys(true, true);
+    let (code, out) = exit_code(env.run(&pipeline).arg("--ignore-unknown-keys=false").env(IGNORE_ENV, "1"));
+    assert_eq!(code, 3, "the flag turns the variable off: {out}");
+    let (code, out) = exit_code(env.run(&pipeline).arg("--ignore-unknown-keys").env(IGNORE_ENV, "0"));
+    assert_eq!(code, 0, "the flag turns it on despite the variable: {out}");
+    let (code, out) = exit_code(env.run(&pipeline).arg("--ignore-unknown-keys=true").env(IGNORE_ENV, "bogus"));
+    assert_eq!(code, 0, "with the flag the variable is not read: {out}");
+    let (code, out) = exit_code(env.run(&pipeline).env(IGNORE_ENV, "bogus"));
+    assert_eq!(code, 2, "an unreadable variable is a usage error: {out}");
+    assert!(out.contains(IGNORE_ENV), "{out}");
 }

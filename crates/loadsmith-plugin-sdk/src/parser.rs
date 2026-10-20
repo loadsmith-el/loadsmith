@@ -26,11 +26,12 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use loadsmith_arrow::IpcWriter;
-use loadsmith_protocol::{capabilities, ConfigureAck, Finished, Message, PluginKind};
+use loadsmith_protocol::{capabilities, Finished, Message, PluginKind};
 use tokio::io::AsyncWrite;
 
 use crate::context::EventSender;
-use crate::control::{conclude, handshake, recv_configure, recv_start, unexpected, Control, Flow, Inbound};
+use crate::config::PluginConfig;
+use crate::control::{answer_configure, conclude, handshake, recv_configure, recv_start, unexpected, Control, Flow, Inbound};
 
 /// `finished.code` when a file's schema differs from the stream's.
 pub const SCHEMA_MISMATCH: &str = "SCHEMA_MISMATCH";
@@ -54,7 +55,7 @@ pub trait ParserPlugin: Send {
 
     /// Called after `configure`. Validate the config and prepare. Return
     /// `Err` to send `configure_ack { error }` and exit.
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()>;
+    async fn configure(&mut self, config: PluginConfig) -> Result<()>;
 
     /// The stream's schema when the config fixes it (for example a
     /// `columns:` list). Called once, after `start`. With it, the SDK sends
@@ -249,13 +250,9 @@ where
         .await?;
 
     // ── Configure ────────────────────────────────────────────────────────
-    let config = recv_configure(ctl).await?;
-    if let Err(e) = plugin.configure(config).await {
-        ctl.send(Message::ConfigureAck(ConfigureAck::error("CONFIGURE_FAILED", format!("{e:#}"))))
-            .await?;
-        return Err(Flow::fatal("CONFIGURE_FAILED", e.context("configure rejected")));
-    }
-    ctl.send(Message::ConfigureAck(ConfigureAck::ok())).await?;
+    let (config, warnings) = recv_configure(ctl).await?;
+    let outcome = plugin.configure(config).await;
+    answer_configure(ctl, events, &warnings, outcome).await?;
 
     // ── Start ─────────────────────────────────────────────────────────────
     recv_start(ctl).await?;
@@ -378,7 +375,7 @@ mod tests {
         fn plugin_version(&self) -> &str {
             "0.0.0"
         }
-        async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
+        async fn configure(&mut self, config: crate::PluginConfig) -> Result<()> {
             self.declared = config.get("declared").is_some();
             Ok(())
         }

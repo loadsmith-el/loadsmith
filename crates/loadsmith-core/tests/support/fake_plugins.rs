@@ -31,7 +31,7 @@ use arrow_array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use async_trait::async_trait;
 use loadsmith_plugin_sdk::{
-    DestinationPlugin, ObjectSourcePlugin, ParserPlugin, ProviderPlugin, ResolveFailure, SourcePlugin,
+    DestinationPlugin, ObjectSourcePlugin, ParserPlugin, PluginConfig, ProviderPlugin, ResolveFailure, SourcePlugin,
 };
 use loadsmith_protocol::{
     CapabilitiesResponse, ConfigureAck, Finished, HandshakeAck, Message, PluginKind,
@@ -49,6 +49,7 @@ pub fn install(dir: &Path) -> PathBuf {
     let mut names = vec![
         "loadsmith-source-fake".to_string(),
         "loadsmith-destination-fake".to_string(),
+        "loadsmith-destination-typed".to_string(),
         "loadsmith-provider-fake".to_string(),
         "loadsmith-source-files".to_string(),
         "loadsmith-parser-fake".to_string(),
@@ -75,6 +76,10 @@ pub fn run_as_plugin_if_invoked() {
         "destination-fake" => {
             rt().block_on(loadsmith_plugin_sdk::run_destination(FakeDestination::default()))
         }
+        "destination-typed" => rt().block_on(loadsmith_plugin_sdk::run_destination(FakeDestination {
+            typed: true,
+            ..Default::default()
+        })),
         "provider-fake" => rt().block_on(loadsmith_plugin_sdk::run_provider(FakeProvider::default())),
         "source-files" => rt().block_on(loadsmith_plugin_sdk::run_object_source(FakeFiles::default())),
         "parser-fake" => rt().block_on(loadsmith_plugin_sdk::run_parser(FakeParser::default())),
@@ -190,11 +195,11 @@ impl ProviderPlugin for FakeProvider {
     fn plugin_version(&self) -> &str {
         "0.0.0"
     }
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
+    async fn configure(&mut self, config: PluginConfig) -> Result<()> {
         self.journal = config.get("journal").and_then(|v| v.as_str()).map(PathBuf::from);
         note(&self.journal, "configure");
         anyhow::ensure!(config.get("reject").is_none(), "fake provider rejects this config");
-        self.config = config;
+        self.config = config.into_value();
         Ok(())
     }
     async fn resolve(&mut self, reference: &str) -> Result<String> {
@@ -234,9 +239,9 @@ impl SourcePlugin for FakeSource {
     fn capabilities(&self) -> Vec<String> {
         vec!["batch_read".into(), "incremental_state".into()]
     }
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
+    async fn configure(&mut self, config: PluginConfig) -> Result<()> {
         self.journal = config.get("journal").and_then(|v| v.as_str()).map(PathBuf::from);
-        self.config = config;
+        self.config = config.into_value();
         note(&self.journal, "configure");
         if let Some(pw) = self.config.get("password").and_then(|v| v.as_str()) {
             // The journal is a file, not output: it proves what arrived.
@@ -293,12 +298,38 @@ impl SourcePlugin for FakeSource {
 /// Config: `journal`, and at most one fault, applied on batch N+1:
 /// `crash_after` (exit 43) or `fail_after` (`write_batch` errors); or
 /// `hang_in_finalize: true`.
+///
+/// `destination-typed` parses its config with the SDK helper
+/// ([`PluginConfig::parse`]) into [`TypedConfig`], so an unknown key fails
+/// `configure` (or is only warned about under the `warn` policy). It
+/// journals the policy it received (`unknown_keys=<policy>`).
 #[derive(Default)]
 pub struct FakeDestination {
     config: serde_json::Value,
     journal: Option<PathBuf>,
     rows: u64,
     batches: u64,
+    typed: bool,
+}
+
+/// The `destination-typed` config: a flattened struct, the case serde's own
+/// `deny_unknown_fields` cannot check.
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+pub struct TypedConfig {
+    #[serde(default)]
+    journal: Option<PathBuf>,
+    #[serde(flatten)]
+    faults: TypedFaults,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+pub struct TypedFaults {
+    #[serde(default)]
+    crash_after: Option<u64>,
+    #[serde(default)]
+    fail_after: Option<u64>,
 }
 
 #[async_trait]
@@ -309,9 +340,13 @@ impl DestinationPlugin for FakeDestination {
     fn plugin_version(&self) -> &str {
         "0.0.0"
     }
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
+    async fn configure(&mut self, config: PluginConfig) -> Result<()> {
         self.journal = config.get("journal").and_then(|v| v.as_str()).map(PathBuf::from);
-        self.config = config;
+        if self.typed {
+            note(&self.journal, &format!("unknown_keys={}", config.unknown_keys().as_str()));
+            let _: TypedConfig = config.parse()?;
+        }
+        self.config = config.into_value();
         note(&self.journal, "configure");
         Ok(())
     }
@@ -378,9 +413,9 @@ impl ObjectSourcePlugin for FakeFiles {
         // a scratch dir; it writes to it only with `download: true`.
         vec!["object_output".into(), "scratch_dir".into()]
     }
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
+    async fn configure(&mut self, config: PluginConfig) -> Result<()> {
         self.journal = config.get("journal").and_then(|v| v.as_str()).map(PathBuf::from);
-        self.config = config;
+        self.config = config.into_value();
         note(&self.journal, "configure");
         if let Some(dir) = self.config.get("scratch_dir").and_then(|v| v.as_str()) {
             note(&self.journal, &format!("scratch {dir}"));
@@ -466,9 +501,9 @@ impl ParserPlugin for FakeParser {
     fn capabilities(&self) -> Vec<String> {
         if self.no_parse { vec![] } else { vec!["parse".into()] }
     }
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
+    async fn configure(&mut self, config: PluginConfig) -> Result<()> {
         self.journal = config.get("journal").and_then(|v| v.as_str()).map(PathBuf::from);
-        self.config = config;
+        self.config = config.into_value();
         note(&self.journal, "configure");
         Ok(())
     }

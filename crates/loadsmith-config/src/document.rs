@@ -22,6 +22,7 @@ use crate::error::ConfigError;
 use crate::mask::MaskList;
 use crate::model::PipelineConfig;
 use crate::template::{scan_value, substitute_value, FoundSecret, SecretRef, SecretValues, Secrets};
+use crate::strict::{deserialize_envelope, UnknownKeys};
 use crate::validate::validate_pipeline;
 
 /// Top-level blocks where `secret()` is not allowed: they are resolved
@@ -35,19 +36,28 @@ pub struct Document {
     raw: Value,
     config: PipelineConfig,
     secrets: Vec<SecretRef>,
+    ignored: Vec<String>,
 }
 
 impl Document {
     /// Parses and statically checks a pipeline file (step 1 above). Evaluates
     /// nothing: no environment variable, file or provider is read.
     pub fn parse(content: &str) -> Result<Self, ConfigError> {
+        Self::parse_with(content, UnknownKeys::Error)
+    }
+
+    /// [`parse`](Self::parse) with an unknown-keys policy for the file's own
+    /// blocks: an unknown key is an error ([`UnknownKeys::Error`]) or is
+    /// ignored and listed in [`ignored_keys`](Self::ignored_keys)
+    /// ([`UnknownKeys::Warn`]).
+    pub fn parse_with(content: &str, unknown_keys: UnknownKeys) -> Result<Self, ConfigError> {
         let raw: Value = serde_yaml::from_str(content)?;
         if !raw.is_mapping() {
             return Err(ConfigError::Validation("a pipeline file must be a YAML mapping".into()));
         }
         // The structure is checked before any template is evaluated: a typo
         // in a key must fail without side effects.
-        let config: PipelineConfig = serde_yaml::from_value(raw.clone())?;
+        let (config, ignored) = deserialize_envelope(raw.clone(), unknown_keys)?;
         validate_pipeline(&config)?;
 
         let mut found: Vec<FoundSecret> = Vec::new();
@@ -75,10 +85,18 @@ impl Document {
                 secrets.push(call);
             }
         }
-        Ok(Self { raw, config, secrets })
+        Ok(Self { raw, config, secrets, ignored })
     }
 
     /// The typed config with every template still unresolved.
+    /// The unknown keys of the file's own blocks that
+    /// [`parse_with`](Self::parse_with) ignored under [`UnknownKeys::Warn`],
+    /// as paths (`pipeline.timeouts.stall_secs`). The caller warns about
+    /// each.
+    pub fn ignored_keys(&self) -> &[String] {
+        &self.ignored
+    }
+
     pub fn config(&self) -> &PipelineConfig {
         &self.config
     }
@@ -274,5 +292,18 @@ destination:
         assert_eq!(config.state.unwrap().path, "/var/state/p.json");
         assert!(config.source.config["password"].as_str().unwrap().contains("secret("));
         assert_eq!(mask.apply("/var/state"), "***");
+    }
+
+    #[test]
+    fn unknown_keys_fail_parse_unless_the_policy_is_warn() {
+        let yaml = format!("x-generated-by: tool\n{WITH_PROVIDERS}").replace("name: p", "name: p\n  owner: me");
+        let err = Document::parse(&yaml).unwrap_err();
+        assert!(matches!(&err, ConfigError::UnknownKeys(k) if k == &["x-generated-by", "pipeline.owner"]), "{err}");
+        let doc = Document::parse_with(&yaml, UnknownKeys::Warn).unwrap();
+        assert_eq!(doc.ignored_keys(), ["x-generated-by", "pipeline.owner"]);
+        assert_eq!(doc.config().pipeline.name, "p");
+        // Later stages resolve the same tree; the ignored keys stay ignored.
+        assert_eq!(doc.resolve_subtrees(&["pipeline"], &MaskList::new()).unwrap().pipeline.name, "p");
+        assert!(Document::parse(WITH_PROVIDERS).unwrap().ignored_keys().is_empty());
     }
 }

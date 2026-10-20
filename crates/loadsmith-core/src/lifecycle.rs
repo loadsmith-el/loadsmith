@@ -3,7 +3,7 @@
 //! by a [`Shutdown`].
 use loadsmith_config::Timeouts;
 use loadsmith_protocol::{
-    error_codes, Configure, Message, PluginKind, ResumeCursor, SetProtocolVersion, StartParams,
+    error_codes, Configure, Message, PluginKind, ResumeCursor, SetProtocolVersion, StartParams, UnknownKeys,
 };
 
 use crate::error::CoreError;
@@ -35,15 +35,17 @@ fn violation(peer: &Peer, expected: &str, got: &Message) -> Failure {
 }
 
 /// Runs handshake, negotiates protocol version, requests capabilities,
-/// and sends configure. Returns identifying info about the plugin.
+/// and sends configure (with the run's unknown-keys policy, which the
+/// plugin applies to its config). Returns identifying info about the plugin.
 pub async fn run_handshake_and_configure(
     peer: &mut Peer,
     config: serde_json::Value,
+    unknown_keys: UnknownKeys,
     expected_kind: PluginKind,
     timeouts: &Timeouts,
     shutdown: &mut Shutdown,
 ) -> Result<PluginHandshake, Failure> {
-    run_handshake_and_configure_with(peer, |_| Ok(config), expected_kind, timeouts, shutdown).await
+    run_handshake_and_configure_with(peer, |_| Ok(config), unknown_keys, expected_kind, timeouts, shutdown).await
 }
 
 /// [`run_handshake_and_configure`], with the config built from the
@@ -52,6 +54,7 @@ pub async fn run_handshake_and_configure(
 pub async fn run_handshake_and_configure_with(
     peer: &mut Peer,
     config: impl FnOnce(&[String]) -> Result<serde_json::Value, Failure>,
+    unknown_keys: UnknownKeys,
     expected_kind: PluginKind,
     timeouts: &Timeouts,
     shutdown: &mut Shutdown,
@@ -120,7 +123,7 @@ pub async fn run_handshake_and_configure_with(
     // Send configuration
     let config = config(&supports)?;
     tracing::debug!(plugin = %label, "→ configure");
-    peer.send(Message::Configure(Configure { config })).await?;
+    peer.send(Message::Configure(Configure { config, unknown_keys: Some(unknown_keys) })).await?;
 
     let configure_limit = Timeouts::limit(timeouts.configure_seconds);
     match peer.recv_expect("configure_ack", configure_limit, shutdown).await? {

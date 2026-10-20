@@ -17,11 +17,12 @@ use std::os::unix::io::FromRawFd;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use loadsmith_protocol::{capabilities, ConfigureAck, Finished, Message, PluginKind, Resolve, Resolved};
+use loadsmith_protocol::{capabilities, Finished, Message, PluginKind, Resolve, Resolved};
 use tokio::io::AsyncWrite;
 
 use crate::context::EventSender;
-use crate::control::{conclude, handshake, recv_configure, recv_start, unexpected, Control, Flow, Inbound};
+use crate::config::PluginConfig;
+use crate::control::{answer_configure, conclude, handshake, recv_configure, recv_start, unexpected, Control, Flow, Inbound};
 
 /// The default `resolved.error.code` when a `resolve` fails without a
 /// [`ResolveFailure`].
@@ -67,7 +68,7 @@ pub trait ProviderPlugin: Send {
     /// Called after `configure`. Validate the config (it may use `env()` and
     /// `file()`, never `secret()`) and prepare: open a client, check a base
     /// directory. Return `Err` to send `configure_ack { error }` and exit.
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()>;
+    async fn configure(&mut self, config: PluginConfig) -> Result<()>;
 
     /// Resolves one reference (the second argument of a `secret()` call;
     /// its syntax is yours to define, e.g. `db.json#password`). Return the
@@ -115,13 +116,9 @@ where
         .await?;
 
     // ── Configure ────────────────────────────────────────────────────────
-    let config = recv_configure(ctl).await?;
-    if let Err(e) = plugin.configure(config).await {
-        ctl.send(Message::ConfigureAck(ConfigureAck::error("CONFIGURE_FAILED", format!("{e:#}"))))
-            .await?;
-        return Err(Flow::fatal("CONFIGURE_FAILED", e.context("configure rejected")));
-    }
-    ctl.send(Message::ConfigureAck(ConfigureAck::ok())).await?;
+    let (config, warnings) = recv_configure(ctl).await?;
+    let outcome = plugin.configure(config).await;
+    answer_configure(ctl, events, &warnings, outcome).await?;
 
     // ── Start ─────────────────────────────────────────────────────────────
     recv_start(ctl).await?;
@@ -215,8 +212,14 @@ mod tests {
         fn plugin_version(&self) -> &str {
             "0.0.0"
         }
-        async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
-            anyhow::ensure!(config.get("bad").is_none(), "bad config");
+        async fn configure(&mut self, config: crate::PluginConfig) -> Result<()> {
+            #[derive(serde::Deserialize)]
+            struct FakeConfig {
+                #[serde(default)]
+                bad: Option<bool>,
+            }
+            let parsed: FakeConfig = config.parse()?;
+            anyhow::ensure!(parsed.bad.is_none(), "bad config");
             Ok(())
         }
         async fn resolve(&mut self, reference: &str) -> Result<String> {
@@ -269,11 +272,17 @@ mod tests {
     /// Runs the provider on in-memory pipes; returns the core's ends and the
     /// task yielding (the lifecycle result, exit code, `cancel` called).
     fn spawn() -> (Core, tokio::task::JoinHandle<(bool, i32, bool)>) {
+        spawn_with_events(tokio::io::sink())
+    }
+
+    fn spawn_with_events(
+        event_out: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+    ) -> (Core, tokio::task::JoinHandle<(bool, i32, bool)>) {
         let (core_in, plugin_in) = tokio::io::duplex(1 << 16);
         let (plugin_out, core_out) = tokio::io::duplex(1 << 16);
         let task = tokio::spawn(async move {
             let mut ctl = Control::new(BufReader::new(plugin_in), plugin_out);
-            let mut events = EventSender::new(tokio::io::sink());
+            let mut events = EventSender::new(event_out);
             let mut plugin = Fake::default();
             let mut started = false;
             let result = drive_provider(&mut plugin, &mut ctl, &mut events, &mut started).await;
@@ -361,6 +370,49 @@ mod tests {
         let ack = core.recv().await;
         assert!(ack.contains(r#""status":"error""#) && ack.contains("CONFIGURE_FAILED"), "{ack}");
         assert_eq!(task.await.unwrap().1, 1);
+    }
+
+    /// Up to `configure`; returns its ack.
+    async fn configure(core: &mut Core, configure: &str) -> String {
+        core.send(r#"{"type":"handshake"}"#).await;
+        core.recv().await;
+        core.send(r#"{"type":"set_protocol_version","protocol_version":1}"#).await;
+        core.send(r#"{"type":"capabilities_request"}"#).await;
+        core.recv().await;
+        core.send(configure).await;
+        core.recv().await
+    }
+
+    #[tokio::test]
+    async fn unknown_config_keys_are_rejected_by_default() {
+        let (mut core, task) = spawn();
+        let ack = configure(&mut core, r#"{"type":"configure","config":{"bda":true}}"#).await;
+        assert!(ack.contains(r#""code":"UNKNOWN_CONFIG_KEYS""#) && ack.contains("`bda`"), "{ack}");
+        assert!(ack.contains("did you mean `bad`?"), "{ack}");
+        assert_eq!(task.await.unwrap().1, 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_config_keys_are_warned_about_under_warn() {
+        let (event_out, event_in) = tokio::io::duplex(1 << 16);
+        let (mut core, task) = spawn_with_events(event_out);
+        let ack = configure(
+            &mut core,
+            r#"{"type":"configure","config":{"bda":true,"x-meta":{"by":"gen"}},"unknown_keys":"warn"}"#,
+        )
+        .await;
+        assert_eq!(ack, r#"{"type":"configure_ack","status":"ok"}"#);
+        let mut events = BufReader::new(event_in);
+        let mut lines = Vec::new();
+        for _ in 0..2 {
+            let mut line = String::new();
+            events.read_line(&mut line).await.unwrap();
+            lines.push(line);
+        }
+        assert!(lines[0].contains(r#""level":"warn""#) && lines[0].contains("`bda`"), "{lines:?}");
+        assert!(lines[1].contains("`x-meta`"), "{lines:?}");
+        core.close().await;
+        let _ = task.await;
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@ pub mod template;
 pub mod mask;
 pub mod validate;
 pub mod error;
+pub mod strict;
 
 pub use document::{resolve_subtrees, Document, SECRET_FREE_BLOCKS};
 pub use model::{
@@ -16,3 +17,4 @@ pub use template::{resolve_string, resolve_value, SecretRef, SecretValues};
 pub use mask::MaskList;
 pub use validate::validate_pipeline;
 pub use error::ConfigError;
+pub use strict::{deserialize_envelope, UnknownKeys};

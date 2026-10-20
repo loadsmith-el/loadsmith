@@ -14,12 +14,15 @@
 //!   ([`Stop`]).
 
 use loadsmith_protocol::{
-    CapabilitiesResponse, HandshakeAck, Message, PluginKind, Resend, SetProtocolVersion,
+    CapabilitiesResponse, ConfigureAck, HandshakeAck, Message, PluginKind, Resend, SetProtocolVersion,
     StartParams,
 };
 use loadsmith_transport::{ControlReader, ControlWriter, TransportError};
 use tokio::io::{AsyncBufRead, AsyncWrite, BufReader, Stdout};
 use tokio::sync::mpsc;
+
+use crate::config::{take_warnings, ConfigRejection, PluginConfig};
+use crate::context::EventSender;
 
 pub(crate) const PROTOCOL_VERSION: u32 = 1;
 
@@ -260,13 +263,48 @@ pub(crate) async fn handshake<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Waits for `configure` and returns its config block.
+/// Waits for `configure` and returns its config block with the
+/// unknown-keys policy, and the handle its parse warnings collect in.
 pub(crate) async fn recv_configure<W: AsyncWrite + Unpin>(
     ctl: &mut Control<W>,
-) -> Result<serde_json::Value, Flow> {
+) -> Result<(PluginConfig, ConfigWarnings), Flow> {
     match ctl.recv().await? {
-        Message::Configure(c) => Ok(c.config),
+        Message::Configure(c) => {
+            let policy = c.unknown_keys();
+            let config = PluginConfig::new(c.config, policy);
+            let warnings = config.warnings();
+            Ok((config, warnings))
+        }
         other => Err(unexpected("configure", &other)),
+    }
+}
+
+/// Where [`PluginConfig::parse`] leaves its warnings.
+pub(crate) type ConfigWarnings = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// Answers `configure` with the outcome of the plugin's `configure()`:
+/// first one `warn` log per ignored unknown key on fd4, then
+/// `configure_ack`: `ok`, or `error` with the code of a [`ConfigRejection`]
+/// (`CONFIGURE_FAILED` for any other error).
+pub(crate) async fn answer_configure<W: AsyncWrite + Unpin, E: AsyncWrite + Unpin>(
+    ctl: &mut Control<W>,
+    events: &mut EventSender<E>,
+    warnings: &ConfigWarnings,
+    outcome: anyhow::Result<()>,
+) -> Result<(), Flow> {
+    for warning in take_warnings(warnings) {
+        events.warn(warning).await;
+    }
+    match outcome {
+        Ok(()) => {
+            ctl.send(Message::ConfigureAck(ConfigureAck::ok())).await?;
+            Ok(())
+        }
+        Err(e) => {
+            let code = e.downcast_ref::<ConfigRejection>().map_or("CONFIGURE_FAILED", ConfigRejection::code);
+            ctl.send(Message::ConfigureAck(ConfigureAck::error(code, format!("{e:#}")))).await?;
+            Err(Flow::fatal(code, e.context("configure rejected")))
+        }
     }
 }
 
@@ -432,7 +470,7 @@ mod tests {
     async fn unknown_types_are_ignored() {
         let (mut ctl, mut core_in, _o) = wired();
         let configure =
-            serde_json::to_string(&Message::Configure(Configure { config: serde_json::json!({}) }))
+            serde_json::to_string(&Message::Configure(Configure::new(serde_json::json!({}))))
                 .unwrap();
         core_in
             .write_all(format!("{{\"type\":\"from_the_future\"}}\n{configure}\n").as_bytes())

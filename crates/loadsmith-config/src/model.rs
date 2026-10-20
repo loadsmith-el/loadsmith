@@ -2,8 +2,12 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// A pipeline file. The structs of this module accept unknown keys on
+/// purpose: [`crate::strict::deserialize_envelope`] finds them, with their
+/// paths, and the operator's policy rejects them (the default) or warns and
+/// ignores them (`--ignore-unknown-keys`). Never deserialize a pipeline file
+/// from untrusted input without it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     pub pipeline: PipelineMeta,
     /// Provider instances, by name: each resolves the `secret('<name>', …)`
@@ -31,7 +35,6 @@ pub struct PipelineConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PipelineMeta {
     pub name: String,
     #[serde(default)]
@@ -54,7 +57,6 @@ fn default_heartbeat_seconds() -> u64 {
 /// once). A timeout fails the run through the abort path: the core sends
 /// `error` (code `TIMEOUT`) to the late plugin and `cancel` to the others.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Timeouts {
     /// Each reply during the handshake and capability exchange.
     #[serde(default = "default_handshake_seconds")]
@@ -133,12 +135,11 @@ impl Timeouts {
     }
 }
 
-/// A reference to a plugin with its opaque config block. Strict like the rest
-/// of the core-owned schema (a typo such as `confg:` must not silently drop
-/// the plugin's whole config); only `config`'s *contents* are free-form — the
-/// plugin validates those.
+/// A reference to a plugin with its opaque config block. Checked for unknown
+/// keys like the rest of the core-owned schema (a typo such as `confg:` must
+/// not silently drop the plugin's whole config); `config`'s *contents* are
+/// the plugin's to check, under the same policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PluginRef {
     #[serde(rename = "type")]
     pub plugin_type: String,
@@ -154,7 +155,6 @@ pub const DEFAULT_PROVIDER_TIMEOUT_SECONDS: u64 = 60;
 /// (binary `loadsmith-provider-<type>`) with its opaque config. Its config
 /// may use `env()`/`file()` but never `secret()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProviderRef {
     #[serde(rename = "type")]
     pub plugin_type: String,
@@ -178,7 +178,6 @@ impl ProviderRef {
 /// column itself lives in `source.config` (plugin-validated) — the core only
 /// stores the opaque value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct StateConfig {
     /// Where the state document lives. `local` is the only backend today.
     pub backend: String,

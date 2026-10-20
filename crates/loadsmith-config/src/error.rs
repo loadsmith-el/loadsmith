@@ -11,6 +11,17 @@ pub enum ConfigError {
     #[error("validation error: {0}")]
     Validation(String),
 
+    /// Keys the engine does not know in the pipeline file's own blocks
+    /// (everything but the contents of a plugin's `config:`), as paths.
+    #[error(
+        "unknown key{} in the pipeline file: {} (fix or remove {}, or run with --ignore-unknown-keys \
+         to ignore unknown keys)",
+        if .0.len() == 1 { "" } else { "s" },
+        .0.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", "),
+        if .0.len() == 1 { "it" } else { "them" }
+    )]
+    UnknownKeys(Vec<String>),
+
     /// A provider instance could not resolve the pipeline's `secret()`
     /// values (it failed, timed out, broke the protocol, or answered a
     /// reference with an error). The text names the instance and starts with

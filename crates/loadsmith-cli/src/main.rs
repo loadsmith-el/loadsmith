@@ -65,6 +65,52 @@ struct RunArgs {
     /// --output says
     #[arg(long, value_name = "PATH", conflicts_with = "print_resolved_config")]
     summary_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    strictness: Strictness,
+}
+
+/// The environment variable that turns `--ignore-unknown-keys` on.
+const IGNORE_UNKNOWN_KEYS_ENV: &str = "LOADSMITH_IGNORE_UNKNOWN_KEYS";
+
+/// How unknown keys in a pipeline file are treated.
+#[derive(Args, Clone, Copy, Debug, Default)]
+struct Strictness {
+    /// Warn about unknown keys and ignore them instead of failing: in the
+    /// pipeline file's own blocks and in every plugin's `config:`. Also
+    /// turned on by LOADSMITH_IGNORE_UNKNOWN_KEYS=1; the flag wins over the
+    /// variable (`--ignore-unknown-keys=false` keeps the default)
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
+    ignore_unknown_keys: Option<bool>,
+}
+
+impl Strictness {
+    /// The policy: the flag if given, else the environment variable, else
+    /// `error`.
+    fn policy(self) -> Result<loadsmith_core::UnknownKeys, UsageError> {
+        let ignore = match self.ignore_unknown_keys {
+            Some(flag) => flag,
+            None => env_switch(IGNORE_UNKNOWN_KEYS_ENV, std::env::var(IGNORE_UNKNOWN_KEYS_ENV).ok().as_deref())?,
+        };
+        Ok(if ignore { loadsmith_core::UnknownKeys::Warn } else { loadsmith_core::UnknownKeys::Error })
+    }
+}
+
+/// A boolean environment variable: unset or empty is off; `1`/`true`/`yes`/
+/// `on` and `0`/`false`/`no`/`off` (any case) are accepted; anything else is
+/// a usage error.
+fn env_switch(name: &str, value: Option<&str>) -> Result<bool, UsageError> {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("0") | Some("false") | Some("no") | Some("off") => Ok(false),
+        Some("1") | Some("true") | Some("yes") | Some("on") => Ok(true),
+        Some(other) => Err(UsageError(format!("{name}={other}: expected 1/true/yes/on or 0/false/no/off"))),
+    }
 }
 
 /// The format of `loadsmith run`'s stdout.
@@ -89,6 +135,9 @@ struct ValidateArgs {
 
     #[arg(long, help = "Override plugin directory (where --resolve finds provider binaries)")]
     plugin_dir: Option<PathBuf>,
+
+    #[command(flatten)]
+    strictness: Strictness,
 }
 
 #[derive(Args)]
@@ -115,6 +164,9 @@ enum StateAction {
 struct StateArgs {
     /// Path to the pipeline YAML file (its `state:` block locates the state)
     pipeline: PathBuf,
+
+    #[command(flatten)]
+    strictness: Strictness,
 }
 
 #[derive(Subcommand)]
@@ -293,15 +345,16 @@ async fn execute_run(
     // engine is PID 1, where an unhandled SIGTERM is silently ignored.
     let shutdown = loadsmith_core::listen_for_signals()?;
     let plugin_dir = args.plugin_dir.unwrap_or_else(discovery::default_plugin_dir);
+    let unknown_keys = args.strictness.policy()?;
 
     // Static check first (nothing runs on a malformed file), so even a run
     // that fails resolving its providers reports the pipeline it was.
-    let doc = loadsmith_core::read_document(&args.pipeline)?;
+    let doc = loadsmith_core::read_document(&args.pipeline, unknown_keys)?;
     ctx.learn(doc.config());
     // Full resolution — providers included — before the state lock and
     // before any data plugin starts. `--dry-run` and
     // `--print-resolved-config` resolve too: they show what would run.
-    let load = LoadOpts { plugin_dir: plugin_dir.clone(), shutdown: shutdown.clone(), mask: mask.clone() };
+    let load = LoadOpts { plugin_dir: plugin_dir.clone(), shutdown: shutdown.clone(), mask: mask.clone(), unknown_keys };
     let config = loadsmith_core::resolve_document(&doc, Mode::Full, &load).await?;
     ctx.learn(&config);
 
@@ -321,6 +374,7 @@ async fn execute_run(
         human_report,
         facts: facts.clone(),
         mask: mask.clone(),
+        unknown_keys,
     };
 
     Ok(Some(run_pipeline(config, opts).await?))
@@ -343,7 +397,8 @@ fn run_outcome(summary: &loadsmith_core::Summary) -> Result<()> {
 async fn cmd_validate(args: ValidateArgs, mask: MaskList) -> Result<()> {
     // Static by default: structure, template syntax, and every secret()
     // naming a declared provider instance. Nothing is evaluated or started.
-    let doc = loadsmith_core::read_document(&args.pipeline)?;
+    let unknown_keys = args.strictness.policy()?;
+    let doc = loadsmith_core::read_document(&args.pipeline, unknown_keys)?;
     if !args.resolve {
         println!(
             "Pipeline '{}' is valid (static check; --resolve also resolves env()/file() and \
@@ -355,7 +410,7 @@ async fn cmd_validate(args: ValidateArgs, mask: MaskList) -> Result<()> {
     // --resolve: the full resolution `run` performs before it starts
     // anything, providers included.
     let plugin_dir = args.plugin_dir.unwrap_or_else(discovery::default_plugin_dir);
-    let load = LoadOpts { plugin_dir, shutdown: loadsmith_core::listen_for_signals()?, mask };
+    let load = LoadOpts { plugin_dir, shutdown: loadsmith_core::listen_for_signals()?, mask, unknown_keys };
     let config = loadsmith_core::resolve_document(&doc, Mode::Full, &load).await?;
     let secrets = doc.secrets().len();
     println!(
@@ -385,11 +440,12 @@ fn cmd_plugin_list(args: PluginListArgs) -> Result<()> {
 /// commands never start a provider, and other blocks' templates (database
 /// credentials…) need not resolve.
 async fn load_state_cfg(
-    pipeline: &std::path::Path,
+    args: &StateArgs,
     mask: MaskList,
 ) -> Result<(loadsmith_config::PipelineConfig, loadsmith_config::StateConfig)> {
-    let load = LoadOpts { mask, ..LoadOpts::new(discovery::default_plugin_dir()) };
-    let (config, _) = loadsmith_core::load_pipeline(pipeline, Mode::Builtins, &load).await?;
+    let unknown_keys = args.strictness.policy()?;
+    let load = LoadOpts { mask, unknown_keys, ..LoadOpts::new(discovery::default_plugin_dir()) };
+    let (config, _) = loadsmith_core::load_pipeline(&args.pipeline, Mode::Builtins, &load).await?;
     let state = config.state.clone().ok_or_else(|| {
         loadsmith_config::ConfigError::Validation(format!(
             "pipeline '{}' has no state: block",
@@ -400,7 +456,7 @@ async fn load_state_cfg(
 }
 
 async fn cmd_state_show(args: StateArgs, mask: MaskList) -> Result<()> {
-    let (config, state_cfg) = load_state_cfg(&args.pipeline, mask).await?;
+    let (config, state_cfg) = load_state_cfg(&args, mask).await?;
     let backend = loadsmith_core::state::open_backend(&state_cfg)?;
     match backend.load(&config.pipeline.name)? {
         None => println!("No state recorded for pipeline '{}'.", config.pipeline.name),
@@ -427,7 +483,7 @@ async fn cmd_state_show(args: StateArgs, mask: MaskList) -> Result<()> {
 }
 
 async fn cmd_state_rm(args: StateArgs, mask: MaskList) -> Result<()> {
-    let (config, state_cfg) = load_state_cfg(&args.pipeline, mask).await?;
+    let (config, state_cfg) = load_state_cfg(&args, mask).await?;
     let backend = loadsmith_core::state::open_backend(&state_cfg)?;
     // Take the lock so we don't clear state out from under a running pipeline.
     let _guard = backend.lock(&config.pipeline.name)?;

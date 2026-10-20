@@ -1,0 +1,5 @@
+{"type":"configure","config":{"host":"db.internal","port":5432,"tls":{"mode":"require"}}}
+{"type":"configure","config":{"host":"db.internal","port":5432},"unknown_keys":"error"}
+{"type":"configure","config":{"host":"db.internal","port":5432},"unknown_keys":"warn"}
+{"type":"configure_ack","status":"ok"}
+{"type":"configure_ack","status":"error","code":"UNKNOWN_CONFIG_KEYS","message":"unknown config key `tls.verify_mode`"}
