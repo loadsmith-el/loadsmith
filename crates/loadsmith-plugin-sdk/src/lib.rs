@@ -3,6 +3,7 @@ pub mod destination;
 pub mod sink;
 pub mod config_provider;
 pub mod context;
+mod control;
 
 pub use source::{SourcePlugin, run_source};
 pub use destination::{DestinationPlugin, run_destination};

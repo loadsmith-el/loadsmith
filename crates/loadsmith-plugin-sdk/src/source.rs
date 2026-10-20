@@ -4,15 +4,11 @@ use anyhow::Result;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use loadsmith_protocol::{
-    ConfigureAck, Finished, HandshakeAck, Message, PluginKind, SetProtocolVersion,
-};
-use loadsmith_transport::{ControlReader, ControlWriter};
-use tokio::io::{AsyncWriteExt, BufReader};
+use loadsmith_protocol::{ConfigureAck, Finished, Message, PluginKind};
+use tokio::io::AsyncWrite;
 
 use crate::context::EventSender;
-
-const PROTOCOL_VERSION: u32 = 1;
+use crate::control::{conclude, handshake, recv_configure, recv_start, Control, Flow};
 
 /// Implemented by source plugins. The SDK drives the full lifecycle;
 /// implementors only provide data and metadata.
@@ -51,114 +47,107 @@ pub trait SourcePlugin: Send {
         None
     }
 
-    /// Called when core sends `cancel`. Plugin should abort promptly.
+    /// Called when the run will not complete, once `start` was received: the
+    /// core sent `cancel` or `error`, the core is gone, or this source failed.
+    /// Stop producing and release what you hold (cursors, connections).
+    ///
+    /// The SDK waits for `next_batch` and for the core at the same time, so on
+    /// `cancel` an in-flight `next_batch` future may have been **dropped**
+    /// before this runs; `cancel` must cope with that (for example, by dropping
+    /// a connection that was mid-query). Never called before `start`.
     async fn cancel(&mut self);
 }
 
 /// Entry point for source plugin binaries. Never returns normally.
+///
+/// Exit code: `0` after success or a `cancel`, `1` after a failure, an
+/// `error` from the core, or a lost core.
 pub async fn run_source<P: SourcePlugin + 'static>(mut plugin: P) -> ! {
-    if let Err(e) = run_source_inner(&mut plugin).await {
-        eprintln!("[plugin-sdk] fatal error: {e:#}");
-        std::process::exit(1);
-    }
-    std::process::exit(0);
+    let mut ctl = Control::stdio();
+    let mut started = false;
+    let result = drive_source(&mut plugin, &mut ctl, &mut started).await;
+    let code = conclude(&mut ctl, result, started, || plugin.cancel()).await;
+    std::process::exit(code);
 }
 
-async fn run_source_inner<P: SourcePlugin>(plugin: &mut P) -> Result<()> {
+async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin>(
+    plugin: &mut P,
+    ctl: &mut Control<W>,
+    started: &mut bool,
+) -> Result<(), Flow> {
     // fd0 = stdin (control in), fd1 = stdout (control out), fd4 = event out
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
     let event_fd = unsafe { std::fs::File::from_raw_fd(4) };
-    let event_async = tokio::fs::File::from_std(event_fd);
+    let mut events = EventSender::new(tokio::fs::File::from_std(event_fd));
 
-    let mut reader = ControlReader::new(BufReader::new(stdin));
-    let mut writer = ControlWriter::new(stdout);
-    let mut events = EventSender::new(event_async);
-
-    // ── Handshake ────────────────────────────────────────────────────────
-    let msg = reader.recv().await?.ok_or_else(|| anyhow::anyhow!("EOF before handshake"))?;
-    anyhow::ensure!(matches!(msg, Message::Handshake), "expected Handshake, got {msg:?}");
-
-    writer
-        .send(&Message::HandshakeAck(HandshakeAck {
-            protocol_supported_versions: vec![PROTOCOL_VERSION],
-            plugin_name: plugin.plugin_name().to_string(),
-            plugin_version: plugin.plugin_version().to_string(),
-            kind: PluginKind::Source,
-        }))
-        .await?;
-
-    let msg = reader.recv().await?.ok_or_else(|| anyhow::anyhow!("EOF after handshake_ack"))?;
-    let chosen_version = match msg {
-        Message::SetProtocolVersion(SetProtocolVersion { protocol_version }) => protocol_version,
-        other => anyhow::bail!("expected set_protocol_version, got {other:?}"),
-    };
-    anyhow::ensure!(
-        chosen_version == PROTOCOL_VERSION,
-        "unsupported protocol version {chosen_version}"
-    );
-
-    // ── Capabilities ─────────────────────────────────────────────────────
-    let msg = reader.recv().await?.ok_or_else(|| anyhow::anyhow!("EOF before capabilities"))?;
-    anyhow::ensure!(
-        matches!(msg, Message::CapabilitiesRequest),
-        "expected capabilities_request"
-    );
-    writer
-        .send(&Message::CapabilitiesResponse(
-            loadsmith_protocol::CapabilitiesResponse { supports: plugin.capabilities() },
-        ))
-        .await?;
+    // ── Handshake + capabilities ─────────────────────────────────────────
+    handshake(
+        ctl,
+        PluginKind::Source,
+        plugin.plugin_name(),
+        plugin.plugin_version(),
+        plugin.capabilities(),
+    )
+    .await?;
 
     // ── Configure ────────────────────────────────────────────────────────
-    let msg = reader.recv().await?.ok_or_else(|| anyhow::anyhow!("EOF before configure"))?;
-    let config = match msg {
-        Message::Configure(c) => c.config,
-        other => anyhow::bail!("expected configure, got {other:?}"),
-    };
-
-    match plugin.configure(config).await {
-        Ok(()) => writer.send(&Message::ConfigureAck(ConfigureAck::ok())).await?,
-        Err(e) => {
-            writer
-                .send(&Message::ConfigureAck(ConfigureAck::error(
-                    "CONFIGURE_FAILED",
-                    format!("{e:#}"),
-                )))
-                .await?;
-            anyhow::bail!("configure rejected: {e:#}");
-        }
+    let config = recv_configure(ctl).await?;
+    if let Err(e) = plugin.configure(config).await {
+        ctl.send(Message::ConfigureAck(ConfigureAck::error("CONFIGURE_FAILED", format!("{e:#}"))))
+            .await?;
+        return Err(Flow::fatal("CONFIGURE_FAILED", e.context("configure rejected")));
     }
+    ctl.send(Message::ConfigureAck(ConfigureAck::ok())).await?;
 
     // ── Start ─────────────────────────────────────────────────────────────
-    let msg = reader.recv().await?.ok_or_else(|| anyhow::anyhow!("EOF before start"))?;
-    let resume = match msg {
-        Message::Start(params) => params.resume.map(|r| r.cursor_value),
-        other => anyhow::bail!("expected start, got {other:?}"),
-    };
-    plugin.resume_from(resume).await;
+    let params = recv_start(ctl).await?;
+    *started = true;
+    plugin.resume_from(params.resume.map(|r| r.cursor_value)).await;
 
     // ── Schema ────────────────────────────────────────────────────────────
-    let schema = plugin.schema().await?;
+    let schema = plugin.schema().await.map_err(|e| Flow::fatal("SCHEMA_FAILED", e))?;
     let protocol_fields = schema_to_protocol_fields(&schema);
-    writer.send(&Message::Schema(loadsmith_protocol::Schema { fields: protocol_fields })).await?;
+    ctl.send(Message::Schema(loadsmith_protocol::Schema { fields: protocol_fields })).await?;
 
     // ── Data loop (Arrow IPC on fd3) ──────────────────────────────────────
     let data_fd = unsafe { std::fs::File::from_raw_fd(3) };
-    let mut ipc_writer =
-        loadsmith_arrow::IpcWriter::new(data_fd, &schema).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut ipc_writer = loadsmith_arrow::IpcWriter::new(data_fd, &schema)
+        .map_err(|e| Flow::fatal("IPC_WRITE_FAILED", anyhow::anyhow!("{e}")))?;
 
     let mut rows_total: u64 = 0;
     let mut batches_total: u64 = 0;
 
     loop {
-        // Check for cancel on stdin before reading next batch
-        // (non-blocking peek — if nothing is there we continue)
-        match plugin.next_batch().await {
+        // Wait for the next batch *and* the core at the same time, so a
+        // `cancel` stops a source even while it is busy producing (some
+        // sources buffer their whole result before the first batch). Only a
+        // stopping message drops the in-flight `next_batch` future; `ping` and
+        // `resend` are handled without touching it.
+        let next = {
+            let batch = plugin.next_batch();
+            tokio::pin!(batch);
+            loop {
+                tokio::select! {
+                    biased;
+                    inbound = ctl.next_inbound() => {
+                        match ctl.process(inbound).await {
+                            Ok(None) => {}
+                            Ok(Some(other)) => {
+                                tracing::warn!("ignoring unexpected control message mid-stream: {other:?}");
+                            }
+                            Err(flow) => break Err(flow),
+                        }
+                    }
+                    result = &mut batch => break Ok(result),
+                }
+            }
+        };
+        match next? {
             Ok(Some(batch)) => {
                 rows_total += batch.num_rows() as u64;
                 batches_total += 1;
-                ipc_writer.write_batch(&batch).map_err(|e| anyhow::anyhow!("{e}"))?;
+                ipc_writer
+                    .write_batch(&batch)
+                    .map_err(|e| Flow::fatal("IPC_WRITE_FAILED", anyhow::anyhow!("{e}")))?;
                 events.progress_source(rows_total, batches_total).await;
                 // Report the high watermark for this batch ordinal. The core
                 // pairs it with the destination's durable-commit ack before
@@ -170,22 +159,19 @@ async fn run_source_inner<P: SourcePlugin>(plugin: &mut P) -> Result<()> {
             Ok(None) => break,
             Err(e) => {
                 events.error_msg(format!("batch error: {e:#}")).await;
-                writer
-                    .send(&Message::Finished(Finished::error("BATCH_FAILED", format!("{e:#}"))))
-                    .await?;
-                return Ok(());
+                return Err(Flow::fatal("BATCH_FAILED", e));
             }
         }
     }
 
-    ipc_writer.finish().map_err(|e| anyhow::anyhow!("IPC finish: {e}"))?;
+    // The end-of-stream marker tells the core the stream is complete. It is
+    // written only after the last batch succeeded; a source that dies before
+    // this point leaves a stream the core recognises as truncated.
+    ipc_writer
+        .finish()
+        .map_err(|e| Flow::fatal("IPC_WRITE_FAILED", anyhow::anyhow!("IPC finish: {e}")))?;
 
-    writer
-        .send(&Message::Finished(Finished::success_source(rows_total, batches_total)))
-        .await?;
-
-    let mut stdout = tokio::io::stdout();
-    stdout.flush().await?;
+    ctl.send(Message::Finished(Finished::success_source(rows_total, batches_total))).await?;
     Ok(())
 }
 

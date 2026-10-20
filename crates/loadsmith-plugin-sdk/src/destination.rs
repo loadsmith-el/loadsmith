@@ -3,15 +3,12 @@ use std::os::unix::io::FromRawFd;
 use anyhow::Result;
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
-use loadsmith_protocol::{
-    ConfigureAck, Finished, HandshakeAck, Message, PluginKind, SetProtocolVersion,
-};
-use loadsmith_transport::{ControlReader, ControlWriter};
-use tokio::io::{AsyncWriteExt, BufReader};
+use loadsmith_protocol::{ConfigureAck, Finished, Message, PluginKind};
+use tokio::io::AsyncWrite;
+use tokio::sync::mpsc;
 
 use crate::context::EventSender;
-
-const PROTOCOL_VERSION: u32 = 1;
+use crate::control::{conclude, handshake, recv_configure, recv_start, Control, Flow};
 
 /// Implemented by destination plugins.
 #[async_trait]
@@ -55,105 +52,135 @@ pub trait DestinationPlugin: Send {
         None
     }
 
-    /// Called after all batches are received (fd3 EOF).
-    /// Plugin should flush and finalize.
+    /// Called once the input is **complete**: the core ended fd3 with the
+    /// end-of-stream marker, which it does only after the source finished
+    /// successfully. Flush and commit here. Never called after `cancel`.
     async fn finalize(&mut self) -> Result<u64>;
 
-    /// Called when core sends `cancel`. Plugin should abort promptly.
+    /// Called when the run will not complete, once `start` was received: the
+    /// core sent `cancel` or `error`, the core is gone (fd0 closed, or fd3
+    /// ended without the end-of-stream marker), or this destination's own
+    /// `write_batch`/`finalize` failed. **Undo the partial load**: roll back
+    /// the open transaction, drop the staging table, delete partial output
+    /// files. Everything already reported durable through `durable_through`
+    /// may stay. `finalize` is never called after this.
+    ///
+    /// The SDK checks for `cancel` between batches (never in the middle of a
+    /// `write_batch` or `finalize` call), so this runs with no write in flight.
     async fn cancel(&mut self);
 }
 
 /// Entry point for destination plugin binaries. Never returns normally.
+///
+/// Exit code: `0` after success or a `cancel`, `1` after a failure, an
+/// `error` from the core, or a lost core.
 pub async fn run_destination<P: DestinationPlugin + 'static>(mut plugin: P) -> ! {
-    if let Err(e) = run_destination_inner(&mut plugin).await {
-        eprintln!("[plugin-sdk] fatal error: {e:#}");
-        std::process::exit(1);
-    }
-    std::process::exit(0);
+    let mut ctl = Control::stdio();
+    let mut started = false;
+    let result = drive_destination(&mut plugin, &mut ctl, &mut started).await;
+    let code = conclude(&mut ctl, result, started, || plugin.cancel()).await;
+    std::process::exit(code);
 }
 
-async fn run_destination_inner<P: DestinationPlugin>(plugin: &mut P) -> Result<()> {
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-    let event_fd = unsafe { std::fs::File::from_raw_fd(4) };
-    let event_async = tokio::fs::File::from_std(event_fd);
+/// What the fd3 reader thread hands to the lifecycle.
+enum DataEvent {
+    Batch(RecordBatch),
+    /// The stream ended; `clean` ⇔ it ended with the end-of-stream marker.
+    End { clean: bool },
+    Failed(String),
+}
 
-    let mut reader = ControlReader::new(BufReader::new(stdin));
-    let mut writer = ControlWriter::new(stdout);
-    let mut events = EventSender::new(event_async);
-
-    // ── Handshake ────────────────────────────────────────────────────────
-    let msg = reader.recv().await?.ok_or_else(|| anyhow::anyhow!("EOF before handshake"))?;
-    anyhow::ensure!(matches!(msg, Message::Handshake), "expected Handshake");
-
-    writer
-        .send(&Message::HandshakeAck(HandshakeAck {
-            protocol_supported_versions: vec![PROTOCOL_VERSION],
-            plugin_name: plugin.plugin_name().to_string(),
-            plugin_version: plugin.plugin_version().to_string(),
-            kind: PluginKind::Destination,
-        }))
-        .await?;
-
-    let msg = reader.recv().await?.ok_or_else(|| anyhow::anyhow!("EOF after handshake_ack"))?;
-    match msg {
-        Message::SetProtocolVersion(SetProtocolVersion { protocol_version }) => {
-            anyhow::ensure!(protocol_version == PROTOCOL_VERSION, "unsupported version");
+/// Reads fd3 on a plain thread (Arrow IPC is blocking I/O) and forwards each
+/// batch, so the lifecycle can wait for data and for the core together. The
+/// channel holds one batch: the thread blocks (and so does the pipe) until the
+/// lifecycle takes it, preserving backpressure.
+fn spawn_fd3_reader() -> mpsc::Receiver<DataEvent> {
+    let (tx, rx) = mpsc::channel(1);
+    std::thread::spawn(move || {
+        let data_fd = unsafe { std::fs::File::from_raw_fd(3) };
+        let mut reader = match loadsmith_arrow::IpcReader::new(data_fd) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.blocking_send(DataEvent::Failed(e.to_string()));
+                return;
+            }
+        };
+        loop {
+            let event = match reader.read_batch() {
+                Ok(Some(batch)) => DataEvent::Batch(batch),
+                Ok(None) => DataEvent::End { clean: reader.ended_cleanly() },
+                Err(e) => DataEvent::Failed(e.to_string()),
+            };
+            let last = !matches!(event, DataEvent::Batch(_));
+            if tx.blocking_send(event).is_err() || last {
+                return;
+            }
         }
-        other => anyhow::bail!("expected set_protocol_version, got {other:?}"),
-    }
+    });
+    rx
+}
 
-    // ── Capabilities ─────────────────────────────────────────────────────
-    let msg = reader.recv().await?.ok_or_else(|| anyhow::anyhow!("EOF before capabilities"))?;
-    anyhow::ensure!(matches!(msg, Message::CapabilitiesRequest));
-    writer
-        .send(&Message::CapabilitiesResponse(loadsmith_protocol::CapabilitiesResponse {
-            supports: plugin.capabilities(),
-        }))
-        .await?;
+async fn drive_destination<P: DestinationPlugin, W: AsyncWrite + Unpin>(
+    plugin: &mut P,
+    ctl: &mut Control<W>,
+    started: &mut bool,
+) -> Result<(), Flow> {
+    let event_fd = unsafe { std::fs::File::from_raw_fd(4) };
+    let mut events = EventSender::new(tokio::fs::File::from_std(event_fd));
+
+    // ── Handshake + capabilities ─────────────────────────────────────────
+    handshake(
+        ctl,
+        PluginKind::Destination,
+        plugin.plugin_name(),
+        plugin.plugin_version(),
+        plugin.capabilities(),
+    )
+    .await?;
 
     // ── Configure ────────────────────────────────────────────────────────
-    let msg = reader.recv().await?.ok_or_else(|| anyhow::anyhow!("EOF before configure"))?;
-    let config = match msg {
-        Message::Configure(c) => c.config,
-        other => anyhow::bail!("expected configure, got {other:?}"),
-    };
-
-    match plugin.configure(config).await {
-        Ok(()) => writer.send(&Message::ConfigureAck(ConfigureAck::ok())).await?,
-        Err(e) => {
-            writer
-                .send(&Message::ConfigureAck(ConfigureAck::error("CONFIGURE_FAILED", format!("{e:#}"))))
-                .await?;
-            anyhow::bail!("configure rejected: {e:#}");
-        }
+    let config = recv_configure(ctl).await?;
+    if let Err(e) = plugin.configure(config).await {
+        ctl.send(Message::ConfigureAck(ConfigureAck::error("CONFIGURE_FAILED", format!("{e:#}"))))
+            .await?;
+        return Err(Flow::fatal("CONFIGURE_FAILED", e.context("configure rejected")));
     }
+    ctl.send(Message::ConfigureAck(ConfigureAck::ok())).await?;
 
     // ── Start + Prepare ───────────────────────────────────────────────────
-    let msg = reader.recv().await?.ok_or_else(|| anyhow::anyhow!("EOF before start"))?;
-    anyhow::ensure!(matches!(msg, Message::Start(_)), "expected start");
-
-    plugin.prepare().await?;
-    writer.send(&Message::Ready).await?;
+    recv_start(ctl).await?;
+    *started = true;
+    plugin.prepare().await.map_err(|e| Flow::fatal("PREPARE_FAILED", e))?;
+    ctl.send(Message::Ready).await?;
 
     // ── Data loop (Arrow IPC on fd3) ──────────────────────────────────────
-    let data_fd = unsafe { std::fs::File::from_raw_fd(3) };
-    let mut ipc_reader =
-        loadsmith_arrow::IpcReader::new(data_fd).map_err(|e| anyhow::anyhow!("{e}"))?;
-
+    // fd0 is watched throughout: the core sends `cancel` when the run aborts,
+    // and it never ends fd3 cleanly after an upstream failure, so a
+    // destination blocked waiting for data still learns it must roll back.
+    let mut data = spawn_fd3_reader();
     let mut batches_total: u64 = 0;
     let mut committed_seq: u64 = 0;
 
     loop {
-        match ipc_reader.read_batch() {
-            Ok(Some(batch)) => {
+        let event = tokio::select! {
+            biased;
+            inbound = ctl.next_inbound() => {
+                match ctl.process(inbound).await? {
+                    None => continue,
+                    Some(other) => {
+                        tracing::warn!("ignoring unexpected control message mid-stream: {other:?}");
+                        continue;
+                    }
+                }
+            }
+            event = data.recv() => event.unwrap_or(DataEvent::Failed("fd3 reader stopped".into())),
+        };
+        match event {
+            DataEvent::Batch(batch) => {
                 batches_total += 1;
                 if let Err(e) = plugin.write_batch(batch).await {
                     events.error_msg(format!("write_batch error: {e:#}")).await;
-                    writer
-                        .send(&Message::Finished(Finished::error("WRITE_FAILED", format!("{e:#}"))))
-                        .await?;
-                    return Ok(());
+                    return Err(Flow::fatal("WRITE_FAILED", e));
                 }
                 // Announce any files finalized by this batch (e.g. a chunk that
                 // rolled over) so the sink can start delivering mid-pump.
@@ -169,17 +196,22 @@ async fn run_destination_inner<P: DestinationPlugin>(plugin: &mut P) -> Result<(
                     }
                 }
             }
-            Ok(None) => break,
-            Err(e) => {
-                writer
-                    .send(&Message::Finished(Finished::error("IPC_READ_FAILED", format!("{e:#}"))))
-                    .await?;
-                return Ok(());
+            DataEvent::End { clean: true } => break,
+            DataEvent::End { clean: false } => {
+                // The core died (or abandoned the run) without ending the
+                // stream: the input is incomplete and must not be committed.
+                return Err(Flow::fatal(
+                    "INPUT_TRUNCATED",
+                    anyhow::anyhow!("the data stream ended without an end-of-stream marker"),
+                ));
+            }
+            DataEvent::Failed(e) => {
+                return Err(Flow::fatal("IPC_READ_FAILED", anyhow::anyhow!("{e}")));
             }
         }
     }
 
-    let rows_written = plugin.finalize().await?;
+    let rows_written = plugin.finalize().await.map_err(|e| Flow::fatal("FINALIZE_FAILED", e))?;
     // Announce the final files (single-file mode closes its only file here, and
     // chunked mode closes the last partial chunk). These events must reach fd4
     // before the process exits so the sink delivers every object.
@@ -194,11 +226,7 @@ async fn run_destination_inner<P: DestinationPlugin>(plugin: &mut P) -> Result<(
     }
     events.progress_destination(rows_written, batches_total).await;
 
-    writer
-        .send(&Message::Finished(Finished::success_destination(rows_written, batches_total)))
+    ctl.send(Message::Finished(Finished::success_destination(rows_written, batches_total)))
         .await?;
-
-    let mut stdout = tokio::io::stdout();
-    stdout.flush().await?;
     Ok(())
 }

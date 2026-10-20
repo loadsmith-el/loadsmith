@@ -3,15 +3,11 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use loadsmith_protocol::{
-    ConfigureAck, Finished, HandshakeAck, Message, ObjectDelivered, PluginKind, SetProtocolVersion,
-};
-use loadsmith_transport::{ControlReader, ControlWriter};
-use tokio::io::{AsyncWriteExt, BufReader};
+use loadsmith_protocol::{ConfigureAck, Finished, Message, ObjectDelivered, PluginKind};
+use tokio::io::AsyncWrite;
 
 use crate::context::EventSender;
-
-const PROTOCOL_VERSION: u32 = 1;
+use crate::control::{conclude, handshake, recv_configure, recv_start, unexpected, Control, Flow};
 
 /// Implemented by sink plugins.
 ///
@@ -45,130 +41,81 @@ pub trait SinkPlugin: Send {
     /// Called after all objects are delivered (control-plane EOF).
     async fn finalize(&mut self) -> Result<u64>;
 
-    /// Called when core sends `cancel`. Plugin should abort promptly.
+    /// Called when the run will not complete, once `start` was received: the
+    /// core sent `cancel` or `error`, or this sink's own `deliver`/`finalize`
+    /// failed. Abort promptly and clean up (for example, abort an in-progress
+    /// multipart upload). Objects already acknowledged stay delivered: a sink
+    /// is not transactional. Checked between objects, never mid-`deliver`.
     async fn cancel(&mut self);
 }
 
 /// Entry point for sink plugin binaries. Never returns normally.
+///
+/// Exit code: `0` after success or a `cancel`, `1` after a failure or an
+/// `error` from the core.
 pub async fn run_sink<P: SinkPlugin + 'static>(mut plugin: P) -> ! {
-    if let Err(e) = run_sink_inner(&mut plugin).await {
-        eprintln!("[plugin-sdk] fatal error: {e:#}");
-        std::process::exit(1);
-    }
-    std::process::exit(0);
+    let mut ctl = Control::stdio();
+    let mut started = false;
+    let result = drive_sink(&mut plugin, &mut ctl, &mut started).await;
+    let code = conclude(&mut ctl, result, started, || plugin.cancel()).await;
+    std::process::exit(code);
 }
 
-async fn run_sink_inner<P: SinkPlugin>(plugin: &mut P) -> Result<()> {
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
+async fn drive_sink<P: SinkPlugin, W: AsyncWrite + Unpin>(
+    plugin: &mut P,
+    ctl: &mut Control<W>,
+    started: &mut bool,
+) -> Result<(), Flow> {
     let event_fd = unsafe { std::fs::File::from_raw_fd(4) };
-    let event_async = tokio::fs::File::from_std(event_fd);
+    let mut events = EventSender::new(tokio::fs::File::from_std(event_fd));
 
-    let mut reader = ControlReader::new(BufReader::new(stdin));
-    let mut writer = ControlWriter::new(stdout);
-    let mut events = EventSender::new(event_async);
-
-    // ── Handshake ────────────────────────────────────────────────────────
-    let msg = reader.recv().await?.ok_or_else(|| anyhow::anyhow!("EOF before handshake"))?;
-    anyhow::ensure!(matches!(msg, Message::Handshake), "expected Handshake");
-
-    writer
-        .send(&Message::HandshakeAck(HandshakeAck {
-            protocol_supported_versions: vec![PROTOCOL_VERSION],
-            plugin_name: plugin.plugin_name().to_string(),
-            plugin_version: plugin.plugin_version().to_string(),
-            kind: PluginKind::Sink,
-        }))
-        .await?;
-
-    let msg = reader.recv().await?.ok_or_else(|| anyhow::anyhow!("EOF after handshake_ack"))?;
-    match msg {
-        Message::SetProtocolVersion(SetProtocolVersion { protocol_version }) => {
-            anyhow::ensure!(protocol_version == PROTOCOL_VERSION, "unsupported version");
-        }
-        other => anyhow::bail!("expected set_protocol_version, got {other:?}"),
-    }
-
-    // ── Capabilities ─────────────────────────────────────────────────────
-    let msg = reader.recv().await?.ok_or_else(|| anyhow::anyhow!("EOF before capabilities"))?;
-    anyhow::ensure!(matches!(msg, Message::CapabilitiesRequest));
-    writer
-        .send(&Message::CapabilitiesResponse(loadsmith_protocol::CapabilitiesResponse {
-            supports: plugin.capabilities(),
-        }))
-        .await?;
+    // ── Handshake + capabilities ─────────────────────────────────────────
+    handshake(
+        ctl,
+        PluginKind::Sink,
+        plugin.plugin_name(),
+        plugin.plugin_version(),
+        plugin.capabilities(),
+    )
+    .await?;
 
     // ── Configure ────────────────────────────────────────────────────────
-    let msg = reader.recv().await?.ok_or_else(|| anyhow::anyhow!("EOF before configure"))?;
-    let config = match msg {
-        Message::Configure(c) => c.config,
-        other => anyhow::bail!("expected configure, got {other:?}"),
-    };
-
-    match plugin.configure(config).await {
-        Ok(()) => writer.send(&Message::ConfigureAck(ConfigureAck::ok())).await?,
-        Err(e) => {
-            writer
-                .send(&Message::ConfigureAck(ConfigureAck::error("CONFIGURE_FAILED", format!("{e:#}"))))
-                .await?;
-            anyhow::bail!("configure rejected: {e:#}");
-        }
+    let config = recv_configure(ctl).await?;
+    if let Err(e) = plugin.configure(config).await {
+        ctl.send(Message::ConfigureAck(ConfigureAck::error("CONFIGURE_FAILED", format!("{e:#}"))))
+            .await?;
+        return Err(Flow::fatal("CONFIGURE_FAILED", e.context("configure rejected")));
     }
+    ctl.send(Message::ConfigureAck(ConfigureAck::ok())).await?;
 
     // ── Start + Prepare ───────────────────────────────────────────────────
-    let msg = reader.recv().await?.ok_or_else(|| anyhow::anyhow!("EOF before start"))?;
-    anyhow::ensure!(matches!(msg, Message::Start(_)), "expected start");
-
-    plugin.prepare().await?;
-    writer.send(&Message::Ready).await?;
+    recv_start(ctl).await?;
+    *started = true;
+    plugin.prepare().await.map_err(|e| Flow::fatal("PREPARE_FAILED", e))?;
+    ctl.send(Message::Ready).await?;
 
     // ── Delivery loop (DeliverObject on the control plane) ─────────────────
     // The core sends one DeliverObject per staged file and closes our stdin
     // (EOF) once everything is delivered. Each successful deliver is ack'd with
-    // ObjectDelivered so the core's ledger knows what survived a crash.
-    let mut delivered_total: u64 = 0;
-
-    loop {
-        let msg = match reader.recv().await? {
-            Some(m) => m,
-            None => break, // EOF — no more objects.
-        };
+    // ObjectDelivered so the core's ledger knows what survived a crash. `ping`,
+    // `resend`, `cancel` and `error` are handled by `Control`.
+    while let Some(msg) = ctl.recv_or_eof().await? {
         match msg {
             Message::DeliverObject(d) => {
                 let path = PathBuf::from(&d.path);
                 if let Err(e) = plugin.deliver(path).await {
                     events.error_msg(format!("deliver error for {}: {e:#}", d.path)).await;
-                    writer
-                        .send(&Message::Finished(Finished::error("DELIVER_FAILED", format!("{e:#}"))))
-                        .await?;
-                    return Ok(());
+                    return Err(Flow::fatal("DELIVER_FAILED", e));
                 }
-                delivered_total += 1;
-                writer.send(&Message::ObjectDelivered(ObjectDelivered { path: d.path })).await?;
+                ctl.send(Message::ObjectDelivered(ObjectDelivered { path: d.path })).await?;
             }
-            Message::Ping => {
-                writer.send(&Message::Pong).await?;
-            }
-            Message::Cancel(_) => {
-                plugin.cancel().await;
-                writer.send(&Message::Finished(Finished::cancelled())).await?;
-                let mut stdout = tokio::io::stdout();
-                stdout.flush().await?;
-                return Ok(());
-            }
-            other => {
-                anyhow::bail!("unexpected message in delivery loop: {other:?}");
-            }
+            other => return Err(unexpected("deliver_object", &other)),
         }
     }
 
-    let count = plugin.finalize().await?;
-    let _ = delivered_total; // ack count is a per-instance sanity check only
+    let count = plugin.finalize().await.map_err(|e| Flow::fatal("FINALIZE_FAILED", e))?;
     // Reuse the Finished shape to carry the object count back to the core
     // (rows_written/batches_written both = objects delivered) — no new field.
-    writer.send(&Message::Finished(Finished::success_destination(count, count))).await?;
-
-    let mut stdout = tokio::io::stdout();
-    stdout.flush().await?;
+    ctl.send(Message::Finished(Finished::success_destination(count, count))).await?;
     Ok(())
 }
