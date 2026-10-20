@@ -53,9 +53,20 @@ pub enum Message {
     Pong,
 
     // Control
+    /// Core → plugin: abort the run. The plugin stops, undoes its partial work
+    /// (a destination rolls back), and replies `finished` with status
+    /// `cancelled`. Never followed by a clean end of the data stream.
     Cancel(Cancel),
+    /// Core → plugin: the core is aborting the run because of a fault in *this*
+    /// plugin (incompatible protocol, wrong kind, protocol violation, timeout).
+    /// The plugin stops and undoes its partial work, as for `cancel`; no reply
+    /// is expected.
     Error(ProtocolError),
     Finished(Finished),
+    /// Either direction, control channel only: the previous line received
+    /// from this peer was malformed; re-send your most recent control message
+    /// once. A second consecutive malformed line is fatal.
+    Resend(Resend),
 
     // Forward compatibility
     /// A message whose `type` this build does not know (sent by a newer peer).
@@ -250,7 +261,33 @@ pub struct Cancel {
     pub reason: String,
 }
 
+// ── Resend ────────────────────────────────────────────────────────────────────
+
+/// Body of `resend`. `{"type":"resend"}` is the whole message; `reason` is an
+/// optional, human-readable description of what was wrong with the line.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Resend {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 // ── Error ─────────────────────────────────────────────────────────────────────
+
+/// The `code`s the core puts in a core → plugin `error`. Plugins must treat an
+/// unknown code like any other `error` (stop and undo partial work).
+pub mod error_codes {
+    /// No protocol version is supported by both sides.
+    pub const UNSUPPORTED_PROTOCOL_VERSION: &str = "UNSUPPORTED_PROTOCOL_VERSION";
+    /// The plugin's `handshake_ack` declared a different kind than the core
+    /// spawned it as.
+    pub const WRONG_PLUGIN_KIND: &str = "WRONG_PLUGIN_KIND";
+    /// The plugin sent a message that is out of place for the lifecycle phase.
+    pub const PROTOCOL_VIOLATION: &str = "PROTOCOL_VIOLATION";
+    /// Two consecutive malformed control lines (a `resend` did not help).
+    pub const MALFORMED_MESSAGE: &str = "MALFORMED_MESSAGE";
+    /// The plugin did not answer within the configured timeout.
+    pub const TIMEOUT: &str = "TIMEOUT";
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtocolError {
@@ -643,6 +680,20 @@ mod tests {
     fn ping_pong_roundtrip() {
         assert!(matches!(roundtrip(&Message::Ping), Message::Ping));
         assert!(matches!(roundtrip(&Message::Pong), Message::Pong));
+    }
+
+    #[test]
+    fn resend_roundtrip() {
+        let bare = Message::Resend(Resend::default());
+        assert_eq!(serde_json::to_string(&bare).unwrap(), r#"{"type":"resend"}"#);
+        let msg: Message = serde_json::from_str(r#"{"type":"resend"}"#).unwrap();
+        assert!(matches!(msg, Message::Resend(Resend { reason: None })));
+        let with_reason = Message::Resend(Resend { reason: Some("bad json".into()) });
+        if let Message::Resend(r) = roundtrip(&with_reason) {
+            assert_eq!(r.reason.as_deref(), Some("bad json"));
+        } else {
+            panic!("wrong variant");
+        }
     }
 
     #[test]
