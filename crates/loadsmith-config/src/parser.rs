@@ -82,6 +82,37 @@ unknown_field: bad
     }
 
     #[test]
+    fn timeouts_default_when_absent() {
+        let (config, _) = parse_pipeline_yaml(BASIC_YAML).unwrap();
+        assert_eq!(config.pipeline.timeouts, crate::Timeouts::default());
+        assert_eq!(config.pipeline.timeouts.stall_seconds, 0, "stall detection is opt-in");
+    }
+
+    #[test]
+    fn timeouts_are_partial_and_strict() {
+        let yaml = r#"
+pipeline:
+  name: x
+  timeouts:
+    stall_seconds: 120
+    cancel_grace_seconds: 5
+source:
+  type: postgres
+destination:
+  type: jsonl
+"#;
+        let (config, _) = parse_pipeline_yaml(yaml).unwrap();
+        let t = config.pipeline.timeouts;
+        assert_eq!(t.stall_seconds, 120);
+        assert_eq!(t.cancel_grace_seconds, 5);
+        assert_eq!(t.handshake_seconds, crate::Timeouts::default().handshake_seconds);
+
+        let typo = yaml.replace("stall_seconds", "stall_secs");
+        let err = parse_pipeline_yaml(&typo).expect_err("unknown key").to_string();
+        assert!(err.contains("stall_secs"), "{err}");
+    }
+
+    #[test]
     fn plugin_config_contents_stay_free_form() {
         let yaml = r#"
 pipeline:
