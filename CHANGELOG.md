@@ -103,6 +103,11 @@ release notes in their repositories.
 
 ### Changed
 
+- `plugin install --all` (no package name) skips, with a warning, any package
+  whose manifest this loadsmith cannot use (unknown plugin kind, no supported
+  protocol version) instead of failing the whole install — e.g. the published
+  `file` 0.1.x, whose manifest still declares `kind: config-provider`.
+
 - **Breaking: the `config_provider` kind is renamed `provider`** (wire
   `"provider"`, manifest `kind: provider`, `--kind provider`, binary
   `loadsmith-provider-<type>`); the old spelling is not accepted. The provider

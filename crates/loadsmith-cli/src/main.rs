@@ -458,6 +458,10 @@ fn cmd_plugin_install(args: PluginInstallArgs) -> Result<()> {
         plugin_install::validate_kind(k)?;
     }
 
+    // `--all` over the index skips packages this loadsmith can't use (see
+    // `Incompatible`); naming a package explicitly still fails on them.
+    let skip_incompatible = args.all && args.name.is_none();
+
     // Each job: a manifest (index URL / path) plus the kinds to install from it
     // (`None` ⇒ all of the package's binaries).
     let jobs: Vec<(String, Option<Vec<String>>)> = if args.all && args.name.is_none() {
@@ -502,15 +506,25 @@ fn cmd_plugin_install(args: PluginInstallArgs) -> Result<()> {
     };
 
     for (spec, kinds) in jobs {
-        let manifest = plugin_install::load_manifest(&spec)?;
         let kind_refs: Option<Vec<&str>> =
             kinds.as_ref().map(|v| v.iter().map(String::as_str).collect());
-        let installed = plugin_install::install_from_manifest(
-            &manifest,
-            &plugin_dir,
-            loadsmith_core::lifecycle::SUPPORTED_VERSIONS,
-            kind_refs.as_deref(),
-        )?;
+        let attempt = plugin_install::load_manifest(&spec).and_then(|manifest| {
+            plugin_install::install_from_manifest(
+                &manifest,
+                &plugin_dir,
+                loadsmith_core::lifecycle::SUPPORTED_VERSIONS,
+                kind_refs.as_deref(),
+            )
+            .map(|installed| (manifest, installed))
+        });
+        let (manifest, installed) = match attempt {
+            Ok(ok) => ok,
+            Err(e) if skip_incompatible && e.downcast_ref::<plugin_install::Incompatible>().is_some() => {
+                eprintln!("warning: skipping incompatible package: {e}");
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         println!(
             "Installed plugin '{}' v{} ({} binar{}) → {}",
             manifest.name,

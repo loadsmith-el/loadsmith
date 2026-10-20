@@ -102,6 +102,21 @@ pub fn resolve_from_index(spec: &str, index_url: &str) -> Result<String> {
     })
 }
 
+/// A package this loadsmith cannot use: its manifest does not validate (e.g. a
+/// plugin kind this version doesn't know) or it targets no protocol version we
+/// speak. `install --all` skips these with a warning instead of failing, so one
+/// stale package in the index can't break installing the rest.
+#[derive(Debug)]
+pub struct Incompatible(pub String);
+
+impl std::fmt::Display for Incompatible {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Incompatible {}
+
 /// Load a manifest from a local path or a `file`/`http`/`https` URL.
 pub fn load_manifest(spec: &str) -> Result<PluginManifest> {
     let text = if spec.contains("://") {
@@ -110,7 +125,8 @@ pub fn load_manifest(spec: &str) -> Result<PluginManifest> {
     } else {
         std::fs::read_to_string(spec).with_context(|| format!("reading manifest {spec}"))?
     };
-    PluginManifest::parse(&text).map_err(|e| anyhow!("invalid manifest {spec}: {e}"))
+    PluginManifest::parse(&text)
+        .map_err(|e| Incompatible(format!("invalid manifest {spec}: {e}")).into())
 }
 
 /// Resolve the host artifact, download + verify it, and install the promised
@@ -127,13 +143,12 @@ pub fn install_from_manifest(
     wanted_kinds: Option<&[&str]>,
 ) -> Result<Vec<PathBuf>> {
     if !manifest.protocol_compatible_with(supported_protocols) {
-        bail!(
+        return Err(Incompatible(format!(
             "plugin '{}' targets protocol {:?}, but this loadsmith supports {:?} \
              — no compatible protocol version",
-            manifest.name,
-            manifest.protocol,
-            supported_protocols
-        );
+            manifest.name, manifest.protocol, supported_protocols
+        ))
+        .into());
     }
 
     let (os, arch) = current_platform();
@@ -300,6 +315,19 @@ mod tests {
         assert_eq!(removed.len(), 1);
         assert!(!dir.join("loadsmith-source-postgres").exists());
         assert!(dir.join("loadsmith-destination-postgres").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_manifest_is_incompatible() {
+        let dir = std::env::temp_dir().join(format!("ls-incompat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("loadsmith-plugin.yaml");
+        std::fs::write(&path, "apiVersion: loadsmith.dev/plugin/v1\nkind: Nonsense\n").unwrap();
+        let err = load_manifest(path.to_str().unwrap()).unwrap_err();
+        assert!(err.downcast_ref::<Incompatible>().is_some(), "{err:#}");
+        let missing = load_manifest(dir.join("absent.yaml").to_str().unwrap()).unwrap_err();
+        assert!(missing.downcast_ref::<Incompatible>().is_none(), "I/O errors must not be skippable");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

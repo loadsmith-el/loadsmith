@@ -319,7 +319,11 @@ loadsmith plugin install --binary ./target/release/loadsmith-destination-jsonl  
 selector — `mysql:source@0.1.0` is the source plugin of mysql 0.1.0. There is
 **one installed version at a time**: the on-disk binary is `loadsmith-{kind}-{name}`
 (no version in the filename), so reinstalling a different version overwrites it.
-`--all` always pulls each package's `latest`.
+`--all` always pulls each package's `latest`. With no name, a package this
+loadsmith cannot use — its manifest doesn't validate (e.g. a plugin kind this
+version doesn't know) or it targets no supported protocol version — is skipped
+with a warning instead of failing the whole install; download and checksum
+errors still fail it. Naming the package explicitly reports the error.
 
 Index/manifest installs download a per-platform artifact, **verify its sha256**,
 and refuse a manifest whose declared `protocol` range is incompatible with this
