@@ -130,7 +130,10 @@ trait later.
 
 The state document also records a **schema fingerprint**; if the source shape
 changed since the recorded run, `on_schema_change` decides whether to refuse
-(default) or continue.
+(default) or continue. The fingerprint is taken from the **exact Arrow schema
+of the source's IPC stream** (fd3), which the core reads before it starts the
+destination, not from the informational `schema` message. A drifted run is
+therefore refused before anything is loaded.
 
 ## State file format
 
@@ -139,10 +142,10 @@ part of Loadsmith's [stability promise](../reference/stability.md):
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "pipeline": "orders-incremental",
   "cursor_value": "2026-06-09T08:00:00Z",
-  "schema_hash": "a8e4fe49824728ac",
+  "schema_hash": "4cd1b622e90bcb1b",
   "run_id": "4242-1781078400000",
   "updated_at_unix_ms": 1781078400000
 }
@@ -150,21 +153,45 @@ part of Loadsmith's [stability promise](../reference/stability.md):
 
 | Field | Meaning |
 |---|---|
-| `version` | State format version. Current: **1**. |
+| `version` | State format version. Current: **2**. |
 | `pipeline` | Owning pipeline — a run refuses a file that belongs to another pipeline. |
 | `cursor_value` | The opaque watermark, echoed to the source verbatim on resume. |
-| `schema_hash` | Fingerprint of the source schema: 64-bit FNV-1a over each field's name and wire type, in order (length-prefixed), as 16 hex digits. Stable across Loadsmith builds and platforms. |
+| `schema_hash` | Fingerprint of the source's Arrow schema, as 16 hex digits (see below). Stable across Loadsmith builds, Arrow versions and platforms. |
 | `run_id` | Run that last wrote the file (diagnostic). |
 | `updated_at_unix_ms` | Time of the last write (diagnostic). |
 
+**The fingerprint** covers field order, names, nullability and exact types with
+their parameters: timestamp unit and time zone, decimal precision and scale,
+fixed sizes, and nested children (list items, struct members, map key and
+value, dictionary index and value types). Field and schema metadata are
+ignored, so a changed column comment is not drift. The schema is mapped to the
+protocol's [type vocabulary](../protocol/messages.md#schema) and encoded as a
+sequence of tokens, each written as its UTF-8 byte length (`u64`
+little-endian) followed by its bytes, then hashed with 64-bit FNV-1a:
+
+- the schema: the field count (decimal), then each field;
+- a field: its name, `nullable` or `required`, then its type;
+- a type: its vocabulary name (`int64`, `timestamp`, …), then its parameters
+  in a fixed order: numbers in decimal (`precision`, `scale`, `byte_width`,
+  `size`, a struct's field count), units by their wire name (`us`), a time zone
+  as `=<tz>` or `-` when absent, `sorted`/`unsorted` for a map, and child
+  fields or types recursively.
+
+For example `id: int64 not null, nome: utf8` hashes the tokens `2`, `id`,
+`required`, `int64`, `nome`, `nullable`, `utf8` to `4cd1b622e90bcb1b`.
+
 Compatibility rules:
 
-- **Legacy files** (written by Loadsmith ≤ 0.2.0) have no `version` field and a
-  `schema_hash` from Rust's `DefaultHasher`, which is not stable across Rust
-  releases. They are accepted: the cursor is honoured, the schema-drift check is
-  skipped for that one run (with a warning, since the old fingerprint cannot be
-  compared), and the next save rewrites the file as version 1. Until a run saves
-  a new watermark the file stays legacy.
+- **Older formats are migrated.** A file in an older format is accepted: the
+  cursor is honoured, the schema-drift check is skipped for that one run (with a
+  warning, since its fingerprint was computed differently and cannot be
+  compared), and the next save rewrites the file as version 2. Until a run
+  saves a new watermark, the file keeps its old format. The older formats are:
+  - **legacy** (Loadsmith ≤ 0.2.0): no `version` field, and a `schema_hash`
+    from Rust's `DefaultHasher`, which is not stable across Rust releases;
+  - **version 1**: `schema_hash` over the field names and the lossy type labels
+    of the protocol `schema` message (every timestamp unit was `timestamp_ms`,
+    most other types `utf8`, no nullability).
 - A file with a `version` **higher** than the running Loadsmith understands was
   written by a newer release; it is refused rather than silently downgraded.
 - Unknown extra fields are ignored on read (and dropped on the next write).

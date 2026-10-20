@@ -16,12 +16,15 @@
 //! 3. Both plugins' outcomes are always collected, and the summary reports the
 //!    run's status with the root cause (the first failure observed).
 
+use std::fs::File;
 use std::os::unix::io::IntoRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use loadsmith_arrow::ipc::IpcError;
+use loadsmith_arrow::IpcReader;
 use loadsmith_config::{validate_pipeline, ConfigError, PipelineConfig, Timeouts};
 use loadsmith_protocol::{error_codes, FinishedStatus, Message, PluginKind};
 use loadsmith_transport::ControlReader;
@@ -228,6 +231,12 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     let mut src = Peer::new("source", src_sp);
     let mut dst = Peer::new("destination", dst_sp);
 
+    // Read the header of the source's Arrow IPC stream (its exact schema) on
+    // a blocking thread. It only completes once the source writes it, right
+    // after its `schema` message; setup waits for it before the drift check.
+    let mut source_stream: Option<StreamOpen> =
+        Some(tokio::task::spawn_blocking(move || IpcReader::new(in_read)));
+
     // The sink stage is stopped through its own shutdown input: the runner
     // fires it when the run aborts (or forwards a signal).
     let (sink_trigger, sink_shutdown) = Shutdown::channel();
@@ -284,12 +293,19 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
 
         // Start source (returns its schema) and destination (signals ready). The
         // resume cursor (if any) tells an incremental source where to pick up.
-        let schema = start_source(&mut src, resume_value, &timeouts, &mut shutdown).await?;
-        reporter.schema(&schema);
+        let declared = start_source(&mut src, resume_value, &timeouts, &mut shutdown).await?;
+
+        // The Arrow IPC stream header is the authoritative schema: the `schema`
+        // message is informational (and lossy from older SDKs).
+        let reader = open_source_stream(&mut src, &mut source_stream, &timeouts, &mut shutdown).await?;
+        let arrow_schema = reader.schema();
+        let fields = loadsmith_arrow::protocol_fields_from_schema(&arrow_schema);
+        warn_on_schema_mismatch(&declared.fields, &fields);
+        reporter.schema(&fields);
 
         // Schema-drift guard: if the source shape changed since the recorded state,
         // a blind resume could corrupt the load. Refuse (default) or warn.
-        let schema_hash = schema_fingerprint(&schema);
+        let schema_hash = schema_fingerprint(&arrow_schema);
         if let (Some(prior), Some(state_cfg)) = (&prior_state, &config.state) {
             check_schema_drift(prior, &schema_hash, state_cfg.on_schema_change)?;
         }
@@ -310,11 +326,11 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
 
         start_and_await_ready(&mut dst, &timeouts, &mut shutdown).await?;
         tracing::info!("destination ready — pump starting");
-        Ok((src_info, dst_info))
+        Ok((src_info, dst_info, reader))
     }
     .await;
 
-    let (src_info, dst_info) = match setup {
+    let (src_info, dst_info, source_reader) = match setup {
         Ok(infos) => infos,
         Err(failure) => {
             tracing::error!("aborting the run: {}", failure.reason());
@@ -328,9 +344,12 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
             if let Some(task) = sink_task {
                 let _ = task.await;
             }
+            // The source is gone, so a header read still in flight ends now.
+            if let Some(task) = source_stream {
+                let _ = task.await;
+            }
             // The destination is gone; only now close its fd3.
             drop(out_write);
-            drop(in_read);
             return Err(failure.error);
         }
     };
@@ -343,7 +362,7 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     let mut pump_join = {
         let control = Arc::clone(&pump_control);
         tokio::task::spawn_blocking(move || {
-            pump(in_read, out_write, control, move |rows, batches| reporter.progress(rows, batches))
+            pump(source_reader, out_write, control, move |rows, batches| reporter.progress(rows, batches))
         })
     };
 
@@ -501,6 +520,94 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
 
     summary.print();
     Ok(summary)
+}
+
+/// The blocking read of the source's IPC stream header.
+type StreamOpen = tokio::task::JoinHandle<Result<IpcReader<File>, IpcError>>;
+
+/// Waits for the header of the source's Arrow IPC stream, which a source
+/// writes right after its `schema` message. Bounded by `start_seconds`
+/// (measured from here) and interrupted by `shutdown`; the source's control
+/// channel is watched meanwhile, so a source that gives up is reported as
+/// such. `task` stays `Some` until the read completes, so the abort path can
+/// reap it once the source is gone.
+async fn open_source_stream(
+    src: &mut Peer,
+    task: &mut Option<StreamOpen>,
+    timeouts: &Timeouts,
+    shutdown: &mut Shutdown,
+) -> Result<IpcReader<File>, Failure> {
+    let limit = Timeouts::limit(timeouts.start_seconds);
+    let deadline = limit.map(|d| Instant::now() + d);
+    let handle = task.as_mut().expect("the source stream is opened once");
+    let opened = loop {
+        tokio::select! {
+            biased;
+            halt = shutdown.wait() => return Err(Failure::halted(halt)),
+            res = &mut *handle => break res,
+            inbound = src.next_inbound() => match src.process(inbound).await? {
+                Some(Event::Msg(Message::Finished(f))) if f.status != FinishedStatus::Success => {
+                    return Err(Failure::of("source", finished_failure("source", &f)));
+                }
+                // EOF on fd1: the source is exiting, and its fd3 closes with it,
+                // which ends the header read below.
+                Some(Event::Eof) | Some(Event::ResendRequested) | None => {}
+                Some(Event::Msg(other)) => ignore_mid_stream("source", &other),
+            },
+            () = sleep_until(deadline) => {
+                return Err(Failure::by(
+                    "source",
+                    error_codes::TIMEOUT,
+                    CoreError::Timeout(format!(
+                        "source: no Arrow IPC stream header on fd3 within {}s after its schema \
+                         (timeouts.start_seconds)",
+                        timeouts.start_seconds
+                    )),
+                ));
+            }
+        }
+    };
+    *task = None;
+    match opened {
+        Ok(Ok(reader)) => Ok(reader),
+        Ok(Err(e)) => Err(source_failure(src, format!("the source's data stream has no valid header: {e}")).await),
+        Err(e) => Err(Failure::new(CoreError::PluginProcess(format!("stream header task: {e}")))),
+    }
+}
+
+/// Sleeps until `deadline`, or forever without one.
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Warns when a source's `schema` message does not describe its Arrow stream
+/// (a plugin built with an older SDK labels types lossily). The stream wins.
+fn warn_on_schema_mismatch(declared: &[loadsmith_protocol::Field], actual: &[loadsmith_protocol::Field]) {
+    if declared == actual {
+        return;
+    }
+    let detail = if declared.len() != actual.len() {
+        format!("{} declared columns, {} in the stream", declared.len(), actual.len())
+    } else {
+        declared
+            .iter()
+            .zip(actual)
+            .find(|(d, a)| d != a)
+            .map(|(d, a)| {
+                let show = |f: &loadsmith_protocol::Field| {
+                    format!("{}: {}{}", f.name, f.field_type, if f.nullable { "" } else { " not null" })
+                };
+                format!("declared `{}`, stream has `{}`", show(d), show(a))
+            })
+            .unwrap_or_default()
+    };
+    tracing::warn!(
+        "the source's schema message does not match its Arrow stream ({detail}); using the \
+         stream. A plugin built with a current SDK sends the exact schema"
+    );
 }
 
 /// What the data phase ended with.

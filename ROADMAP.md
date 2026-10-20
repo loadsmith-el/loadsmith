@@ -107,9 +107,12 @@ What's shipped and what's queued next. Shipped items are documented in
       failure or SIGINT/SIGTERM the core sends `cancel`/`error`, waits a grace
       period and kills — the destination rolls back instead of committing a
       partial load), per-phase timeouts and an opt-in stall timeout, one
-      `resend` for a malformed control line, and distinct exit codes.
+      `resend` for a malformed control line, and distinct exit codes; a
+      complete Arrow field-type vocabulary in the `schema` message (with
+      nullability and tolerant reading) and drift detection on the exact Arrow
+      stream schema (state format v2, migrated automatically).
       Remaining: the policy's open decisions (machine-readable output,
-      experimental kinds, Arrow field types, remote state, SDK publishing),
+      experimental kinds, remote state, SDK publishing),
       and the canonical plugins' `cancel()` rolling back once they move to
       the new SDK.
 

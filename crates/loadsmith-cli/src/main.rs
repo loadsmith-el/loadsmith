@@ -289,6 +289,12 @@ fn cmd_state_show(args: StateArgs) -> Result<()> {
             println!("Pipeline:     {}", doc.pipeline);
             if doc.is_legacy() {
                 println!("Format:       legacy (pre-v1; upgraded on the next run's save)");
+            } else if !doc.fingerprint_is_comparable() {
+                println!(
+                    "Format:       v{} (old schema fingerprint; upgraded to v{} on the next run's save)",
+                    doc.version,
+                    loadsmith_core::state::STATE_FORMAT_VERSION
+                );
             } else {
                 println!("Format:       v{}", doc.version);
             }

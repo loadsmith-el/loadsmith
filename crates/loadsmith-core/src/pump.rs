@@ -41,8 +41,6 @@ pub struct PumpControl {
 
 /// The destination's end of the data plane, still open.
 pub enum PumpOutput {
-    /// The source never produced a stream, so nothing was written yet.
-    Unopened(File),
     /// The stream is open: schema (and batches) written, no end marker yet.
     Open(IpcWriter<File>),
     /// Writing to the destination failed; the pipe is gone.
@@ -55,7 +53,6 @@ impl PumpOutput {
     pub fn finish(self) -> anyhow::Result<()> {
         match self {
             PumpOutput::Open(w) => w.finish().map_err(|e| anyhow::anyhow!("data plane finish: {e}")),
-            PumpOutput::Unopened(_) => anyhow::bail!("the destination stream was never opened"),
             PumpOutput::Closed => anyhow::bail!("the destination stream is closed"),
         }
     }
@@ -73,8 +70,9 @@ pub struct PumpOutcome {
     pub output: PumpOutput,
 }
 
-/// Copies the Arrow IPC stream from `read_in` (source) to `write_out`
-/// (destination) until the source's stream ends, invoking
+/// Copies the Arrow IPC stream from `reader` (the source's, its header
+/// already read by the runner) to `write_out` (destination) until the
+/// source's stream ends, invoking
 /// `on_progress(rows, batches)` at exponentially growing batch intervals
 /// (1, 2, 4, 8, …) so logs never flood.
 ///
@@ -84,23 +82,16 @@ pub struct PumpOutcome {
 ///
 /// This is synchronous, blocking I/O — intended to run on a blocking thread
 /// (e.g. `tokio::task::spawn_blocking`).
-pub fn pump<F>(read_in: File, write_out: File, control: Arc<PumpControl>, mut on_progress: F) -> PumpOutcome
+pub fn pump<F>(
+    mut reader: IpcReader<File>,
+    write_out: File,
+    control: Arc<PumpControl>,
+    mut on_progress: F,
+) -> PumpOutcome
 where
     F: FnMut(u64, u64),
 {
     let mut stats = PumpStats::default();
-    let mut reader = match IpcReader::new(read_in) {
-        Ok(r) => r,
-        Err(e) => {
-            return PumpOutcome {
-                stats,
-                source_clean: false,
-                read_error: Some(format!("data plane reader: {e}")),
-                write_error: None,
-                output: PumpOutput::Unopened(write_out),
-            }
-        }
-    };
     let schema = reader.schema();
     let mut write_error = None;
     let mut writer = match IpcWriter::new(write_out, schema.as_ref()) {
@@ -177,8 +168,8 @@ mod tests {
     }
 
     /// Writes `n` batches to a fresh pipe, optionally with the end marker, and
-    /// returns the read end.
-    fn source_stream(n: usize, finish: bool) -> File {
+    /// returns a reader on it (header read, as the runner hands it over).
+    fn source_stream(n: usize, finish: bool) -> IpcReader<File> {
         let (r, w) = pipe();
         let (schema, b) = batch();
         let mut writer = IpcWriter::new(w, &schema).unwrap();
@@ -187,8 +178,10 @@ mod tests {
         }
         if finish {
             writer.finish().unwrap();
+        } else {
+            drop(writer);
         }
-        r
+        IpcReader::new(r).unwrap()
     }
 
     #[test]
@@ -243,16 +236,5 @@ mod tests {
         let mut reader = IpcReader::new(bytes.as_slice()).unwrap();
         assert!(reader.read_batch().unwrap().is_none(), "nothing forwarded after abort");
         assert!(!reader.ended_cleanly());
-    }
-
-    #[test]
-    fn a_source_that_never_wrote_leaves_the_output_unopened() {
-        let (r, w) = pipe();
-        drop(w);
-        let (_dst_r, dst_w) = pipe();
-        let out = pump(r, dst_w, Arc::default(), |_, _| {});
-        assert!(!out.source_clean);
-        assert!(out.read_error.is_some());
-        assert!(matches!(out.output, PumpOutput::Unopened(_)));
     }
 }

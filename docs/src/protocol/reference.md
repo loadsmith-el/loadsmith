@@ -138,8 +138,11 @@ Both plugins are spawned up front, but the core drives them in a fixed order:
    `state:` block, `object_output` on the destination if it has a `sink:` block;
 3. spawn the sink supervisor (only with `sink:`), which brings the sink up to
    `ready`;
-4. `start` the source and wait for its `schema`;
-5. schema-drift check and state supervisor (only with `state:`);
+4. `start` the source and wait for its `schema`, then for the header of its
+   Arrow IPC stream on fd3 (the authoritative schema; both within
+   `start_seconds`);
+5. schema-drift check against the IPC schema, and the state supervisor (only
+   with `state:`);
 6. `start` the destination and wait for `ready`;
 7. start the data pump.
 

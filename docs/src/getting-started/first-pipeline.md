@@ -123,7 +123,7 @@ postgres → jsonl
 2026-10-20T14:03:08.412204Z  INFO loadsmith_core::reporter: id: int64
 2026-10-20T14:03:08.412204Z  INFO loadsmith_core::reporter: customer: utf8
 2026-10-20T14:03:08.412204Z  INFO loadsmith_core::reporter: total: float64
-2026-10-20T14:03:08.412204Z  INFO loadsmith_core::reporter: created_at: timestamp_ms
+2026-10-20T14:03:08.412204Z  INFO loadsmith_core::reporter: created_at: timestamp(ms)
 …
 2026-10-20T14:03:08.731204Z  INFO loadsmith_core::reporter: 2,000 rows · 1 batch
 2026-10-20T14:03:08.902204Z  INFO loadsmith_core::reporter: 4,000 rows · 2 batches

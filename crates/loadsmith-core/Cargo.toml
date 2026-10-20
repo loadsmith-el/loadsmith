@@ -22,10 +22,10 @@ loadsmith-protocol  = { path = "../loadsmith-protocol" }
 loadsmith-transport = { path = "../loadsmith-transport" }
 loadsmith-config    = { path = "../loadsmith-config" }
 loadsmith-arrow     = { path = "../loadsmith-arrow" }
+arrow-schema        = { workspace = true }
 
 [dev-dependencies]
 arrow-array          = { workspace = true }
-arrow-schema         = { workspace = true }
 async-trait          = { workspace = true }
 loadsmith-plugin-sdk = { path = "../loadsmith-plugin-sdk" }
 

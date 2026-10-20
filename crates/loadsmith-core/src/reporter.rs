@@ -36,16 +36,19 @@ impl Reporter {
         println!();
     }
 
-    /// Reports the schema right after the source negotiates it — one line per
-    /// field, plus a summary line. Emitted through `tracing` (not stdout),
-    /// same as `progress`, so each line carries the same timestamp and
-    /// formatting as the rest of the run log and lines up with it.
-    pub fn schema(&self, schema: &loadsmith_protocol::Schema) {
-        let count = schema.fields.len();
+    /// Reports the source's schema (from its Arrow stream header) — one line
+    /// per field with its exact type (`timestamp(us, UTC)`,
+    /// `decimal128(12, 2)`, `list<utf8?>`, a nullable child marked `?`) and
+    /// `not null` on a non-nullable column, plus a summary line. Emitted
+    /// through `tracing` (not stdout), same as `progress`, so each line carries
+    /// the same timestamp and formatting as the rest of the run log.
+    pub fn schema(&self, fields: &[loadsmith_protocol::Field]) {
+        let count = fields.len();
         let unit = if count == 1 { "column" } else { "columns" };
         tracing::info!("schema negotiated — {count} {unit}");
-        for field in &schema.fields {
-            tracing::info!("{}: {}", field.name, field.field_type);
+        for field in fields {
+            let null = if field.nullable { "" } else { " not null" };
+            tracing::info!("{}: {}{null}", field.name, field.field_type);
         }
     }
 

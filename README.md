@@ -181,7 +181,7 @@ postgres → jsonl
 … INFO loadsmith_core::reporter: id: utf8
 … INFO loadsmith_core::reporter: spacecraft_id: utf8
 … INFO loadsmith_core::reporter: event_sequence: int64
-… INFO loadsmith_core::reporter: event_timestamp: timestamp_ms
+… INFO loadsmith_core::reporter: event_timestamp: timestamp(ms)
 …
 … INFO loadsmith_core::reporter: 2,000 rows · 1 batch
 … INFO loadsmith_core::reporter: 4,000 rows · 2 batches

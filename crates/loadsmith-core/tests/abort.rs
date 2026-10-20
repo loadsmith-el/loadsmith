@@ -37,6 +37,9 @@ fn main() {
         ("ignored_resend_times_out", ignored_resend_times_out),
         ("unknown_message_types_are_ignored", unknown_message_types_are_ignored),
         ("state_lock_released_after_a_crash", state_lock_released_after_a_crash),
+        ("schema_drift_is_detected_from_the_arrow_stream", schema_drift_is_detected_from_the_arrow_stream),
+        ("v1_state_file_is_migrated", v1_state_file_is_migrated),
+        ("source_without_a_stream_header_fails_setup", source_without_a_stream_header_fails_setup),
     ];
     let filter: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
     let mut failed = Vec::new();
@@ -437,4 +440,89 @@ fn state_lock_released_after_a_crash() {
     assert!(!lock_path(&state).exists(), "the state lock was not released");
     // Nothing was durably committed, so no watermark may have been persisted.
     assert!(!state.exists(), "a watermark was persisted for an aborted load");
+}
+
+fn state_doc(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(path).expect("state file")).unwrap()
+}
+
+/// The fingerprint comes from the source's Arrow stream: a changed column
+/// type is refused on the next run, before the destination is started.
+fn schema_drift_is_detected_from_the_arrow_stream() {
+    let run = Run::new("drift");
+    let state = run.scratch.path("state.json");
+    let yaml = |wide: bool| {
+        pipeline_yaml(
+            "drift",
+            "fake",
+            run.src_config(json!({ "incremental": true, "wide": wide })),
+            run.dst_config(json!({})),
+            &timeouts(""),
+            &state_block(&state),
+        )
+    };
+    let summary = run.exec(&yaml(false)).expect("first run");
+    assert_eq!(summary.status, SummaryStatus::Success);
+    let doc = state_doc(&state);
+    assert_eq!(doc["version"], loadsmith_core::state::STATE_FORMAT_VERSION);
+    let recorded = doc["schema_hash"].clone();
+
+    // Same shape: accepted.
+    assert_eq!(run.exec(&yaml(false)).expect("same schema").status, SummaryStatus::Success);
+    assert_eq!(state_doc(&state)["schema_hash"], recorded);
+
+    // A new column: refused (exit 5 in the CLI), and nothing was loaded.
+    let finalized_before = run.journal("destination").iter().filter(|l| *l == "finalize").count();
+    match run.exec(&yaml(true)) {
+        Err(CoreError::State(msg)) => assert!(msg.contains("schema changed"), "{msg}"),
+        other => panic!("expected a drift refusal, got {other:?}"),
+    }
+    let finalized_after = run.journal("destination").iter().filter(|l| *l == "finalize").count();
+    assert_eq!(finalized_before, finalized_after, "a drifted run must not load anything");
+    assert!(!lock_path(&state).exists());
+}
+
+/// A state file written in format 1 (fingerprint of the lossy protocol
+/// labels) is honoured, not refused, and upgraded to the current format.
+fn v1_state_file_is_migrated() {
+    let run = Run::new("migrate");
+    let state = run.scratch.path("state.json");
+    std::fs::write(
+        &state,
+        r#"{"version":1,"pipeline":"migrate","cursor_value":5,"schema_hash":"a8e4fe49824728ac","run_id":"old","updated_at_unix_ms":1}"#,
+    )
+    .unwrap();
+    let yaml = pipeline_yaml(
+        "migrate",
+        "fake",
+        run.src_config(json!({ "incremental": true, "wide": true })),
+        run.dst_config(json!({})),
+        &timeouts(""),
+        &state_block(&state),
+    );
+    let summary = run.exec(&yaml).expect("an old fingerprint must not be refused");
+    assert_eq!(summary.status, SummaryStatus::Success);
+    let doc = state_doc(&state);
+    assert_eq!(doc["version"], loadsmith_core::state::STATE_FORMAT_VERSION);
+    assert_ne!(doc["schema_hash"], "a8e4fe49824728ac");
+    assert_eq!(doc["run_id"].as_str().map(|r| r != "old"), Some(true));
+}
+
+/// A source that declares a schema but never writes its stream fails the
+/// run during setup; the destination is never started.
+fn source_without_a_stream_header_fails_setup() {
+    let run = Run::new("noheader");
+    let yaml = pipeline_yaml(
+        "noheader",
+        "noheader",
+        json!({}),
+        run.dst_config(json!({})),
+        &timeouts(""),
+        "",
+    );
+    match run.exec(&yaml) {
+        Err(CoreError::PluginFailed(msg)) => assert!(msg.contains("source"), "{msg}"),
+        other => panic!("expected a source failure, got {other:?}"),
+    }
+    assert!(!has(&run.journal("destination"), "prepare"), "{:?}", run.journal("destination"));
 }

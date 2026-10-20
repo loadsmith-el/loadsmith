@@ -29,12 +29,24 @@ use loadsmith_config::{SchemaChangePolicy, StateConfig};
 ///   Rust releases, so it cannot be compared with a current fingerprint. Such a
 ///   document is accepted (its cursor is honoured) and is rewritten in the
 ///   current format on the next save.
-/// - `1`: adds `version`; `schema_hash` is the FNV-1a fingerprint of
-///   [`schema_fingerprint`].
+/// - `1`: adds `version`; `schema_hash` is FNV-1a over the field names and
+///   the lossy type labels of the protocol `schema` message (every timestamp
+///   was `timestamp_ms`, most other types `utf8`, no nullability).
+/// - `2`: `schema_hash` is FNV-1a over the exact Arrow schema of the source's
+///   IPC stream (see [`schema_fingerprint`]).
+///
+/// A document older than [`FINGERPRINT_SINCE`] is migrated like a legacy one:
+/// its cursor is honoured, the drift check is skipped once with a warning
+/// (its fingerprint cannot be compared), and the next save rewrites it.
 ///
 /// A document with a version **greater** than this one was written by a newer
 /// loadsmith and is refused rather than silently downgraded.
-pub const STATE_FORMAT_VERSION: u32 = 1;
+pub const STATE_FORMAT_VERSION: u32 = 2;
+
+/// The first state format whose `schema_hash` is comparable with
+/// [`schema_fingerprint`]. Bump it (with [`STATE_FORMAT_VERSION`]) whenever
+/// the fingerprint changes.
+pub const FINGERPRINT_SINCE: u32 = 2;
 
 /// The persisted state document for one pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +90,12 @@ impl StateDoc {
     pub fn is_legacy(&self) -> bool {
         self.version == 0
     }
+
+    /// True when `schema_hash` can be compared with [`schema_fingerprint`]
+    /// (format ≥ [`FINGERPRINT_SINCE`]).
+    pub fn fingerprint_is_comparable(&self) -> bool {
+        self.version >= FINGERPRINT_SINCE
+    }
 }
 
 /// Backend that persists [`StateDoc`]s and provides an exclusive lock per
@@ -104,41 +122,111 @@ pub fn open_backend(cfg: &StateConfig) -> Result<Box<dyn StateBackend>, CoreErro
     }
 }
 
-/// Fingerprint of a source schema (field names + types, in order), for drift
-/// detection. Persisted in the state file, so it must be **stable across Rust
-/// releases and platforms**: 64-bit FNV-1a over a length-prefixed encoding
-/// (`len(name) name len(type) type` per field, lengths as u64 little-endian;
-/// `type` is the protocol's wire name, e.g. `int64`). Not cryptographic — it
-/// only has to notice a changed shape. Changing this function changes every
-/// stored fingerprint: bump [`STATE_FORMAT_VERSION`] and migrate if you do.
-pub fn schema_fingerprint(schema: &loadsmith_protocol::Schema) -> String {
+/// Fingerprint of a source's Arrow schema, for drift detection.
+///
+/// It covers what a resume depends on: field order, names, nullability, and
+/// exact types including their parameters (timestamp unit and time zone,
+/// decimal precision and scale, list/struct/map children, dictionary index
+/// and value types). Field metadata is ignored, so a changed column comment
+/// is not drift.
+///
+/// The schema is first mapped to the protocol's type vocabulary (owned by
+/// Loadsmith, so an Arrow upgrade cannot change it) and then encoded as a
+/// sequence of length-prefixed tokens (`u64` little-endian length, then the
+/// UTF-8 bytes) hashed with 64-bit FNV-1a, printed as 16 hex digits:
+///
+/// - the schema: the field count, then each field;
+/// - a field: its name, `nullable` or `required`, then its type;
+/// - a type: its wire name (e.g. `timestamp`), then its parameters in a fixed
+///   order — numbers in decimal, units by their wire name, a time zone as
+///   `=<tz>` or `-` when absent, child counts in decimal, child fields and
+///   types recursively.
+///
+/// Persisted in the state file, so it must be **stable across Rust releases
+/// and platforms**. Not cryptographic — it only has to notice a changed
+/// shape. Changing this encoding changes every stored fingerprint: bump
+/// [`STATE_FORMAT_VERSION`] and [`FINGERPRINT_SINCE`] if you do.
+pub fn schema_fingerprint(schema: &arrow_schema::Schema) -> String {
+    let fields = loadsmith_arrow::protocol_fields_from_schema(schema);
     let mut h = Fnv1a64::new();
-    for f in &schema.fields {
-        h.write_prefixed(f.name.as_bytes());
-        h.write_prefixed(f.field_type.to_string().as_bytes());
+    h.write_prefixed(fields.len().to_string().as_bytes());
+    for f in &fields {
+        hash_field(&mut h, f);
     }
     format!("{:016x}", h.0)
 }
 
-/// Schema-drift guard, run once per run after the source reports its schema:
-/// if the source shape changed since `prior` was written, a blind resume could
-/// corrupt the load, so refuse (default) or warn per `policy`.
+fn hash_field(h: &mut Fnv1a64, f: &loadsmith_protocol::Field) {
+    h.write_prefixed(f.name.as_bytes());
+    h.write_prefixed(if f.nullable { b"nullable" } else { b"required" });
+    hash_type(h, &f.field_type);
+}
+
+fn hash_type(h: &mut Fnv1a64, t: &loadsmith_protocol::FieldType) {
+    use loadsmith_protocol::FieldType as T;
+    h.write_prefixed(t.type_name().as_bytes());
+    let num = |h: &mut Fnv1a64, n: i64| h.write_prefixed(n.to_string().as_bytes());
+    match t {
+        T::Decimal128 { precision, scale } | T::Decimal256 { precision, scale } => {
+            num(h, i64::from(*precision));
+            num(h, i64::from(*scale));
+        }
+        T::FixedSizeBinary { byte_width } => num(h, i64::from(*byte_width)),
+        T::Time32 { unit } | T::Time64 { unit } | T::Duration { unit } => {
+            h.write_prefixed(unit.as_str().as_bytes());
+        }
+        T::Timestamp { unit, timezone } => {
+            h.write_prefixed(unit.as_str().as_bytes());
+            match timezone {
+                Some(tz) => h.write_prefixed(format!("={tz}").as_bytes()),
+                None => h.write_prefixed(b"-"),
+            }
+        }
+        T::Interval { unit } => h.write_prefixed(unit.as_str().as_bytes()),
+        T::List { item } | T::LargeList { item } => hash_field(h, item),
+        T::FixedSizeList { item, size } => {
+            hash_field(h, item);
+            num(h, i64::from(*size));
+        }
+        T::Struct { fields } => {
+            num(h, fields.len() as i64);
+            for f in fields {
+                hash_field(h, f);
+            }
+        }
+        T::Map { key, value, keys_sorted } => {
+            hash_field(h, key);
+            hash_field(h, value);
+            h.write_prefixed(if *keys_sorted { b"sorted" } else { b"unsorted" });
+        }
+        T::Dictionary { index, value } => {
+            hash_type(h, index);
+            hash_type(h, value);
+        }
+        _ => {}
+    }
+}
+
+/// Schema-drift guard, run once per run after the source's stream header is
+/// read: if the source shape changed since `prior` was written, a blind
+/// resume could corrupt the load, so refuse (default) or warn per `policy`.
 ///
-/// A legacy document (see [`STATE_FORMAT_VERSION`]) carries a fingerprint from
-/// an unstable hasher that cannot be compared: it is accepted with a one-time
-/// notice, and the run's next save rewrites it with the current fingerprint
-/// and version.
+/// A document older than [`FINGERPRINT_SINCE`] (legacy or format 1) carries a
+/// fingerprint computed differently, which cannot be compared: it is accepted
+/// with a one-time warning, and the run's next save rewrites it with the
+/// current fingerprint and version.
 pub fn check_schema_drift(
     prior: &StateDoc,
     current_hash: &str,
     policy: SchemaChangePolicy,
 ) -> Result<(), CoreError> {
-    if prior.is_legacy() {
+    if !prior.fingerprint_is_comparable() {
+        let format = if prior.is_legacy() { "legacy".to_string() } else { format!("v{}", prior.version) };
         tracing::warn!(
             pipeline = %prior.pipeline,
-            "state file predates state format v{STATE_FORMAT_VERSION}: its schema fingerprint \
-             cannot be compared, so schema drift is not checked this run; the file is \
-             upgraded on the next save"
+            "state file is format {format}, older than v{FINGERPRINT_SINCE}: its schema fingerprint \
+             was computed differently and cannot be compared, so schema drift is not checked \
+             this run; the file is upgraded to v{STATE_FORMAT_VERSION} on the next save"
         );
         return Ok(());
     }
@@ -532,37 +620,73 @@ mod tests {
         assert_eq!(loaded.schema_hash, "abc");
     }
 
-    fn schema(fields: &[(&str, loadsmith_protocol::FieldType)]) -> loadsmith_protocol::Schema {
-        loadsmith_protocol::Schema {
-            fields: fields
-                .iter()
-                .map(|(n, t)| loadsmith_protocol::Field::new(*n, t.clone()))
-                .collect(),
-        }
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+
+    fn schema(fields: &[(&str, DataType, bool)]) -> Schema {
+        Schema::new(
+            fields.iter().map(|(n, t, nullable)| Field::new(*n, t.clone(), *nullable)).collect::<Vec<_>>(),
+        )
+    }
+
+    fn simple(fields: &[(&str, DataType)]) -> Schema {
+        schema(&fields.iter().map(|(n, t)| (*n, t.clone(), true)).collect::<Vec<_>>())
     }
 
     /// The fingerprint is persisted, so its value is part of the state format:
-    /// this golden value (computed independently) must never change without a
-    /// STATE_FORMAT_VERSION bump.
+    /// these golden values (computed independently, from the documented
+    /// token encoding) must never change without a STATE_FORMAT_VERSION bump.
     #[test]
     fn schema_fingerprint_is_pinned() {
-        use loadsmith_protocol::FieldType::*;
-        let s = schema(&[("id", Int64), ("nome", Utf8)]);
-        assert_eq!(schema_fingerprint(&s), "a8e4fe49824728ac");
+        let s = schema(&[("id", DataType::Int64, false), ("nome", DataType::Utf8, true)]);
+        assert_eq!(schema_fingerprint(&s), "4cd1b622e90bcb1b");
+        let s = schema(&[
+            ("ts", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
+            ("amount", DataType::Decimal128(12, 2), false),
+            ("tags", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), true),
+        ]);
+        assert_eq!(schema_fingerprint(&s), "bcda90d5848a8a39");
     }
 
     #[test]
     fn schema_fingerprint_detects_changes() {
-        use loadsmith_protocol::FieldType::*;
-        let base = schema_fingerprint(&schema(&[("id", Int64), ("nome", Utf8)]));
-        assert_ne!(base, schema_fingerprint(&schema(&[("id", Int32), ("nome", Utf8)])));
-        assert_ne!(base, schema_fingerprint(&schema(&[("nome", Utf8), ("id", Int64)])));
-        assert_ne!(base, schema_fingerprint(&schema(&[("id", Int64)])));
+        let base = schema_fingerprint(&simple(&[("id", DataType::Int64), ("nome", DataType::Utf8)]));
+        let changed = |s: Schema| assert_ne!(base, schema_fingerprint(&s), "{s:?}");
+        changed(simple(&[("id", DataType::Int32), ("nome", DataType::Utf8)]));
+        changed(simple(&[("nome", DataType::Utf8), ("id", DataType::Int64)]));
+        changed(simple(&[("id", DataType::Int64)]));
+        changed(simple(&[("id", DataType::Int64), ("nome", DataType::LargeUtf8)]));
+        // Nullability is part of the shape.
+        changed(schema(&[("id", DataType::Int64, false), ("nome", DataType::Utf8, true)]));
         // Length prefixes keep field boundaries unambiguous.
         assert_ne!(
-            schema_fingerprint(&schema(&[("ab", Utf8), ("c", Utf8)])),
-            schema_fingerprint(&schema(&[("a", Utf8), ("bc", Utf8)]))
+            schema_fingerprint(&simple(&[("ab", DataType::Utf8), ("c", DataType::Utf8)])),
+            schema_fingerprint(&simple(&[("a", DataType::Utf8), ("bc", DataType::Utf8)]))
         );
+        // Units, time zones, precision and children all count.
+        let fp = |t: DataType| schema_fingerprint(&simple(&[("c", t)]));
+        let all = [
+            fp(DataType::Timestamp(TimeUnit::Millisecond, None)),
+            fp(DataType::Timestamp(TimeUnit::Microsecond, None)),
+            fp(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))),
+            fp(DataType::Timestamp(TimeUnit::Microsecond, Some("".into()))),
+            fp(DataType::Decimal128(12, 2)),
+            fp(DataType::Decimal128(12, 3)),
+            fp(DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))),
+            fp(DataType::List(Arc::new(Field::new("item", DataType::Utf8, false)))),
+            fp(DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))),
+        ];
+        let unique: std::collections::BTreeSet<_> = all.iter().collect();
+        assert_eq!(unique.len(), all.len(), "{all:?}");
+    }
+
+    #[test]
+    fn schema_fingerprint_ignores_metadata() {
+        let plain = simple(&[("id", DataType::Int64)]);
+        let with_meta = Schema::new(vec![Field::new("id", DataType::Int64, true).with_metadata(
+            [("comment".to_string(), "primary key".to_string())].into(),
+        )])
+        .with_metadata([("origin".to_string(), "pg".to_string())].into());
+        assert_eq!(schema_fingerprint(&plain), schema_fingerprint(&with_meta));
     }
 
     #[test]
@@ -573,17 +697,45 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(raw["version"], STATE_FORMAT_VERSION);
-        assert!(!backend.load("p1").unwrap().unwrap().is_legacy());
+        let doc = backend.load("p1").unwrap().unwrap();
+        assert!(!doc.is_legacy());
+        assert!(doc.fingerprint_is_comparable());
     }
 
-    /// Migration: a state file written by loadsmith ≤ 0.2.0 has no `version`
-    /// and a DefaultHasher fingerprint. It must load, keep its cursor, pass the
-    /// drift check even under `refuse`, and be upgraded by the next save.
+    /// Migration: an older state file must load, keep its cursor, pass the
+    /// drift check even under `refuse` (its fingerprint is not comparable),
+    /// and be upgraded to the current format by the next save.
+    fn assert_migrates(tag: &str, raw: &str, expect_version: u32) {
+        let (_tmp, path) = tmp_state_path(tag);
+        fs::write(&path, raw).unwrap();
+        let backend = LocalFileBackend::new(&path);
+        let prior = backend.load("p1").unwrap().unwrap();
+        assert_eq!(prior.version, expect_version);
+        assert!(!prior.fingerprint_is_comparable());
+        assert_eq!(prior.cursor_value, "2026-06-09T10:00:00");
+
+        let current = schema_fingerprint(&simple(&[("id", DataType::Int64)]));
+        assert_ne!(prior.schema_hash, current);
+        check_schema_drift(&prior, &current, SchemaChangePolicy::Refuse)
+            .expect("an old fingerprint must not trigger a drift refusal");
+
+        // Next save (what the state supervisor does) rewrites it in the new format.
+        backend.store(&StateDoc::new("p1", serde_json::json!("2026-06-10"), &current, "r2")).unwrap();
+        let upgraded = backend.load("p1").unwrap().unwrap();
+        assert_eq!(upgraded.version, STATE_FORMAT_VERSION);
+        assert!(upgraded.fingerprint_is_comparable());
+        assert_eq!(upgraded.schema_hash, current);
+        check_schema_drift(&upgraded, &current, SchemaChangePolicy::Refuse).unwrap();
+        // And from now on drift is detected again.
+        assert!(check_schema_drift(&upgraded, "0000000000000000", SchemaChangePolicy::Refuse).is_err());
+    }
+
+    /// Format 0: written by loadsmith ≤ 0.2.0, no `version`, a DefaultHasher
+    /// fingerprint.
     #[test]
     fn legacy_doc_loads_and_is_upgraded_on_next_save() {
-        let (_tmp, path) = tmp_state_path("legacy");
-        fs::write(
-            &path,
+        assert_migrates(
+            "legacy",
             r#"{
   "pipeline": "p1",
   "cursor_value": "2026-06-09T10:00:00",
@@ -591,26 +743,27 @@ mod tests {
   "run_id": "4242-1760000000000",
   "updated_at_unix_ms": 1760000000000
 }"#,
-        )
-        .unwrap();
-        let backend = LocalFileBackend::new(&path);
-        let prior = backend.load("p1").unwrap().unwrap();
-        assert!(prior.is_legacy());
-        assert_eq!(prior.cursor_value, "2026-06-09T10:00:00");
-
-        let current = schema_fingerprint(&schema(&[("id", loadsmith_protocol::FieldType::Int64)]));
-        assert_ne!(prior.schema_hash, current);
-        check_schema_drift(&prior, &current, SchemaChangePolicy::Refuse)
-            .expect("a legacy fingerprint must not trigger a drift refusal");
-
-        // Next save (what the state supervisor does) rewrites it in the new format.
-        backend.store(&StateDoc::new("p1", serde_json::json!("2026-06-10"), &current, "r2")).unwrap();
-        let upgraded = backend.load("p1").unwrap().unwrap();
-        assert_eq!(upgraded.version, STATE_FORMAT_VERSION);
-        assert_eq!(upgraded.schema_hash, current);
-        check_schema_drift(&upgraded, &current, SchemaChangePolicy::Refuse).unwrap();
+            0,
+        );
     }
 
+    /// Format 1: FNV-1a over the lossy protocol labels (`a8e4fe49824728ac` is
+    /// what it recorded for `id: int64, nome: utf8`).
+    #[test]
+    fn v1_doc_loads_and_is_upgraded_on_next_save() {
+        assert_migrates(
+            "v1",
+            r#"{
+  "version": 1,
+  "pipeline": "p1",
+  "cursor_value": "2026-06-09T10:00:00",
+  "schema_hash": "a8e4fe49824728ac",
+  "run_id": "4242-1781078400000",
+  "updated_at_unix_ms": 1781078400000
+}"#,
+            1,
+        );
+    }
     #[test]
     fn drift_check_on_current_docs() {
         let doc = StateDoc::new("p1", serde_json::json!(1), "aaaa", "r");

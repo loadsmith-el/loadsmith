@@ -91,6 +91,22 @@ release notes in their repositories.
   still loads and its cursor is honoured. For that one run the schema-drift
   check is skipped (with a warning), because the old fingerprint cannot be
   compared. The file is then rewritten in the new format on the next save.
+- **The schema-drift fingerprint now comes from the source's Arrow IPC
+  stream**, not the `schema` message: names, order, nullability and exact
+  types with their parameters (timestamp unit and time zone, decimal
+  precision, list/struct/map children; metadata is ignored). The core reads
+  the stream header before it starts the destination (within
+  `timeouts.start_seconds`), so a drifted run is refused before anything is
+  loaded, and a source that declares a schema but never writes its stream
+  fails during setup. The state format is now **version 2**. **Migration is
+  automatic**: a legacy or version 1 state file loads, its cursor is honoured,
+  the drift check is skipped for that one run with a warning, and the file is
+  rewritten as version 2 on the next save. `loadsmith state show` says when a
+  file still has an old fingerprint.
+- The run log's schema lines show the exact Arrow types from the stream
+  (`created_at: timestamp(us, UTC)`, `amount: decimal128(12, 2) not null`,
+  `tags: list<utf8?>`) instead of the lossy labels. A source whose `schema`
+  message disagrees with its stream gets a warning.
 - A state file with a newer format version than the engine understands is
   refused instead of being silently downgraded.
 - Release builds pin `rust:1.99.0-alpine` instead of the floating

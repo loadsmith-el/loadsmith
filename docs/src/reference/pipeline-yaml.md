@@ -139,7 +139,7 @@ interprets it** — the source decides how to use it (the cursor column lives in
 |---|---|---|---|
 | `backend` | string | yes | State backend. Only `local` exists today (a state file on disk). |
 | `path` | string | yes | Location of the state file for this pipeline. A sibling `<path>.lock` guards against concurrent runs. |
-| `on_schema_change` | `refuse` / `continue` | no | What to do if the source schema differs from the recorded state. Default `refuse`. |
+| `on_schema_change` | `refuse` / `continue` | no | What to do if the source schema (the exact Arrow schema of its stream: names, order, types with their parameters, nullability) differs from the recorded state. Default `refuse`. |
 | `checkpoint_interval` | integer | no | Persist the safe watermark at most once per this many durably-committed batches. `0` (default) ⇒ persist only at the end of a successful run. |
 
 **Guarantee.** Loadsmith is **at-least-once**: on a crash the next run rereads

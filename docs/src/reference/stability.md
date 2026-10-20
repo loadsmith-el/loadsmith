@@ -26,7 +26,7 @@ SDK version (or language) it was built with.
 
 | Interface | What is frozen | Compatible evolution (minor) |
 |---|---|---|
-| **Wire protocol v1** | The fd layout (fd0 control core→plugin, fd1 control plugin→core, fd3 Arrow IPC data, fd4 events; stderr is free-form). JSONL framing. Every message's `type` and required fields. Handshake and version negotiation (`protocol_supported_versions` → `set_protocol_version`). Lifecycle ordering, including the commit point (the core ends the destination's fd3 only after the source succeeded). The [abort rules](../protocol/reference.md#abort-rules): `cancel`, `error` and its codes, the grace period, then kill. The [`resend` rule](../protocol/reference.md#malformed-lines-and-resend) for malformed control lines. The [tolerant-reader rule](../protocol/reference.md#compatibility-rule-tolerant-reader). | New optional fields. New message types a receiver may safely ignore. A change the receiver must understand needs **protocol v2**, negotiated in the handshake. Every 1.x engine keeps speaking v1. |
+| **Wire protocol v1** | The fd layout (fd0 control core→plugin, fd1 control plugin→core, fd3 Arrow IPC data, fd4 events; stderr is free-form). JSONL framing. Every message's `type` and required fields. The `schema` message's [field-type vocabulary](../protocol/messages.md#schema), its field-object shape, and the rule that the Arrow IPC header is the authoritative schema. Handshake and version negotiation (`protocol_supported_versions` → `set_protocol_version`). Lifecycle ordering, including the commit point (the core ends the destination's fd3 only after the source succeeded). The [abort rules](../protocol/reference.md#abort-rules): `cancel`, `error` and its codes, the grace period, then kill. The [`resend` rule](../protocol/reference.md#malformed-lines-and-resend) for malformed control lines. The [tolerant-reader rule](../protocol/reference.md#compatibility-rule-tolerant-reader). | New optional fields. New message types a receiver may safely ignore. New field types and type parameters (read as unknown by an older receiver). A change the receiver must understand needs **protocol v2**, negotiated in the handshake. Every 1.x engine keeps speaking v1. |
 | **CLI** | Commands and subcommands, flags and their defaults and meaning, the [exit-code table](cli.md#exit-codes) (`0`–`5`, `130`, `143`), graceful cancel on SIGINT/SIGTERM, and the split of the human report on stdout from diagnostics on stderr. | New commands and new flags. A new exit code only for a case that exits `1` today. |
 | **`pipeline.yaml` schema** | Every core-owned key, its type, default and meaning (including `pipeline.timeouts`). Unknown core-owned keys are rejected. The template syntax `{{ env('VAR') }}` / `{{ file('/path') }}`. | New optional keys and new template functions. The contents of each plugin's `config:` block belong to that plugin and are versioned by it. |
 | **Incremental state file** | The [state file format](../architecture/incremental-state.md#state-file-format), versioned by its `version` field, and the lock file's lease semantics. | A new engine reads every older format and upgrades it on its next save. An engine refuses a format newer than it understands rather than downgrading it. |
@@ -98,6 +98,27 @@ These were open and are now settled. 1.0 freezes them as described.
 5. **Timeouts.** Every wait of the core on a plugin has a default limit, and a
    data-plane stall timeout is available as an opt-in, in
    [`pipeline.timeouts`](pipeline-yaml.md#pipelinetimeouts).
+6. **Arrow field types: a complete vocabulary now, tolerant reading, no
+   negotiation.** The `schema` message carries every common Arrow type with
+   its parameters (unit, time zone, precision and scale, children) and
+   per-field `nullable`, in a flat field object (`{"name", "type",
+   params…, "nullable"}`); see the
+   [vocabulary](../protocol/messages.md#schema). New types and parameters are
+   added in minor releases. They need no negotiation, because the `schema`
+   message is informational: the Arrow IPC stream header is the authoritative
+   schema, and a receiver reads an unknown type (or a known type with invalid
+   parameters) as *unknown* and carries on. So a plugin that emits a type newer
+   than the engine still runs; the engine just labels that column unknown.
+   Older plugins' type strings, including `timestamp_ms`, stay valid
+   throughout 1.x.
+7. **Schema drift is checked against the Arrow stream.** The incremental-state
+   fingerprint is computed from the exact Arrow schema the source writes on
+   fd3 (names, order, types with their parameters, nullability; not metadata),
+   read before the destination starts, with a documented, Arrow-independent
+   encoding. This changed the fingerprint, so the state format is now
+   **version 2**; legacy and version 1 files are migrated (the drift check is
+   skipped once, with a warning, and the file is rewritten on the next save).
+   See the [state file format](../architecture/incremental-state.md#state-file-format).
 
 ## Open decisions before 1.0
 
@@ -108,11 +129,8 @@ These are still open, and each one changes what 1.0 freezes:
    a file) would close that gap. Add it before 1.0 or as a 1.x minor?
 2. **Experimental kinds.** Wire `config-provider` (and `parser`) into the core
    before 1.0, or ship 1.0 without them and add them in a 1.x minor?
-3. **Arrow field types.** A plugin that emits a field type added in 1.y needs a
-   1.y engine. Is "minor, with a minimum engine version" acceptable, or should
-   new field types be negotiated?
-4. **Remote state backends.** The `s3` state backend will need its own format
+3. **Remote state backends.** The `s3` state backend will need its own format
    and lock semantics. Should they fall under the same state-format version?
-5. **Publishing the SDK crates** to crates.io (they are consumed by git
+4. **Publishing the SDK crates** to crates.io (they are consumed by git
    revision today), and whether `loadsmith-plugin-manifest` should also be
    `publish = false`.

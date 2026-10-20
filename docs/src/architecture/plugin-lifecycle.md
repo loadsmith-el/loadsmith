@@ -130,9 +130,11 @@ declared its schema.
 `"resume": {"cursor_value": ...}`, which the SDK hands to the plugin's
 `resume_from()`. The plugin sends `Schema` on the control channel (declaring the
 schema of the data it will emit), then begins writing Arrow IPC batches to fd3.
-The core uses the `Schema` message to report the schema and to fingerprint it for
-incremental-state drift checks; it is not forwarded to the destination, which
-reads the exact Arrow schema from the IPC stream header on its fd3. During the
+The `Schema` message is informational. The core then reads the header of the
+source's IPC stream (the exact Arrow schema), logs that schema, and
+fingerprints it for incremental-state drift checks, all before the destination
+gets `start`. Neither is forwarded to the destination, which reads the same
+Arrow schema from the IPC stream header on its own fd3. During the
 run the SDK also emits `checkpoint` events on fd4, and the destination emits
 `committed` — see [Incremental State](./incremental-state.md).
 

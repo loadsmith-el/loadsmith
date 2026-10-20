@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use arrow_array::{Int64Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use async_trait::async_trait;
 use loadsmith_plugin_sdk::{DestinationPlugin, SourcePlugin};
 use loadsmith_protocol::{
@@ -30,7 +30,7 @@ use loadsmith_protocol::{
 };
 
 /// Raw (non-SDK) source scenarios.
-pub const RAW_SOURCES: &[&str] = &["garbled1", "garbled2", "noresend", "chatty", "deaf"];
+pub const RAW_SOURCES: &[&str] = &["garbled1", "garbled2", "noresend", "chatty", "deaf", "noheader"];
 
 /// Creates a plugin directory under `dir` with every fake plugin linked to the
 /// current executable, and returns it.
@@ -89,6 +89,20 @@ fn batch(seq: u64, rows: u64) -> RecordBatch {
     RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(ids))]).unwrap()
 }
 
+/// The `wide` variant: `id` plus a microsecond UTC timestamp column.
+fn wide_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("seen_at", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
+    ]))
+}
+
+fn wide_batch(seq: u64, rows: u64) -> RecordBatch {
+    let ids: Vec<i64> = (0..rows).map(|i| (seq * 1000 + i) as i64).collect();
+    let ts = TimestampMicrosecondArray::from(ids.clone()).with_timezone("UTC");
+    RecordBatch::try_new(wide_schema(), vec![Arc::new(Int64Array::from(ids)), Arc::new(ts)]).unwrap()
+}
+
 fn opt_u64(config: &serde_json::Value, key: &str) -> Option<u64> {
     config.get(key).and_then(|v| v.as_u64())
 }
@@ -99,12 +113,19 @@ fn opt_u64(config: &serde_json::Value, key: &str) -> Option<u64> {
 /// before each batch, and at most one fault, applied when batch N+1 is asked
 /// for: `crash_after` (exit 42), `fail_after` (`next_batch` errors),
 /// `hang_after` (never returns). `incremental: true` advertises
-/// `incremental_state` and reports a watermark.
+/// `incremental_state` and reports a watermark. `wide: true` adds a
+/// `seen_at` timestamp column (a schema change).
 #[derive(Default)]
 pub struct FakeSource {
     config: serde_json::Value,
     journal: Option<PathBuf>,
     produced: u64,
+}
+
+impl FakeSource {
+    fn wide(&self) -> bool {
+        self.config.get("wide").and_then(|v| v.as_bool()) == Some(true)
+    }
 }
 
 #[async_trait]
@@ -126,7 +147,7 @@ impl SourcePlugin for FakeSource {
     }
     async fn schema(&mut self) -> Result<Schema> {
         note(&self.journal, "start");
-        Ok(schema().as_ref().clone())
+        Ok(if self.wide() { wide_schema() } else { schema() }.as_ref().clone())
     }
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         let n = self.produced;
@@ -150,7 +171,8 @@ impl SourcePlugin for FakeSource {
         }
         self.produced += 1;
         note(&self.journal, &format!("batch {}", self.produced));
-        Ok(Some(batch(self.produced, opt_u64(&self.config, "rows").unwrap_or(10))))
+        let rows = opt_u64(&self.config, "rows").unwrap_or(10);
+        Ok(Some(if self.wide() { wide_batch(self.produced, rows) } else { batch(self.produced, rows) }))
     }
     fn current_watermark(&self) -> Option<serde_json::Value> {
         (self.config.get("incremental").and_then(|v| v.as_bool()) == Some(true))
@@ -268,7 +290,8 @@ impl Raw {
 /// - `noresend`: one malformed line, then ignores `resend` (so the core's
 ///   handshake timeout must fire);
 /// - `chatty`: an unknown message type before every reply and mid-stream;
-/// - `deaf`: one batch, then hangs forever and ignores `cancel`.
+/// - `deaf`: one batch, then hangs forever and ignores `cancel`;
+/// - `noheader`: sends `schema`, then exits without writing its stream.
 fn raw_source(scenario: &str) -> ! {
     let mut raw = Raw { lines: std::io::stdin().lock().lines(), last: None };
     let chatty = scenario == "chatty";
@@ -327,6 +350,9 @@ fn raw_source(scenario: &str) -> ! {
             .with_nullable(false)],
     }));
 
+    if scenario == "noheader" {
+        std::process::exit(3);
+    }
     let fd3 = unsafe { std::fs::File::from_raw_fd(3) };
     let mut writer = loadsmith_arrow::IpcWriter::new(fd3, schema().as_ref()).unwrap();
     writer.write_batch(&batch(1, 10)).unwrap();
