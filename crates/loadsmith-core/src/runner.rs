@@ -691,7 +691,8 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
 
 /// The capability gates of the parser stage: a `parser:` needs a raw source
 /// (`object_output`) and a parser advertising `parse`; a raw source needs a
-/// `parser:`. Failing one is a configuration error.
+/// `parser:`. A mismatched pair is a configuration error (exit 3); a parser
+/// without `parse` is an incompatible plugin (exit 4).
 fn check_parser_gates(
     config: &PipelineConfig,
     src: &PluginHandshake,
@@ -708,12 +709,15 @@ fn check_parser_gates(
                     p.plugin_type, config.source.plugin_type
                 ));
             }
+            // Like a provider without `resolve`: the plugin itself cannot do
+            // the job (exit 4), whatever the pipeline says.
             if !info.supports.iter().any(|c| c == capabilities::PARSE) {
-                return gate(format!(
-                    "parser '{}' does not parse files (missing '{}' capability)",
+                return Err(Failure::new(CoreError::PluginIncompatible(format!(
+                    "parser '{}' ({}) does not parse files (missing '{}' capability)",
                     p.plugin_type,
+                    info.name,
                     capabilities::PARSE
-                ));
+                ))));
             }
         }
         _ if raw_source => {

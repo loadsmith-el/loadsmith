@@ -33,6 +33,7 @@ fn main() {
         ("parser_needs_a_raw_source", parser_needs_a_raw_source),
         ("raw_source_needs_a_parser", raw_source_needs_a_parser),
         ("missing_parser_binary_is_plugin_not_found", missing_parser_binary_is_plugin_not_found),
+        ("parser_without_parse_is_incompatible", parser_without_parse_is_incompatible),
         ("signal_during_parse_cancels_everything", signal_during_parse_cancels_everything),
         ("download_scratch_is_removed_after_success", download_scratch_is_removed_after_success),
         ("download_scratch_is_kept_after_a_failure", download_scratch_is_kept_after_a_failure),
@@ -410,4 +411,15 @@ fn raw_source_finishing_at_once_is_kept() {
     let summary = run.exec(&yaml).expect("run");
     assert_eq!(summary.status, SummaryStatus::Success, "{:?}", summary.root_cause);
     assert_eq!(summary.rows_written, 3);
+}
+
+fn parser_without_parse_is_incompatible() {
+    let run = Run::new("p-noparse");
+    let yaml = run
+        .yaml("files", json!({ "files": [] }), Some(json!({})), "")
+        .replace("parser:\n  type: fake", "parser:\n  type: noparse");
+    match run.exec(&yaml) {
+        Err(CoreError::PluginIncompatible(msg)) => assert!(msg.contains("'parse' capability"), "{msg}"),
+        other => panic!("expected an incompatible plugin, got {other:?}"),
+    }
 }

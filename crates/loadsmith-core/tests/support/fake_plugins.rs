@@ -53,6 +53,7 @@ pub fn install(dir: &Path) -> PathBuf {
         "loadsmith-source-files".to_string(),
         "loadsmith-parser-fake".to_string(),
         "loadsmith-parser-eager".to_string(),
+        "loadsmith-parser-noparse".to_string(),
     ];
     names.extend(RAW_SOURCES.iter().map(|s| format!("loadsmith-source-{s}")));
     for name in names {
@@ -78,6 +79,9 @@ pub fn run_as_plugin_if_invoked() {
         "source-files" => rt().block_on(loadsmith_plugin_sdk::run_object_source(FakeFiles::default())),
         "parser-fake" => rt().block_on(loadsmith_plugin_sdk::run_parser(FakeParser::default())),
         "parser-eager" => eager_parser(),
+        "parser-noparse" => {
+            rt().block_on(loadsmith_plugin_sdk::run_parser(FakeParser { no_parse: true, ..Default::default() }))
+        }
         other => match other.strip_prefix("source-") {
             Some(scenario) if RAW_SOURCES.contains(&scenario) => raw_source(scenario),
             _ => {}
@@ -443,6 +447,8 @@ pub struct FakeParser {
     journal: Option<PathBuf>,
     header: Vec<String>,
     rows: std::collections::VecDeque<Vec<i64>>,
+    /// `parser-noparse`: advertises no `parse` capability.
+    no_parse: bool,
 }
 
 fn int_schema(names: &[String]) -> Schema {
@@ -456,6 +462,9 @@ impl ParserPlugin for FakeParser {
     }
     fn plugin_version(&self) -> &str {
         "0.0.0"
+    }
+    fn capabilities(&self) -> Vec<String> {
+        if self.no_parse { vec![] } else { vec!["parse".into()] }
     }
     async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
         self.journal = config.get("journal").and_then(|v| v.as_str()).map(PathBuf::from);
