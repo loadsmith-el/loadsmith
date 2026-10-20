@@ -14,6 +14,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -205,18 +206,31 @@ const LEASE_TTL: Duration = Duration::from_secs(60);
 /// [`LEASE_TTL`] so a healthy run never has its lock stolen.
 pub const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(20);
 
-/// On-disk lock file. The lease is purely time-based: `holder` is diagnostic
-/// only (no liveness probing), and `renewed_at_unix_ms` is what decides
-/// staleness.
+/// On-disk lock file. The lease is purely time-based: `renewed_at_unix_ms` is
+/// what decides staleness (no liveness probing). `holder` is a token unique to
+/// one acquisition, used to tell "still mine" from "stolen by another run" —
+/// a holder never renews or deletes a lock whose token is not its own.
 #[derive(Debug, Serialize, Deserialize)]
 struct LockFile {
     holder: String,
     renewed_at_unix_ms: u64,
 }
 
-/// A diagnostic holder identifier (the pid as a string). Used only in messages.
+/// A holder token unique to this acquisition: pid (diagnostic — every
+/// container's entrypoint is pid 1, so the pid alone is not unique) + clock +
+/// a per-process counter.
 fn holder_id() -> String {
-    std::process::id().to_string()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos =
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    format!("{}-{nanos:x}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The holder recorded in the lock file right now, if it is readable.
+fn current_holder(lock_path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(lock_path).ok()?;
+    serde_json::from_str::<LockFile>(&raw).ok().map(|lf| lf.holder)
 }
 
 /// Atomically (temp + rename) writes a fresh lease to `lock_path`.
@@ -234,32 +248,121 @@ fn write_lease(lock_path: &Path, holder: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// Held for the duration of a run; releasing it (drop) removes the lock file.
-/// While held, the run renews the lease periodically (see
-/// [`LockGuard::renew`]).
-pub struct LockGuard {
+/// The lease as seen by its holder. Shared (behind a mutex) between the
+/// [`LockGuard`] and its background renewal task, so a renewal can never run
+/// concurrently with — or after — the release.
+struct Lease {
     lock_path: PathBuf,
     holder: String,
+    released: bool,
+    /// Set once a renewal found another holder's token: stop renewing.
+    lost: bool,
 }
 
-impl LockGuard {
-    /// Refreshes the lease timestamp. Called on a wall-clock interval by the
-    /// state supervisor so a live (even quiet) run keeps its lock. Errors are
-    /// non-fatal — a single missed renewal is well within `LEASE_TTL`.
-    pub fn renew(&self) {
-        if let Err(e) = write_lease(&self.lock_path, &self.holder) {
-            tracing::warn!(path = %self.lock_path.display(), "could not renew state lock lease: {e}");
+impl Lease {
+    fn renew(&mut self) {
+        if self.released || self.lost {
+            return;
+        }
+        match current_holder(&self.lock_path) {
+            Some(h) if h == self.holder => {
+                if let Err(e) = write_lease(&self.lock_path, &self.holder) {
+                    tracing::warn!(path = %self.lock_path.display(), "could not renew state lock lease: {e}");
+                }
+            }
+            other => {
+                // Stolen (our lease expired and another run took it) or removed.
+                // Never overwrite it: the other run owns the state now.
+                self.lost = true;
+                tracing::error!(
+                    path = %self.lock_path.display(),
+                    now_held_by = other.as_deref().unwrap_or("nobody"),
+                    "state lock lease was lost to another run; no longer renewing it"
+                );
+            }
+        }
+    }
+
+    fn release(&mut self) {
+        self.released = true;
+        match current_holder(&self.lock_path) {
+            Some(h) if h == self.holder => {
+                if let Err(e) = fs::remove_file(&self.lock_path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(path = %self.lock_path.display(), "could not remove state lock: {e}");
+                    }
+                }
+            }
+            Some(other) => tracing::warn!(
+                path = %self.lock_path.display(),
+                now_held_by = %other,
+                "state lock is held by another run; leaving it in place"
+            ),
+            None => {} // already gone (or unreadable — leave it for its owner)
         }
     }
 }
 
+/// Held for the duration of a run; releasing it (drop) removes the lock file —
+/// but only if it is still ours (a lock stolen after our lease expired belongs
+/// to the run that stole it). While held, the lease must be renewed: call
+/// [`LockGuard::start_renewal`] right after acquiring.
+pub struct LockGuard {
+    lease: Arc<Mutex<Lease>>,
+    renewal: Option<tokio::task::AbortHandle>,
+}
+
+impl LockGuard {
+    fn new(lock_path: PathBuf, holder: String) -> Self {
+        let lease = Lease { lock_path, holder, released: false, lost: false };
+        Self { lease: Arc::new(Mutex::new(lease)), renewal: None }
+    }
+
+    /// Refreshes the lease timestamp, unless the lock now belongs to another
+    /// run. Errors are non-fatal — a single missed renewal is well within
+    /// `LEASE_TTL`.
+    pub fn renew(&self) {
+        lock_lease(&self.lease).renew();
+    }
+
+    /// Renews the lease every [`LEASE_RENEW_INTERVAL`] on the current tokio
+    /// runtime until the guard is dropped. Start it as soon as the lock is
+    /// acquired: anything slow before the data flows (spawning plugins, a long
+    /// first query) must not let the lease expire.
+    pub fn start_renewal(&mut self) {
+        self.start_renewal_every(LEASE_RENEW_INTERVAL);
+    }
+
+    fn start_renewal_every(&mut self, every: Duration) {
+        if let Some(old) = self.renewal.take() {
+            old.abort();
+        }
+        let lease = Arc::clone(&self.lease);
+        let task = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.tick().await; // the first tick is immediate; the lease is fresh
+            loop {
+                tick.tick().await;
+                lock_lease(&lease).renew();
+            }
+        });
+        self.renewal = Some(task.abort_handle());
+    }
+}
+
+/// Locks the lease, recovering from a poisoned mutex (the data is plain flags).
+fn lock_lease(lease: &Mutex<Lease>) -> std::sync::MutexGuard<'_, Lease> {
+    lease.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        if let Err(e) = fs::remove_file(&self.lock_path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %self.lock_path.display(), "could not remove state lock: {e}");
-            }
+        if let Some(task) = self.renewal.take() {
+            task.abort();
         }
+        // Under the mutex: a renewal in flight finishes first, and any later
+        // one sees `released` and does nothing.
+        lock_lease(&self.lease).release();
     }
 }
 
@@ -309,7 +412,7 @@ impl StateBackend for LocalFileBackend {
             Ok(mut f) => {
                 let lf = LockFile { holder: holder.clone(), renewed_at_unix_ms: now_unix_ms() };
                 let _ = f.write_all(serde_json::to_string(&lf).unwrap_or_default().as_bytes());
-                return Ok(LockGuard { lock_path, holder });
+                return Ok(LockGuard::new(lock_path, holder));
             }
             Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
                 return Err(CoreError::State(format!("acquire state lock: {e}")));
@@ -339,7 +442,7 @@ impl StateBackend for LocalFileBackend {
             "stealing expired state lock lease"
         );
         write_lease(&lock_path, &holder)?;
-        Ok(LockGuard { lock_path, holder })
+        Ok(LockGuard::new(lock_path, holder))
     }
 
     fn load(&self, key: &str) -> Result<Option<StateDoc>, CoreError> {
@@ -577,10 +680,86 @@ mod tests {
         let backend = LocalFileBackend::new(&path);
 
         let guard = backend.lock("p1").unwrap();
-        // Backdate the lease past TTL, then renew: a second acquire must still fail.
-        let stale = LockFile { holder: "x".into(), renewed_at_unix_ms: 1 };
-        fs::write(backend.lock_path(), serde_json::to_string(&stale).unwrap()).unwrap();
+        // Backdate our own lease past TTL, then renew: a second acquire must still fail.
+        backdate(&backend.lock_path(), &holder_of(&guard));
         guard.renew();
         assert!(backend.lock("p1").is_err());
+    }
+
+    fn holder_of(guard: &LockGuard) -> String {
+        lock_lease(&guard.lease).holder.clone()
+    }
+
+    fn backdate(lock_path: &Path, holder: &str) {
+        let stale = LockFile { holder: holder.into(), renewed_at_unix_ms: 1 };
+        fs::write(lock_path, serde_json::to_string(&stale).unwrap()).unwrap();
+    }
+
+    fn lock_file(lock_path: &Path) -> LockFile {
+        serde_json::from_str(&fs::read_to_string(lock_path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn holder_tokens_are_unique_per_acquisition() {
+        assert_ne!(holder_id(), holder_id());
+    }
+
+    /// Regression: dropping a guard whose lease had expired and been stolen
+    /// deleted the *new* holder's lock, letting a third run in concurrently.
+    #[test]
+    fn drop_leaves_a_stolen_lock_alone() {
+        let (_tmp, path) = tmp_state_path("lock-stolen-drop");
+        let backend = LocalFileBackend::new(&path);
+        let guard = backend.lock("p1").unwrap();
+        // Our lease expired; another run stole it.
+        backdate(&backend.lock_path(), &holder_of(&guard));
+        let thief = backend.lock("p1").unwrap();
+        let thief_holder = holder_of(&thief);
+
+        drop(guard);
+        assert_eq!(lock_file(&backend.lock_path()).holder, thief_holder);
+        assert!(backend.lock("p1").is_err(), "the thief still holds the lock");
+        drop(thief);
+        assert!(!backend.lock_path().exists());
+    }
+
+    #[test]
+    fn renew_does_not_overwrite_a_stolen_lock() {
+        let (_tmp, path) = tmp_state_path("lock-stolen-renew");
+        let backend = LocalFileBackend::new(&path);
+        let guard = backend.lock("p1").unwrap();
+        backdate(&backend.lock_path(), &holder_of(&guard));
+        let thief = backend.lock("p1").unwrap();
+
+        guard.renew();
+        assert_eq!(lock_file(&backend.lock_path()).holder, holder_of(&thief));
+        drop(thief);
+        // Lost for good: a later renew must not resurrect the lock either.
+        guard.renew();
+        assert!(!backend.lock_path().exists());
+    }
+
+    /// Regression: renewal used to start only when the state supervisor was
+    /// spawned (after the source's first query returned), so a slow start let
+    /// the 60s lease expire. Now it runs from acquisition.
+    #[tokio::test]
+    async fn renewal_runs_from_acquisition() {
+        let (_tmp, path) = tmp_state_path("lock-autorenew");
+        let backend = LocalFileBackend::new(&path);
+        let mut guard = backend.lock("p1").unwrap();
+        guard.start_renewal_every(Duration::from_millis(10));
+        backdate(&backend.lock_path(), &holder_of(&guard));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while lock_file(&backend.lock_path()).renewed_at_unix_ms == 1 {
+            assert!(std::time::Instant::now() < deadline, "lease was never renewed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(backend.lock("p1").is_err());
+
+        drop(guard);
+        // Released, and the aborted renewal task does not recreate it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!backend.lock_path().exists());
     }
 }

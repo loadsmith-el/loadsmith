@@ -51,11 +51,9 @@ pub async fn run_state_supervisor(
     let mut ckpt_open = true;
     let mut commit_open = true;
 
-    // Renew the lock lease on a wall clock so a live run — even a quiet one
-    // (e.g. a long query producing no batches) — never has its lock stolen.
-    let mut renew = tokio::time::interval(crate::state::LEASE_RENEW_INTERVAL);
-    renew.tick().await; // discard the immediate first tick
-
+    // The lease is renewed by the guard's own background task, started at
+    // acquisition (`LockGuard::start_renewal`) — not here, so it also covers
+    // the time before this supervisor exists (spawn, handshake, first query).
     while ckpt_open || commit_open {
         tokio::select! {
             ckpt = checkpoint_rx.recv(), if ckpt_open => match ckpt {
@@ -66,7 +64,6 @@ pub async fn run_state_supervisor(
                 Some(seq) => { durable_through = durable_through.max(seq); }
                 None => commit_open = false,
             },
-            _ = renew.tick() => guard.renew(),
         }
 
         // Throttled, durability-gated persist. interval 0 ⇒ defer to final flush.

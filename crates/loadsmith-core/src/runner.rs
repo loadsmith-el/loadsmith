@@ -75,7 +75,11 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     let (mut state_backend, mut state_guard, prior_state) = match &config.state {
         Some(cfg) => {
             let backend = open_backend(cfg)?;
-            let guard = backend.lock(&config.pipeline.name)?;
+            let mut guard = backend.lock(&config.pipeline.name)?;
+            // Renew from the moment of acquisition: plugin spawn, handshake and
+            // a slow first query all happen before the state supervisor exists,
+            // and must not let the lease expire.
+            guard.start_renewal();
             let prior = backend.load(&config.pipeline.name)?;
             (Some(backend), Some(guard), prior)
         }

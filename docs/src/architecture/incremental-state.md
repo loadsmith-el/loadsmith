@@ -114,10 +114,16 @@ wasted work, never a duplicate.
 State lives behind a `StateBackend` trait. The shipped backend is **local**: a
 JSON state file written atomically (temp file + `rename`), with a sibling
 `<path>.lock` created via `O_EXCL` that holds a time-based lease, renewed every
-20s by the running pipeline. A second run fails fast while the lease is fresh (so
+20s by the running pipeline from the moment it acquires the lock (so plugin
+start-up and a slow first query are covered). A second run fails fast while the
+lease is fresh (so
 two concurrent runs of one pipeline can't corrupt the watermark); a lease not
 renewed for 60s (a crashed run) is stolen with a warning. There is no
-process-liveness check — after a crash, the next run is refused for up to 60s. A
+process-liveness check — after a crash, the next run is refused for up to 60s.
+Each acquisition writes a unique holder token into the lock file, and a run
+only renews or removes a lock that still carries its own token: a run whose
+lease expired and was stolen logs an error and leaves the new holder's lock
+alone. A
 remote
 `s3` backend (conditional PUT for a distributed lock) slots in behind the same
 trait later.
