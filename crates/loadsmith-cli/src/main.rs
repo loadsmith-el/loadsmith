@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use loadsmith_config::{parse_pipeline_yaml, MaskList};
+use loadsmith_config::MaskList;
 use loadsmith_core::{discovery, run_pipeline, LoadOpts, Mode, RunOpts};
 
 mod download;
@@ -34,7 +34,7 @@ struct Cli {
 enum Commands {
     /// Run a pipeline from a YAML config file
     Run(RunArgs),
-    /// Validate a pipeline config without running it
+    /// Validate a pipeline config without running it (static; --resolve for full resolution)
     Validate(ValidateArgs),
     /// Manage installed plugins
     Plugin(PluginCmd),
@@ -47,10 +47,10 @@ struct RunArgs {
     /// Path to the pipeline YAML file
     pipeline: PathBuf,
 
-    #[arg(long, help = "Validate and print config, but do not execute")]
+    #[arg(long, help = "Resolve and validate the config (providers included), but start no data plugin")]
     dry_run: bool,
 
-    #[arg(long, help = "Print resolved config (secrets masked) and exit")]
+    #[arg(long, help = "Resolve the config (providers included), print it with every resolved value masked, and exit")]
     print_resolved_config: bool,
 
     #[arg(long, help = "Override plugin directory (default: ~/.loadsmith/plugins)")]
@@ -81,7 +81,13 @@ struct ValidateArgs {
     /// Path to the pipeline YAML file
     pipeline: PathBuf,
 
-    #[arg(long, help = "Override plugin directory")]
+    /// Also resolve every template: read env()/file() values and run the
+    /// provider instances the secret() calls reference (the default check
+    /// is static and evaluates nothing)
+    #[arg(long)]
+    resolve: bool,
+
+    #[arg(long, help = "Override plugin directory (where --resolve finds provider binaries)")]
     plugin_dir: Option<PathBuf>,
 }
 
@@ -201,26 +207,18 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Reads the pipeline file; an unreadable file is a config error (exit 3).
-fn read_pipeline(path: &std::path::Path) -> Result<String> {
-    std::fs::read_to_string(path).map_err(|e| {
-        anyhow::Error::new(loadsmith_config::ConfigError::Io(e))
-            .context(format!("cannot read {}", path.display()))
-    })
-}
-
 async fn run(cli: Cli, color: bool, mask: MaskList) -> Result<()> {
     match cli.command {
         Commands::Run(args) => cmd_run(args, color, mask).await,
-        Commands::Validate(args) => cmd_validate(args),
+        Commands::Validate(args) => cmd_validate(args, mask).await,
         Commands::Plugin(cmd) => match cmd.action {
             PluginAction::List(args) => cmd_plugin_list(args),
             PluginAction::Install(args) => cmd_plugin_install(args),
             PluginAction::Uninstall(args) => cmd_plugin_uninstall(args),
         },
         Commands::State(cmd) => match cmd.action {
-            StateAction::Show(args) => cmd_state_show(args),
-            StateAction::Rm(args) => cmd_state_rm(args),
+            StateAction::Show(args) => cmd_state_show(args, mask).await,
+            StateAction::Rm(args) => cmd_state_rm(args, mask).await,
         },
     }
 }
@@ -342,13 +340,29 @@ fn run_outcome(summary: &loadsmith_core::Summary) -> Result<()> {
     }
 }
 
-fn cmd_validate(args: ValidateArgs) -> Result<()> {
-    let content = read_pipeline(&args.pipeline)?;
-
-    let (config, _mask) = parse_pipeline_yaml(&content)?;
-    loadsmith_config::validate_pipeline(&config)?;
-
-    println!("Pipeline '{}' is valid.", config.pipeline.name);
+async fn cmd_validate(args: ValidateArgs, mask: MaskList) -> Result<()> {
+    // Static by default: structure, template syntax, and every secret()
+    // naming a declared provider instance. Nothing is evaluated or started.
+    let doc = loadsmith_core::read_document(&args.pipeline)?;
+    if !args.resolve {
+        println!(
+            "Pipeline '{}' is valid (static check; --resolve also resolves env()/file() and \
+             runs the providers).",
+            doc.config().pipeline.name
+        );
+        return Ok(());
+    }
+    // --resolve: the full resolution `run` performs before it starts
+    // anything, providers included.
+    let plugin_dir = args.plugin_dir.unwrap_or_else(discovery::default_plugin_dir);
+    let load = LoadOpts { plugin_dir, shutdown: loadsmith_core::listen_for_signals()?, mask };
+    let config = loadsmith_core::resolve_document(&doc, Mode::Full, &load).await?;
+    let secrets = doc.secrets().len();
+    println!(
+        "Pipeline '{}' is valid (fully resolved; {secrets} secret() reference{} resolved).",
+        config.pipeline.name,
+        if secrets == 1 { "" } else { "s" }
+    );
     Ok(())
 }
 
@@ -367,9 +381,15 @@ fn cmd_plugin_list(args: PluginListArgs) -> Result<()> {
     Ok(())
 }
 
-fn load_state_cfg(pipeline: &std::path::Path) -> Result<(loadsmith_config::PipelineConfig, loadsmith_config::StateConfig)> {
-    let content = read_pipeline(pipeline)?;
-    let (config, _mask) = parse_pipeline_yaml(&content)?;
+/// The pipeline with only `pipeline:` and `state:` resolved: the state
+/// commands never start a provider, and other blocks' templates (database
+/// credentials…) need not resolve.
+async fn load_state_cfg(
+    pipeline: &std::path::Path,
+    mask: MaskList,
+) -> Result<(loadsmith_config::PipelineConfig, loadsmith_config::StateConfig)> {
+    let load = LoadOpts { mask, ..LoadOpts::new(discovery::default_plugin_dir()) };
+    let (config, _) = loadsmith_core::load_pipeline(pipeline, Mode::Builtins, &load).await?;
     let state = config.state.clone().ok_or_else(|| {
         loadsmith_config::ConfigError::Validation(format!(
             "pipeline '{}' has no state: block",
@@ -379,8 +399,8 @@ fn load_state_cfg(pipeline: &std::path::Path) -> Result<(loadsmith_config::Pipel
     Ok((config, state))
 }
 
-fn cmd_state_show(args: StateArgs) -> Result<()> {
-    let (config, state_cfg) = load_state_cfg(&args.pipeline)?;
+async fn cmd_state_show(args: StateArgs, mask: MaskList) -> Result<()> {
+    let (config, state_cfg) = load_state_cfg(&args.pipeline, mask).await?;
     let backend = loadsmith_core::state::open_backend(&state_cfg)?;
     match backend.load(&config.pipeline.name)? {
         None => println!("No state recorded for pipeline '{}'.", config.pipeline.name),
@@ -406,8 +426,8 @@ fn cmd_state_show(args: StateArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_state_rm(args: StateArgs) -> Result<()> {
-    let (config, state_cfg) = load_state_cfg(&args.pipeline)?;
+async fn cmd_state_rm(args: StateArgs, mask: MaskList) -> Result<()> {
+    let (config, state_cfg) = load_state_cfg(&args.pipeline, mask).await?;
     let backend = loadsmith_core::state::open_backend(&state_cfg)?;
     // Take the lock so we don't clear state out from under a running pipeline.
     let _guard = backend.lock(&config.pipeline.name)?;
