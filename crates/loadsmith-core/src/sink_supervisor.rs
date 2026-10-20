@@ -11,28 +11,32 @@
 //! dies, or is torn down, the supervisor respawns it and re-sends every object
 //! that has not yet been acknowledged, so delivery resumes from where it
 //! stopped. This matches the project rule that the core is the sole owner of
-//! state and plugins are memoryless tools.
+//! state and plugins are memoryless tools. A `resend` from the sink (it got a
+//! malformed line) is answered the same way: every unacknowledged object is
+//! re-sent, which is safe because `deliver` is idempotent.
 //!
-//! Cancellation-safety note: `ControlReader::recv` clears its line buffer each
-//! call and is therefore *not* cancel-safe. We never poll it inside `select!`;
-//! instead each sink instance gets a dedicated reader task that forwards parsed
-//! messages over an mpsc, and the supervisor selects only over cancel-safe
-//! channels (`mpsc`, `interval`).
+//! When the run aborts (or a signal arrives), the `shutdown` input fires: the
+//! supervisor sends `cancel` to the live sink, waits the grace period, kills
+//! it, and returns an error. Objects already acknowledged stay delivered.
+//!
+//! The control channel is read through [`Peer`], whose inbound channel is
+//! cancel-safe, so the supervisor can `select!` over it.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use loadsmith_config::Timeouts;
 use loadsmith_protocol::{DeliverObject, FinishedStatus, Message, PluginKind};
-use loadsmith_transport::{ControlReader, ControlWriter};
 use tokio::io::BufReader;
-use tokio::process::ChildStdin;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{
     error::CoreError,
     events::drain_events,
-    lifecycle::{run_handshake_and_configure, start_sink},
+    lifecycle::{run_handshake_and_configure, start_and_await_ready},
+    peer::{Event, Peer},
+    shutdown::{Halt, Shutdown},
     spawner::spawn_plugin,
 };
 
@@ -51,10 +55,11 @@ pub struct SinkOutcome {
 }
 
 /// Why a sink instance stopped driving — distinguishes "all done" from a
-/// recoverable failure (respawn + resume) and a fatal one (give up).
+/// recoverable failure (respawn + resume) and a halt (give up).
 enum Driven {
     Done,
     Recoverable(String),
+    Halted(Halt),
 }
 
 /// Runs the sink stage to completion, respawning the sink as needed.
@@ -66,62 +71,56 @@ pub async fn run_sink_supervisor(
     binary: PathBuf,
     config: serde_json::Value,
     mut object_rx: UnboundedReceiver<PathBuf>,
+    timeouts: Timeouts,
+    mut shutdown: Shutdown,
 ) -> Result<SinkOutcome, CoreError> {
     // Ledger — lives across respawns.
     let mut emitted: Vec<PathBuf> = Vec::new();
     let mut delivered: HashSet<PathBuf> = HashSet::new();
     let mut input_closed = false;
     let mut restarts: u32 = 0;
+    let grace = Duration::from_secs(timeouts.cancel_grace_seconds);
 
     loop {
-        let sink_name;
         // ── Spawn one sink instance and bring it up to Ready ──────────────
         let mut sp = spawn_plugin(&binary, None)
-            .map_err(|e| CoreError::PluginProcess(format!("spawn sink: {e}")))?;
+            .map_err(|e| CoreError::PluginIncompatible(format!("spawn sink: {e}")))?;
         let event = tokio::fs::File::from_std(sp.event_fd_take());
         let event_task = tokio::spawn(async move {
             drain_events(
-                ControlReader::new(BufReader::new(event)),
+                loadsmith_transport::ControlReader::new(BufReader::new(event)),
                 "sink",
                 crate::events::EventForward::default(),
             )
             .await;
         });
-        let crate::spawner::SpawnedPlugin { mut child, control_in, control_out, .. } = sp;
+        let mut peer = Peer::new("sink", sp);
 
-        // Handshake/configure/start synchronously over borrowed streams. The
-        // sink sends nothing after Ready until we send a DeliverObject, so no
-        // bytes are buffered past Ready when we hand control_out to the reader
-        // task below.
-        let mut control_in = control_in;
-        let mut control_out = control_out;
-        {
-            let mut reader = ControlReader::new(BufReader::new(&mut control_out));
-            let mut writer = ControlWriter::new(&mut control_in);
+        let setup = async {
             let info = run_handshake_and_configure(
-                &mut reader,
-                &mut writer,
+                &mut peer,
                 config.clone(),
                 PluginKind::Sink,
+                &timeouts,
+                &mut shutdown,
             )
             .await?;
-            start_sink(&mut reader, &mut writer).await?;
-            sink_name = info.name;
+            start_and_await_ready(&mut peer, &timeouts, &mut shutdown).await?;
+            Ok::<_, crate::peer::Failure>(info.name)
         }
-
-        // Dedicated reader task: forwards parsed control messages so the
-        // supervisor's select! only touches cancel-safe channels.
-        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::unbounded_channel();
-        let reader_task = tokio::spawn(async move {
-            let mut r = ControlReader::new(BufReader::new(control_out));
-            while let Ok(Some(m)) = r.recv().await {
-                if ctrl_tx.send(m).is_err() {
-                    break;
-                }
+        .await;
+        let sink_name = match setup {
+            Ok(name) => name,
+            Err(failure) => {
+                peer.notify_abort(&failure.reason(), failure.code).await;
+                peer.wind_down(grace).await;
+                let _ = event_task.await;
+                return Err(failure.error);
             }
-        });
+        };
 
-        let mut writer = ControlWriter::new(control_in);
+        // From here on a `resend` means "re-send every unacked object".
+        peer.replay_on_resend = false;
 
         // Resume: (re-)send every object not yet acknowledged, in order.
         let pending: Vec<PathBuf> =
@@ -131,7 +130,7 @@ pub async fn run_sink_supervisor(
         }
         let mut send_failed = false;
         for p in &pending {
-            if let Err(e) = send_deliver(&mut writer, p).await {
+            if let Err(e) = send_deliver(&mut peer, p).await {
                 tracing::warn!("re-send failed: {e}");
                 send_failed = true;
                 break;
@@ -139,26 +138,32 @@ pub async fn run_sink_supervisor(
         }
 
         // ── Drive this instance ───────────────────────────────────────────
-        // `writer` is moved in so that dropping it (not `shutdown`, which does
-        // not close a tokio ChildStdin pipe) signals EOF to the sink.
         let outcome = if send_failed {
             Driven::Recoverable("re-send to fresh sink failed".into())
         } else {
             drive_instance(
-                writer,
-                ctrl_rx,
+                &mut peer,
                 &mut object_rx,
                 &mut emitted,
                 &mut delivered,
                 &mut input_closed,
+                &mut shutdown,
             )
             .await
         };
 
         // Tear the instance down regardless of outcome.
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        reader_task.abort();
+        match &outcome {
+            Driven::Halted(halt) => {
+                let reason = match halt {
+                    Halt::Signal(sig) => format!("interrupted by {}", sig.name()),
+                    Halt::Abort(reason) => reason.clone(),
+                };
+                peer.notify_abort(&reason, None).await;
+                peer.wind_down(grace).await;
+            }
+            _ => peer.wind_down(Duration::ZERO).await,
+        }
         let _ = event_task.await;
 
         match outcome {
@@ -168,10 +173,20 @@ pub async fn run_sink_supervisor(
                     objects_delivered: delivered.len() as u64,
                 });
             }
+            Driven::Halted(halt) => {
+                return Err(match halt {
+                    Halt::Signal(sig) => CoreError::Interrupted(sig),
+                    Halt::Abort(reason) => CoreError::PluginProcess(format!(
+                        "sink cancelled ({reason}); {} of {} objects delivered",
+                        delivered.len(),
+                        emitted.len()
+                    )),
+                });
+            }
             Driven::Recoverable(reason) => {
                 restarts += 1;
                 if restarts > MAX_RESTARTS {
-                    return Err(CoreError::PluginProcess(format!(
+                    return Err(CoreError::PluginFailed(format!(
                         "sink failed after {MAX_RESTARTS} restarts (last: {reason}); \
                          {} of {} objects delivered",
                         delivered.len(),
@@ -185,42 +200,44 @@ pub async fn run_sink_supervisor(
     }
 }
 
-/// Drives a single live sink instance until it finishes, fails, or hangs.
+/// Drives a single live sink instance until it finishes, fails, hangs, or the
+/// run is halted.
 ///
-/// Takes `writer` by value: closing the sink's stdin to signal "no more objects"
-/// is done by **dropping** the writer (`writer = None`). `ControlWriter::shutdown`
-/// would not work here — tokio's `ChildStdin` only closes its pipe on drop, so a
-/// shutdown leaves the sink blocked on `read_line` waiting for an EOF that never
-/// comes.
+/// Closing the sink's stdin to signal "no more objects" is done by dropping
+/// its writer ([`Peer::close_input`]): tokio's `ChildStdin` only closes its
+/// pipe on drop, so a `shutdown` would leave the sink waiting for an EOF that
+/// never comes.
 async fn drive_instance(
-    writer: ControlWriter<ChildStdin>,
-    mut ctrl_rx: UnboundedReceiver<Message>,
+    peer: &mut Peer,
     object_rx: &mut UnboundedReceiver<PathBuf>,
     emitted: &mut Vec<PathBuf>,
     delivered: &mut HashSet<PathBuf>,
     input_closed: &mut bool,
+    shutdown: &mut Shutdown,
 ) -> Driven {
-    let mut writer = Some(writer);
+    let mut input_open = true;
     let mut awaiting_pong = false;
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.tick().await; // discard the immediate first tick
 
     loop {
         // Once the destination is done and every emitted object is acked, close
-        // the sink's stdin by dropping the writer so it sees EOF and finalizes.
-        if *input_closed && writer.is_some() && emitted.iter().all(|p| delivered.contains(p)) {
-            writer = None;
+        // the sink's stdin so it sees EOF and finalizes.
+        if *input_closed && input_open && emitted.iter().all(|p| delivered.contains(p)) {
+            peer.close_input();
+            input_open = false;
             tracing::debug!("all objects delivered; closed sink stdin");
         }
 
         tokio::select! {
+            halt = shutdown.wait() => return Driven::Halted(halt),
             maybe = object_rx.recv(), if !*input_closed => {
                 match maybe {
                     Some(path) => {
                         if !delivered.contains(&path) && !emitted.contains(&path) {
                             emitted.push(path.clone());
-                            if let Some(w) = writer.as_mut() {
-                                if let Err(e) = send_deliver(w, &path).await {
+                            if input_open {
+                                if let Err(e) = send_deliver(peer, &path).await {
                                     return Driven::Recoverable(format!("deliver send failed: {e}"));
                                 }
                             }
@@ -231,15 +248,20 @@ async fn drive_instance(
                     }
                 }
             }
-            msg = ctrl_rx.recv() => {
-                match msg {
-                    Some(Message::ObjectDelivered(d)) => {
+            inbound = peer.next_inbound() => {
+                let event = match peer.process(inbound).await {
+                    Ok(Some(event)) => event,
+                    Ok(None) => continue,
+                    Err(failure) => return Driven::Recoverable(failure.reason()),
+                };
+                match event {
+                    Event::Msg(Message::ObjectDelivered(d)) => {
                         delivered.insert(PathBuf::from(d.path));
                     }
-                    Some(Message::Pong) => {
+                    Event::Msg(Message::Pong) => {
                         awaiting_pong = false;
                     }
-                    Some(Message::Finished(f)) => {
+                    Event::Msg(Message::Finished(f)) => {
                         return match f.status {
                             FinishedStatus::Success => Driven::Done,
                             _ => Driven::Recoverable(format!(
@@ -249,35 +271,38 @@ async fn drive_instance(
                             )),
                         };
                     }
-                    Some(_) => { /* stray log/progress — ignore */ }
-                    None => {
+                    Event::ResendRequested => {
+                        if input_open {
+                            let pending: Vec<PathBuf> =
+                                emitted.iter().filter(|p| !delivered.contains(*p)).cloned().collect();
+                            tracing::debug!(count = pending.len(), "sink asked for a resend");
+                            for p in &pending {
+                                if let Err(e) = send_deliver(peer, p).await {
+                                    return Driven::Recoverable(format!("re-send failed: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    Event::Msg(_) => { /* stray log/progress — ignore */ }
+                    Event::Eof => {
                         return Driven::Recoverable("sink control channel closed (died)".into());
                     }
                 }
             }
-            _ = ping.tick(), if writer.is_some() => {
+            _ = ping.tick(), if input_open => {
                 if awaiting_pong {
                     return Driven::Recoverable("sink hung (no pong within interval)".into());
                 }
-                if let Some(w) = writer.as_mut() {
-                    if w.send(&Message::Ping).await.is_err() {
-                        return Driven::Recoverable("ping write failed".into());
-                    }
-                    awaiting_pong = true;
+                if peer.send_raw(&Message::Ping).await.is_err() {
+                    return Driven::Recoverable("ping write failed".into());
                 }
+                awaiting_pong = true;
             }
         }
     }
 }
 
-async fn send_deliver(
-    writer: &mut ControlWriter<ChildStdin>,
-    path: &Path,
-) -> Result<(), CoreError> {
-    writer
-        .send(&Message::DeliverObject(DeliverObject {
-            path: path.to_string_lossy().into_owned(),
-        }))
+async fn send_deliver(peer: &mut Peer, path: &Path) -> Result<(), CoreError> {
+    peer.send(Message::DeliverObject(DeliverObject { path: path.to_string_lossy().into_owned() }))
         .await
-        .map_err(|e| CoreError::Protocol(format!("deliver_object: {e}")))
 }

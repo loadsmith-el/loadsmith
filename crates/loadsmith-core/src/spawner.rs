@@ -67,6 +67,14 @@ pub fn spawn_plugin(binary: &Path, child_data_fd: Option<RawFd>) -> Result<Spawn
 
     let mut cmd = Command::new(binary);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+    // Each plugin leads its own process group, so a terminal's Ctrl+C (sent
+    // to the foreground group) reaches only the core, which then cancels the
+    // plugins gracefully instead of having them die mid-write. The abort path
+    // kills the whole group, grandchildren included.
+    cmd.process_group(0);
+    // Any path that drops a plugin without reaping it (an early return, a
+    // panic) still kills it.
+    cmd.kill_on_drop(true);
 
     // SAFETY: Only async-signal-safe calls (dup2, close via libc) are made
     // inside pre_exec, which runs in the forked child before exec.

@@ -22,3 +22,7 @@ loadsmith-protocol  = { path = "../loadsmith-protocol" }
 loadsmith-transport = { path = "../loadsmith-transport" }
 loadsmith-config    = { path = "../loadsmith-config" }
 loadsmith-arrow     = { path = "../loadsmith-arrow" }
+
+[dev-dependencies]
+arrow-array          = { workspace = true }
+arrow-schema         = { workspace = true }

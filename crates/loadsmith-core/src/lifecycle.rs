@@ -1,11 +1,14 @@
-/// Drives the handshake → capabilities → configure sequence for a plugin.
+//! Drives the handshake → capabilities → configure → start sequence for a
+//! plugin. Every wait is bounded by the pipeline's `timeouts` and interrupted
+//! by a [`Shutdown`].
+use loadsmith_config::Timeouts;
 use loadsmith_protocol::{
-    Configure, Message, PluginKind, ResumeCursor, SetProtocolVersion, StartParams,
+    error_codes, Configure, Message, PluginKind, ResumeCursor, SetProtocolVersion, StartParams,
 };
-use loadsmith_transport::{ControlReader, ControlWriter};
-use tokio::io::{AsyncBufRead, AsyncWrite};
 
 use crate::error::CoreError;
+use crate::peer::{Failure, Peer};
+use crate::shutdown::Shutdown;
 
 /// Protocol versions this core can speak. The handshake picks the highest
 /// version also advertised by the plugin; `loadsmith plugin install` checks a
@@ -23,35 +26,35 @@ pub struct PluginHandshake {
     pub supports: Vec<String>,
 }
 
+fn violation(peer: &Peer, expected: &str, got: &Message) -> Failure {
+    Failure::by(
+        peer.label(),
+        error_codes::PROTOCOL_VIOLATION,
+        CoreError::Protocol(format!("{}: expected {expected}, got {got:?}", peer.label())),
+    )
+}
+
 /// Runs handshake, negotiates protocol version, requests capabilities,
 /// and sends configure. Returns identifying info about the plugin.
-pub async fn run_handshake_and_configure<R, W>(
-    reader: &mut ControlReader<R>,
-    writer: &mut ControlWriter<W>,
+pub async fn run_handshake_and_configure(
+    peer: &mut Peer,
     config: serde_json::Value,
     expected_kind: PluginKind,
-) -> Result<PluginHandshake, CoreError>
-where
-    R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let label = format!("{expected_kind:?}").to_lowercase();
+    timeouts: &Timeouts,
+    shutdown: &mut Shutdown,
+) -> Result<PluginHandshake, Failure> {
+    let label = peer.label();
+    let handshake_limit = Timeouts::limit(timeouts.handshake_seconds);
 
-    // Send Handshake
     tracing::debug!(plugin = %label, "→ handshake");
-    writer.send(&Message::Handshake).await?;
+    peer.send(Message::Handshake).await?;
 
-    // Await HandshakeAck
-    let ack = recv_expect(reader, "handshake_ack").await?;
+    let ack = peer.recv_expect("handshake_ack", handshake_limit, shutdown).await?;
     let (plugin_name, plugin_version, plugin_versions, kind) = match ack {
         Message::HandshakeAck(a) => {
             (a.plugin_name, a.plugin_version, a.protocol_supported_versions, a.kind)
         }
-        other => {
-            return Err(CoreError::Protocol(format!(
-                "expected handshake_ack, got {other:?}"
-            )))
-        }
+        other => return Err(violation(peer, "handshake_ack", &other)),
     };
     tracing::debug!(
         plugin = %label,
@@ -62,9 +65,13 @@ where
     );
 
     if kind != expected_kind {
-        return Err(CoreError::Protocol(format!(
-            "expected plugin kind {expected_kind:?}, got {kind:?}"
-        )));
+        return Err(Failure::by(
+            label,
+            error_codes::WRONG_PLUGIN_KIND,
+            CoreError::PluginIncompatible(format!(
+                "{plugin_name}: expected plugin kind {expected_kind:?}, got {kind:?}"
+            )),
+        ));
     }
 
     // Choose the highest mutually supported version
@@ -74,56 +81,50 @@ where
         .find(|v| plugin_versions.contains(v))
         .copied()
         .ok_or_else(|| {
-            CoreError::Protocol(format!(
-                "no compatible protocol version: core supports {SUPPORTED_VERSIONS:?}, plugin supports {plugin_versions:?}"
-            ))
+            Failure::by(
+                label,
+                error_codes::UNSUPPORTED_PROTOCOL_VERSION,
+                CoreError::PluginIncompatible(format!(
+                    "{plugin_name}: no compatible protocol version: core supports \
+                     {SUPPORTED_VERSIONS:?}, plugin supports {plugin_versions:?}"
+                )),
+            )
         })?;
     tracing::debug!(plugin = %label, protocol_version = chosen, "→ set_protocol_version");
-
-    writer
-        .send(&Message::SetProtocolVersion(SetProtocolVersion {
-            protocol_version: chosen,
-        }))
+    peer.send(Message::SetProtocolVersion(SetProtocolVersion { protocol_version: chosen }))
         .await?;
 
     // Capabilities exchange
-    writer.send(&Message::CapabilitiesRequest).await?;
-    let caps = recv_expect(reader, "capabilities_response").await?;
-    let supports = match caps {
+    peer.send(Message::CapabilitiesRequest).await?;
+    let supports = match peer.recv_expect("capabilities_response", handshake_limit, shutdown).await? {
         Message::CapabilitiesResponse(c) => {
             tracing::debug!(plugin = %label, supports = ?c.supports, "← capabilities");
             c.supports
         }
-        other => {
-            return Err(CoreError::Protocol(format!(
-                "expected capabilities_response, got {other:?}"
-            )))
-        }
+        other => return Err(violation(peer, "capabilities_response", &other)),
     };
 
     // Send configuration
     tracing::debug!(plugin = %label, "→ configure");
-    writer.send(&Message::Configure(Configure { config })).await?;
+    peer.send(Message::Configure(Configure { config })).await?;
 
-    // Await ConfigureAck
-    let ack = recv_expect(reader, "configure_ack").await?;
-    match ack {
+    let configure_limit = Timeouts::limit(timeouts.configure_seconds);
+    match peer.recv_expect("configure_ack", configure_limit, shutdown).await? {
         Message::ConfigureAck(a) if a.status == loadsmith_protocol::ConfigureStatus::Ok => {
             tracing::debug!(plugin = %label, "← configure_ack ok");
             tracing::info!(plugin = %label, name = %plugin_name, version = %plugin_version, "configured");
         }
         Message::ConfigureAck(a) => {
-            return Err(CoreError::Protocol(format!(
-                "plugin rejected config: {} — {}",
-                a.code.unwrap_or_default(),
-                a.message.unwrap_or_default()
-            )))
+            return Err(Failure::of(
+                label,
+                CoreError::PluginRejectedConfig(format!(
+                    "{plugin_name}: {} — {}",
+                    a.code.unwrap_or_default(),
+                    a.message.unwrap_or_default()
+                )),
+            ))
         }
-        other => {
-            return Err(CoreError::Protocol(format!(
-                "expected configure_ack, got {other:?}"
-            )))
-        }
+        other => return Err(violation(peer, "configure_ack", &other)),
     }
 
     Ok(PluginHandshake {
@@ -134,103 +135,44 @@ where
     })
 }
 
-/// Sends Start and waits for Schema (source) or Ready (destination).
+/// Sends Start and waits for the source's Schema.
 ///
 /// `resume` carries the opaque watermark persisted by a previous run (when the
 /// pipeline has incremental state and prior state exists); the source uses it to
 /// resume reading. `None` means a full read.
-pub async fn start_source<R, W>(
-    reader: &mut ControlReader<R>,
-    writer: &mut ControlWriter<W>,
+pub async fn start_source(
+    peer: &mut Peer,
     resume: Option<serde_json::Value>,
-) -> Result<loadsmith_protocol::Schema, CoreError>
-where
-    R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
+    timeouts: &Timeouts,
+    shutdown: &mut Shutdown,
+) -> Result<loadsmith_protocol::Schema, Failure> {
     tracing::debug!(plugin = "source", has_resume = resume.is_some(), "→ start");
-    let params = StartParams {
-        resume: resume.map(|cursor_value| ResumeCursor { cursor_value }),
-    };
-    writer.send(&Message::Start(params)).await?;
-    let msg = recv_expect(reader, "schema").await?;
-    match msg {
+    let params = StartParams { resume: resume.map(|cursor_value| ResumeCursor { cursor_value }) };
+    peer.send(Message::Start(params)).await?;
+    match peer.recv_expect("schema", Timeouts::limit(timeouts.start_seconds), shutdown).await? {
         Message::Schema(s) => {
             tracing::debug!(plugin = "source", fields = s.fields.len(), "← schema");
             Ok(s)
         }
-        other => Err(CoreError::Protocol(format!("expected schema, got {other:?}"))),
+        other => Err(violation(peer, "schema", &other)),
     }
 }
 
-pub async fn start_destination<R, W>(
-    reader: &mut ControlReader<R>,
-    writer: &mut ControlWriter<W>,
-) -> Result<(), CoreError>
-where
-    R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    tracing::debug!(plugin = "destination", "→ start");
-    writer.send(&Message::Start(StartParams::default())).await?;
-    let msg = recv_expect(reader, "ready").await?;
-    match msg {
+/// Sends Start and waits for Ready — a destination, or a sink (which has no
+/// schema; it just signals it is prepared to receive objects).
+pub async fn start_and_await_ready(
+    peer: &mut Peer,
+    timeouts: &Timeouts,
+    shutdown: &mut Shutdown,
+) -> Result<(), Failure> {
+    let label = peer.label();
+    tracing::debug!(plugin = %label, "→ start");
+    peer.send(Message::Start(StartParams::default())).await?;
+    match peer.recv_expect("ready", Timeouts::limit(timeouts.start_seconds), shutdown).await? {
         Message::Ready => {
-            tracing::debug!(plugin = "destination", "← ready");
-            tracing::info!("destination ready — pump starting");
+            tracing::debug!(plugin = %label, "← ready");
             Ok(())
         }
-        other => Err(CoreError::Protocol(format!("expected ready, got {other:?}"))),
+        other => Err(violation(peer, "ready", &other)),
     }
-}
-
-/// Sends Start to a sink and waits for Ready. Same shape as `start_destination`
-/// — a sink has no schema, it just signals it is prepared to receive objects.
-pub async fn start_sink<R, W>(
-    reader: &mut ControlReader<R>,
-    writer: &mut ControlWriter<W>,
-) -> Result<(), CoreError>
-where
-    R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    tracing::debug!(plugin = "sink", "→ start");
-    writer.send(&Message::Start(StartParams::default())).await?;
-    let msg = recv_expect(reader, "ready").await?;
-    match msg {
-        Message::Ready => {
-            tracing::debug!(plugin = "sink", "← ready");
-            Ok(())
-        }
-        other => Err(CoreError::Protocol(format!("expected ready, got {other:?}"))),
-    }
-}
-
-/// Drains the control channel until Finished, returning the final message.
-pub async fn await_finished<R: AsyncBufRead + Unpin>(
-    reader: &mut ControlReader<R>,
-) -> Result<loadsmith_protocol::Finished, CoreError> {
-    loop {
-        let msg = reader.recv().await?.ok_or_else(|| {
-            CoreError::Protocol("plugin closed control channel without sending finished".into())
-        })?;
-        match msg {
-            Message::Finished(f) => return Ok(f),
-            Message::Progress(_) | Message::Log(_) | Message::Pong => {
-                // These can arrive between start and finished; just continue.
-            }
-            other => {
-                tracing::warn!("unexpected message while awaiting finished: {other:?}");
-            }
-        }
-    }
-}
-
-async fn recv_expect<R: AsyncBufRead + Unpin>(
-    reader: &mut ControlReader<R>,
-    what: &str,
-) -> Result<Message, CoreError> {
-    reader.recv().await?.ok_or_else(|| {
-        CoreError::Protocol(format!("EOF while waiting for {what}"))
-    })
 }

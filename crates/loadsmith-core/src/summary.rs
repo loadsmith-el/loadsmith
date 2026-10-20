@@ -19,6 +19,11 @@ pub struct Summary {
     /// Files delivered by the sink, when one is attached.
     pub objects_delivered: Option<u64>,
     pub duration: Duration,
+    /// Why the run did not succeed (the first failure observed). `None` on
+    /// success.
+    pub root_cause: Option<String>,
+    /// The operator signal that stopped the run, when status is `Cancelled`.
+    pub signal: Option<crate::shutdown::StopSignal>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -60,6 +65,9 @@ impl Summary {
             }
         }
         println!("Status:       {}", self.status.as_str());
+        if let Some(cause) = &self.root_cause {
+            println!("Cause:        {cause}");
+        }
         println!("Rows read:    {}", fmt_number(self.rows_read));
         println!("Rows written: {}", fmt_number(self.rows_written));
         println!("Batches:      {}", fmt_number(self.batches_read));

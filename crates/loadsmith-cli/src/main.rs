@@ -192,6 +192,9 @@ async fn run(cli: Cli, color: bool) -> Result<()> {
 }
 
 async fn cmd_run(args: RunArgs, color: bool) -> Result<()> {
+    // Handle SIGINT/SIGTERM explicitly before anything else: in the images the
+    // engine is PID 1, where an unhandled SIGTERM is silently ignored.
+    let shutdown = loadsmith_core::listen_for_signals()?;
     let content = std::fs::read_to_string(&args.pipeline)
         .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", args.pipeline.display()))?;
 
@@ -210,12 +213,13 @@ async fn cmd_run(args: RunArgs, color: bool) -> Result<()> {
         print_resolved_config: args.print_resolved_config,
         color,
         version: env!("CARGO_PKG_VERSION").to_string(),
+        shutdown,
     };
 
     let summary = run_pipeline(config, opts).await?;
     // A pipeline that ran but failed (a plugin error, a failed delivery…) must
     // exit non-zero, or schedulers and the lab read it as a success.
-    if summary.status == loadsmith_core::SummaryStatus::Error {
+    if summary.status != loadsmith_core::SummaryStatus::Success {
         anyhow::bail!("pipeline '{}' failed (see the errors above)", summary.pipeline_name);
     }
     Ok(())
