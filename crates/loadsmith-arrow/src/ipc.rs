@@ -37,13 +37,24 @@ impl<W: Write> IpcWriter<W> {
     }
 }
 
+/// Reads an Arrow IPC stream and tells a **clean end** (the explicit
+/// end-of-stream marker) from a **truncated** one (the underlying reader hit
+/// EOF first).
+///
+/// arrow-rs's `StreamReader` reports both as "no more batches": EOF at a
+/// message boundary is valid per the IPC format. For Loadsmith that ambiguity
+/// is a data-loss bug, because a writer that crashed between two batches looks
+/// exactly like one that finished. Loadsmith writers always end with the
+/// marker ([`IpcWriter::finish`]), so after [`read_batch`](Self::read_batch)
+/// returns `Ok(None)`, [`ended_cleanly`](Self::ended_cleanly) is `true` only if
+/// the marker was read.
 pub struct IpcReader<R: Read> {
-    inner: StreamReader<R>,
+    inner: StreamReader<EofTracker<R>>,
 }
 
 impl<R: Read> IpcReader<R> {
     pub fn new(reader: R) -> Result<Self, IpcError> {
-        let inner = StreamReader::try_new(reader, None)?;
+        let inner = StreamReader::try_new(EofTracker { inner: reader, hit_eof: false }, None)?;
         Ok(Self { inner })
     }
 
@@ -51,13 +62,39 @@ impl<R: Read> IpcReader<R> {
         self.inner.schema()
     }
 
-    /// Returns `Ok(None)` when the stream ends.
+    /// Returns `Ok(None)` when the stream ends — cleanly or not; see
+    /// [`ended_cleanly`](Self::ended_cleanly).
     pub fn read_batch(&mut self) -> Result<Option<RecordBatch>, IpcError> {
         match self.inner.next() {
             Some(Ok(batch)) => Ok(Some(batch)),
             Some(Err(e)) => Err(IpcError::Arrow(e)),
             None => Ok(None),
         }
+    }
+
+    /// After `read_batch` returned `Ok(None)`: `true` if the stream ended with
+    /// the end-of-stream marker, `false` if the writer's side closed (or died)
+    /// without writing it. Meaningless before the stream has ended.
+    pub fn ended_cleanly(&self) -> bool {
+        self.inner.is_finished() && !self.inner.get_ref().hit_eof
+    }
+}
+
+/// Records whether the wrapped reader ever reported EOF. `StreamReader` stops
+/// reading right after the end-of-stream marker, so it only sees EOF when the
+/// marker is missing.
+struct EofTracker<R> {
+    inner: R,
+    hit_eof: bool,
+}
+
+impl<R: Read> Read for EofTracker<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 && !buf.is_empty() {
+            self.hit_eof = true;
+        }
+        Ok(n)
     }
 }
 
@@ -107,6 +144,33 @@ mod tests {
         assert_eq!(ids.value(2), 3);
 
         assert!(reader.read_batch().unwrap().is_none());
+        assert!(reader.ended_cleanly());
+    }
+
+    #[test]
+    fn missing_end_of_stream_marker_is_not_clean() {
+        let (schema, batch) = make_batch();
+
+        // A writer that died between two batches: complete messages, no marker.
+        let mut buf = Vec::new();
+        let mut writer = IpcWriter::new(&mut buf, &schema).unwrap();
+        writer.write_batch(&batch).unwrap();
+        drop(writer);
+
+        let mut reader = IpcReader::new(buf.as_slice()).unwrap();
+        assert!(reader.read_batch().unwrap().is_some());
+        assert!(reader.read_batch().unwrap().is_none());
+        assert!(!reader.ended_cleanly());
+    }
+
+    #[test]
+    fn empty_stream_with_marker_is_clean() {
+        let (schema, _) = make_batch();
+        let mut buf = Vec::new();
+        IpcWriter::new(&mut buf, &schema).unwrap().finish().unwrap();
+        let mut reader = IpcReader::new(buf.as_slice()).unwrap();
+        assert!(reader.read_batch().unwrap().is_none());
+        assert!(reader.ended_cleanly());
     }
 
     #[test]
