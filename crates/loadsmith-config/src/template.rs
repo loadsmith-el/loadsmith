@@ -14,42 +14,24 @@ pub struct ResolveResult {
 /// Resolves all `{{ expr }}` occurrences in `input`.
 /// Appends resolved secret values to `mask`.
 pub fn resolve_string(input: &str, mask: &mut MaskList) -> Result<String, ConfigError> {
+    // Copy literal text as whole `&str` slices: the delimiters are ASCII, so
+    // every split point is a char boundary and multi-byte UTF-8 (São, Zürich,
+    // 東京) passes through untouched.
     let mut out = String::with_capacity(input.len());
-    let mut pos = 0;
-    let bytes = input.as_bytes();
+    let mut rest = input;
 
-    while pos < bytes.len() {
-        // Find next `{{`
-        if pos + 1 < bytes.len() && bytes[pos] == b'{' && bytes[pos + 1] == b'{' {
-            let expr_start = pos + 2;
-            // Find closing `}}`
-            let close = find_close(bytes, expr_start).ok_or_else(|| {
-                ConfigError::Template(format!(
-                    "unclosed '{{{{' in template: {}",
-                    &input[pos..]
-                ))
-            })?;
-            let expr = input[expr_start..close].trim();
-            let resolved = eval_expr(expr, mask)?;
-            out.push_str(&resolved);
-            pos = close + 2; // skip past `}}`
-        } else {
-            out.push(bytes[pos] as char);
-            pos += 1;
-        }
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open + 2..];
+        let close = after_open.find("}}").ok_or_else(|| {
+            ConfigError::Template(format!("unclosed '{{{{' in template: {}", &rest[open..]))
+        })?;
+        let expr = after_open[..close].trim();
+        out.push_str(&eval_expr(expr, mask)?);
+        rest = &after_open[close + 2..]; // skip past `}}`
     }
+    out.push_str(rest);
     Ok(out)
-}
-
-fn find_close(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut i = start;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'}' && bytes[i + 1] == b'}' {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
 }
 
 /// Evaluates a single template expression.
@@ -158,6 +140,47 @@ mod tests {
         let mut mask = MaskList::new();
         let result = resolve_string("no templates here", &mut mask).unwrap();
         assert_eq!(result, "no templates here");
+    }
+
+    /// Regression: literal text was copied byte by byte as `u8 as char`, so
+    /// every non-ASCII character was mangled (São → SÃ£o), including inside
+    /// queries sent to plugins.
+    #[test]
+    fn non_ascii_outside_templates_is_preserved() {
+        let mut mask = MaskList::new();
+        let input = "SELECT * FROM cidades WHERE nome = 'São Paulo' -- Zürich, 東京, 🚚";
+        assert_eq!(resolve_string(input, &mut mask).unwrap(), input);
+    }
+
+    #[test]
+    fn non_ascii_around_and_inside_templates_is_preserved() {
+        std::env::set_var("LS_TEST_UTF8_VAR", "Conceição");
+        let mut mask = MaskList::new();
+        let result = resolve_string(
+            "ação={{ env('LS_TEST_UTF8_VAR') }}·{{env(\"LS_TEST_UTF8_VAR\")}}é",
+            &mut mask,
+        )
+        .unwrap();
+        assert_eq!(result, "ação=Conceição·Conceiçãoé");
+    }
+
+    #[test]
+    fn non_ascii_in_file_template_is_preserved() {
+        let dir = std::env::temp_dir().join(format!("ls-tpl-utf8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v.txt");
+        std::fs::write(&path, "Florianópolis\n").unwrap();
+        let mut mask = MaskList::new();
+        let input = format!("cidade: {{{{ file('{}') }}}} — ok", path.display());
+        let result = resolve_string(&input, &mut mask);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(result.unwrap(), "cidade: Florianópolis — ok");
+    }
+
+    #[test]
+    fn single_braces_are_literal() {
+        let mut mask = MaskList::new();
+        assert_eq!(resolve_string("{ \"a\": \"ç\" }", &mut mask).unwrap(), "{ \"a\": \"ç\" }");
     }
 
     #[test]
