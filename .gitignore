@@ -4,3 +4,6 @@
 
 # mdbook build output (generated from docs/src/)
 /docs/book/
+
+# Golden wire fixtures are test data, not output
+!crates/loadsmith-protocol/tests/fixtures/*.jsonl

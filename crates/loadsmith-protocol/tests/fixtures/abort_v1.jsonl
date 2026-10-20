@@ -1,0 +1,11 @@
+{"type":"cancel","reason":"source failed"}
+{"type":"cancel","reason":"SIGTERM"}
+{"type":"error","code":"UNSUPPORTED_PROTOCOL_VERSION","message":"no common protocol version"}
+{"type":"error","code":"WRONG_PLUGIN_KIND","message":"spawned as destination, plugin declared source"}
+{"type":"error","code":"PROTOCOL_VIOLATION","message":"unexpected schema during configure"}
+{"type":"error","code":"MALFORMED_MESSAGE","message":"two consecutive malformed control lines"}
+{"type":"error","code":"TIMEOUT","message":"no configure_ack within 300s"}
+{"type":"resend"}
+{"type":"resend","reason":"invalid JSON"}
+{"type":"finished","status":"cancelled"}
+{"type":"finished","status":"error","code":"INPUT_TRUNCATED","message":"data stream ended without an end-of-stream marker"}
