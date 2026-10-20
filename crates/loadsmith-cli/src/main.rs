@@ -2,13 +2,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use loadsmith_config::parse_pipeline_yaml;
 use loadsmith_core::{discovery, run_pipeline, RunOpts};
 
 mod download;
 mod exit;
 mod plugin_install;
+mod run_summary;
 
 use exit::{classify, Exit, RunOutcome, UsageError};
 
@@ -54,6 +55,25 @@ struct RunArgs {
 
     #[arg(long, help = "Override plugin directory (default: ~/.loadsmith/plugins)")]
     plugin_dir: Option<PathBuf>,
+
+    /// What stdout carries: the human report, or one JSON run summary
+    /// (logs stay on stderr either way)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Human, conflicts_with = "print_resolved_config")]
+    output: OutputFormat,
+
+    /// Also write the JSON run summary to this file (atomically), whatever
+    /// --output says
+    #[arg(long, value_name = "PATH", conflicts_with = "print_resolved_config")]
+    summary_file: Option<PathBuf>,
+}
+
+/// The format of `loadsmith run`'s stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    /// Header and summary box for people (default).
+    Human,
+    /// One JSON run-summary document, on a single line.
+    Json,
 }
 
 #[derive(Args)]
@@ -203,17 +223,81 @@ async fn run(cli: Cli, color: bool) -> Result<()> {
 }
 
 async fn cmd_run(args: RunArgs, color: bool) -> Result<()> {
+    let json_stdout = args.output == OutputFormat::Json;
+    let summary_file = args.summary_file.clone();
+    let started = std::time::SystemTime::now();
+    let facts = loadsmith_core::FactsHandle::default();
+    let mut ctx = run_summary::RunContext { dry_run: args.dry_run, ..Default::default() };
+
+    let result = execute_run(args, color, !json_stdout, &facts, &mut ctx).await;
+    let finished = std::time::SystemTime::now();
+    let (summary, outcome) = match result {
+        Ok(Some(summary)) => {
+            let outcome = run_outcome(&summary);
+            (Some(summary), outcome)
+        }
+        Ok(None) => (None, Ok(())),
+        Err(e) => (None, Err(e)),
+    };
+
+    if json_stdout || summary_file.is_some() {
+        let exit_code = match &outcome {
+            Ok(()) => Exit::Success.code(),
+            Err(e) => classify(e).code(),
+        };
+        let snapshot = facts.snapshot();
+        let doc = run_summary::build(&run_summary::RunRecord {
+            ctx: &ctx,
+            facts: &snapshot,
+            summary: summary.as_ref(),
+            error: outcome.as_ref().err(),
+            exit_code,
+            started,
+            finished,
+        });
+        if let Some(path) = &summary_file {
+            if let Err(e) = run_summary::write_file(path, &doc) {
+                let err = anyhow::anyhow!("cannot write the summary file {}: {e}", path.display());
+                match &outcome {
+                    // A successful run whose summary was asked for and lost
+                    // is a failure for whoever waits on that file.
+                    Ok(()) => {
+                        if json_stdout {
+                            println!("{}", serde_json::to_string(&doc)?);
+                        }
+                        return Err(err);
+                    }
+                    Err(_) => eprintln!("error: {err:#}"),
+                }
+            }
+        }
+        if json_stdout {
+            println!("{}", serde_json::to_string(&doc)?);
+        }
+    }
+    outcome
+}
+
+/// Runs the pipeline. `Ok(None)`: `--print-resolved-config`, nothing ran.
+async fn execute_run(
+    args: RunArgs,
+    color: bool,
+    human_report: bool,
+    facts: &loadsmith_core::FactsHandle,
+    ctx: &mut run_summary::RunContext,
+) -> Result<Option<loadsmith_core::Summary>> {
     // Handle SIGINT/SIGTERM explicitly before anything else: in the images the
     // engine is PID 1, where an unhandled SIGTERM is silently ignored.
     let shutdown = loadsmith_core::listen_for_signals()?;
     let content = read_pipeline(&args.pipeline)?;
 
     let (config, mask) = parse_pipeline_yaml(&content)?;
+    ctx.learn(&config);
 
     if args.print_resolved_config {
         let yaml = serde_yaml::to_string(&config)?;
         println!("{}", mask.apply(&yaml));
-        return Ok(());
+        return Ok(None);
     }
 
     let plugin_dir = args.plugin_dir.unwrap_or_else(discovery::default_plugin_dir);
@@ -224,22 +308,24 @@ async fn cmd_run(args: RunArgs, color: bool) -> Result<()> {
         color,
         version: env!("CARGO_PKG_VERSION").to_string(),
         shutdown,
+        human_report,
+        facts: facts.clone(),
     };
 
-    let summary = run_pipeline(config, opts).await?;
-    // A pipeline that ran but failed (a plugin error, a failed delivery…) must
-    // exit non-zero, or schedulers and the lab read it as a success.
+    Ok(Some(run_pipeline(config, opts).await?))
+}
+
+/// A pipeline that ran but failed (a plugin error, a failed delivery…) must
+/// exit non-zero, or schedulers and the lab read it as a success.
+fn run_outcome(summary: &loadsmith_core::Summary) -> Result<()> {
+    let pipeline = summary.pipeline_name.clone();
     match summary.status {
         loadsmith_core::SummaryStatus::Success => Ok(()),
         loadsmith_core::SummaryStatus::Cancelled => match summary.signal {
-            Some(signal) => {
-                Err(RunOutcome::Cancelled { pipeline: summary.pipeline_name, signal }.into())
-            }
-            None => Err(RunOutcome::Failed { pipeline: summary.pipeline_name }.into()),
+            Some(signal) => Err(RunOutcome::Cancelled { pipeline, signal }.into()),
+            None => Err(RunOutcome::Failed { pipeline }.into()),
         },
-        loadsmith_core::SummaryStatus::Error => {
-            Err(RunOutcome::Failed { pipeline: summary.pipeline_name }.into())
-        }
+        loadsmith_core::SummaryStatus::Error => Err(RunOutcome::Failed { pipeline }.into()),
     }
 }
 

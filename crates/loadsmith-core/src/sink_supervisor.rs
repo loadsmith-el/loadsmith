@@ -51,6 +51,7 @@ const MAX_RESTARTS: u32 = 5;
 /// Result of the sink stage.
 pub struct SinkOutcome {
     pub name: String,
+    pub version: String,
     pub objects_delivered: u64,
 }
 
@@ -106,11 +107,11 @@ pub async fn run_sink_supervisor(
             )
             .await?;
             start_and_await_ready(&mut peer, &timeouts, &mut shutdown).await?;
-            Ok::<_, crate::peer::Failure>(info.name)
+            Ok::<_, crate::peer::Failure>((info.name, info.version))
         }
         .await;
-        let sink_name = match setup {
-            Ok(name) => name,
+        let (sink_name, sink_version) = match setup {
+            Ok(id) => id,
             Err(failure) => {
                 peer.notify_abort(&failure.reason(), failure.code).await;
                 peer.wind_down(grace).await;
@@ -170,6 +171,7 @@ pub async fn run_sink_supervisor(
             Driven::Done => {
                 return Ok(SinkOutcome {
                     name: sink_name,
+                    version: sink_version,
                     objects_delivered: delivered.len() as u64,
                 });
             }

@@ -15,6 +15,6 @@ pub mod state_supervisor;
 pub mod summary;
 
 pub use runner::{run_pipeline, RunOpts};
-pub use summary::{Summary, SummaryStatus};
+pub use summary::{FactsHandle, PluginFacts, RunFacts, Summary, SummaryStatus};
 pub use error::CoreError;
 pub use shutdown::{listen_for_signals, Halt, Shutdown, ShutdownTrigger, StopSignal};

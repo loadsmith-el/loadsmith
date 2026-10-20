@@ -200,6 +200,11 @@ Throughput:   31,877 rows/s
 ───────────────────────────────────────────
 ```
 
+For automation, `--output json` puts one versioned JSON run summary on stdout
+instead (status, exit code, root cause, route with plugin versions, counts,
+timings, watermarks), and `--summary-file <path>` writes the same document to
+a file; see the [CLI reference](docs/src/reference/cli.md#machine-readable-run-summary).
+
 ---
 
 ## CLI
@@ -208,6 +213,8 @@ Throughput:   31,877 rows/s
 loadsmith run pipeline.yaml                 # run a pipeline
 loadsmith run pipeline.yaml --dry-run       # validate without executing
 loadsmith run pipeline.yaml --print-resolved-config   # show resolved config (secrets masked)
+loadsmith run pipeline.yaml --output json   # one JSON run summary on stdout
+loadsmith run pipeline.yaml --summary-file run.json   # also write it to a file
 loadsmith run pipeline.yaml --plugin-dir ../loadsmith-canonical-plugins/target/debug
 
 loadsmith validate pipeline.yaml            # validate config only

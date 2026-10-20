@@ -45,6 +45,17 @@ release notes in their repositories.
   [CLI reference](docs/src/reference/cli.md#exit-codes).
 - The run summary has a `Cause:` line with the root cause when a run fails or
   is cancelled.
+- **Machine-readable run summary.** `loadsmith run --output json` prints one
+  JSON document on stdout instead of the human report (logs stay on stderr),
+  and `--summary-file <path>` writes the same document to a file. It carries a
+  `version` (`1`), the pipeline, status, exit code, root cause, signal, the
+  route (each plugin's kind, type, handshake name and version, binary path),
+  rows read/written, batches, duration, throughput, RFC 3339 start/end times,
+  the incremental watermark before and after, and sink deliveries. It is also
+  produced for setup failures (unreadable pipeline, missing plugin, rejected
+  config, held lock), which otherwise print only an `error:` line. The schema
+  is covered by the stability policy. See the
+  [CLI reference](docs/src/reference/cli.md#machine-readable-run-summary).
 - Protocol: a **complete field-type vocabulary** for the `schema` message,
   covering Arrow's common types with their parameters: `int8`…`uint64`,
   `float16`, `decimal128`/`decimal256` (precision, scale), `large_utf8`,

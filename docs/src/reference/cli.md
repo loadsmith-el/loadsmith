@@ -22,6 +22,8 @@ loadsmith run pipeline.yaml --dry-run
 loadsmith run pipeline.yaml --dry-run --print-resolved-config
 loadsmith run pipeline.yaml --log-level debug
 loadsmith run pipeline.yaml --no-color
+loadsmith run pipeline.yaml --output json                # one JSON run summary on stdout
+loadsmith run pipeline.yaml --summary-file run.json     # human report on stdout, JSON in a file
 ```
 
 **Arguments:**
@@ -37,10 +39,14 @@ loadsmith run pipeline.yaml --no-color
 | `--plugin-dir <path>` | `~/.loadsmith/plugins/` | Directory to search for plugin binaries |
 | `--dry-run` | off | Parse, resolve templates and validate the pipeline, then exit without spawning plugins (plugin binaries are not checked) |
 | `--print-resolved-config` | off | Print the resolved config (with secrets masked) to stdout and exit, without running |
+| `--output <human\|json>` | `human` | What stdout carries: the human report, or one JSON [run summary](#machine-readable-run-summary) instead |
+| `--summary-file <path>` | — | Also write the JSON [run summary](#machine-readable-run-summary) to this file, whatever `--output` says |
 
 **Exit codes:** see [Exit codes](#exit-codes). A run that fails once data is
 flowing prints the summary with `Status: error` and a `Cause:` line; a run that
-cannot start prints the cause as an `error:` line on stderr.
+cannot start prints the cause as an `error:` line on stderr. With
+`--output json` or `--summary-file`, both cases also produce the
+[run summary](#machine-readable-run-summary) with the exit code and cause.
 
 **Signals:** SIGINT (Ctrl+C) and SIGTERM stop a run gracefully: the engine
 sends `cancel` to every plugin (a destination rolls back), waits up to
@@ -55,10 +61,95 @@ Keep the grace period below your orchestrator's (see
 **Output:**
 
 - **stdout** — the human report: the header (`loadsmith <version>`, then the
-  route) and the summary box. Suitable for piping to a file.
+  route) and the summary box. Suitable for piping to a file. Its layout is not
+  a stable interface; for automation use the
+  [run summary](#machine-readable-run-summary). With `--output json`, stdout
+  carries only that JSON document.
 - **stderr** — tracing output at the configured log level, including the schema
   and the progress lines at doubling batch intervals (timestamped `INFO`
   records). Includes the full protocol handshake at `--log-level debug`.
+
+### Machine-readable run summary
+
+`--output json` replaces the human report on stdout with **one JSON document
+on a single line**, printed when the command ends; `--summary-file <path>`
+writes the same document (pretty-printed, atomically through a temporary file
+renamed into place) whatever `--output` says. Logs, progress and the `error:`
+line stay on stderr. Use `--output json` when a scheduler or a container log
+captures stdout, and `--summary-file` to keep the human report on stdout and
+hand the document to an orchestrator as a file.
+
+The document is produced for **every run that got past argument parsing**:
+successes, run failures, cancellations by a signal, dry runs, and setup
+failures that print only an `error:` line in human mode (an unreadable or
+invalid pipeline file, a missing or incompatible plugin, a rejected config, a
+held state lock, schema drift). Usage errors (exit `2`) come from the argument
+parser before anything runs and produce no document. `--output json` and
+`--summary-file` cannot be combined with `--print-resolved-config`.
+
+```json
+{
+  "version": 1,
+  "loadsmith_version": "0.3.0",
+  "pipeline": "orders-incremental",
+  "status": "success",
+  "exit_code": 0,
+  "cause": null,
+  "signal": null,
+  "dry_run": false,
+  "route": [
+    {"kind": "source", "type": "postgres", "name": "loadsmith-source-postgres",
+     "version": "0.2.1", "path": "/home/u/.loadsmith/plugins/loadsmith-source-postgres"},
+    {"kind": "destination", "type": "jsonl", "name": "loadsmith-destination-jsonl",
+     "version": "0.2.1", "path": "/home/u/.loadsmith/plugins/loadsmith-destination-jsonl"}
+  ],
+  "rows_read": 100000,
+  "rows_written": 100000,
+  "batches": 50,
+  "duration_ms": 3137,
+  "throughput_rows_per_sec": 31877,
+  "started_at": "2026-10-20T14:03:08.398Z",
+  "finished_at": "2026-10-20T14:03:11.535Z",
+  "state": {"watermark_before": "2026-10-19T00:00:00Z", "watermark_after": "2026-10-20T14:00:00Z"},
+  "sink": null
+}
+```
+
+A setup failure, for example a held state lock:
+
+```json
+{"version":1,"loadsmith_version":"0.3.0","pipeline":"orders-incremental","status":"error","exit_code":5,"cause":"state error: pipeline 'orders-incremental' is locked by a running process (lease renewed 812ms ago); another run is in progress against state file 'state.json'","signal":null,"dry_run":false,"route":[{"kind":"source","type":"postgres","name":null,"version":null,"path":null},{"kind":"destination","type":"jsonl","name":null,"version":null,"path":null}],"rows_read":0,"rows_written":0,"batches":0,"duration_ms":3,"throughput_rows_per_sec":0,"started_at":"2026-10-20T14:03:08.398Z","finished_at":"2026-10-20T14:03:08.401Z","state":{"watermark_before":null,"watermark_after":null},"sink":null}
+```
+
+**Fields (version 1).** Every field is always present; `null` means unknown or
+not applicable.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `version` | integer | Version of this document's schema. Currently `1` |
+| `loadsmith_version` | string | Version of the engine that ran |
+| `pipeline` | string \| null | `pipeline.name`; `null` if the pipeline file could not be read or parsed |
+| `status` | string | `success`, `error` or `cancelled` (stopped by SIGINT/SIGTERM) |
+| `exit_code` | integer | The process exit code (see [Exit codes](#exit-codes)) |
+| `cause` | string \| null | The root cause when the run did not succeed (the summary's `Cause:` line, or the `error:` line of a setup failure) |
+| `signal` | string \| null | `SIGINT` or `SIGTERM` when a signal stopped the run |
+| `dry_run` | bool | The run was `--dry-run` (nothing was executed) |
+| `route` | array | One entry per stage, in order: `kind` (`source`, `destination`, `sink`), `type` (the `type:` in `pipeline.yaml`), `name` and `version` (from the plugin's handshake), `path` (the binary that was resolved). `name`/`version`/`path` are `null` until the run learned them; `route` is `[]` if the pipeline file could not be parsed |
+| `rows_read` | integer | Rows the source produced |
+| `rows_written` | integer | Rows the destination reported written |
+| `batches` | integer | Batches the source produced |
+| `duration_ms` | integer | Wall-clock time of the command, `finished_at − started_at` |
+| `throughput_rows_per_sec` | integer | `rows_read` per second of `duration_ms` (`0` for an instant run) |
+| `started_at`, `finished_at` | string | UTC timestamps, RFC 3339 with milliseconds (`2026-10-20T14:03:08.398Z`) |
+| `state` | object \| null | With a `state:` block: `watermark_before` (the cursor loaded at start, `null` if none) and `watermark_after` (the cursor in the state after the run: the one this run persisted, else unchanged). The values are the opaque cursors, verbatim. `null` without a `state:` block |
+| `sink` | object \| null | With a `sink:` block: `objects_delivered` (`null` if delivery did not complete). `null` without a sink |
+
+If `--summary-file` cannot be written, the error is reported on stderr and a
+run that otherwise succeeded exits `1`.
+
+The document's schema is covered by the [Stability Policy](stability.md):
+within a `version`, fields are only ever added, never removed or changed in
+meaning. Consumers should ignore fields they do not know.
 
 **Examples:**
 

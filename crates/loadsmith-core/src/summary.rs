@@ -1,6 +1,50 @@
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::fmt::{fmt_duration, fmt_number};
+
+/// What the runner learned about one plugin of the route.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginFacts {
+    /// The binary that was resolved for it.
+    pub path: Option<PathBuf>,
+    /// `plugin_name` from its `handshake_ack`.
+    pub name: Option<String>,
+    /// `plugin_version` from its `handshake_ack`.
+    pub version: Option<String>,
+}
+
+/// Facts the runner records as it learns them, so a caller can report them
+/// even when the run fails before it produces a [`Summary`] (a missing
+/// plugin, a rejected config, a held lock).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RunFacts {
+    pub source: PluginFacts,
+    pub destination: PluginFacts,
+    pub sink: PluginFacts,
+    /// The incremental watermark loaded at the start (`None`: no `state:`
+    /// block, or no state recorded yet).
+    pub watermark_before: Option<serde_json::Value>,
+    /// The watermark persisted by this run, if it persisted one.
+    pub watermark_persisted: Option<serde_json::Value>,
+}
+
+/// A shared, cheaply cloned handle on the [`RunFacts`] of one run.
+#[derive(Debug, Clone, Default)]
+pub struct FactsHandle(Arc<Mutex<RunFacts>>);
+
+impl FactsHandle {
+    /// Applies `f` to the facts.
+    pub fn update(&self, f: impl FnOnce(&mut RunFacts)) {
+        f(&mut self.0.lock().unwrap_or_else(|p| p.into_inner()));
+    }
+
+    /// A copy of the facts recorded so far.
+    pub fn snapshot(&self) -> RunFacts {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
 
 /// Final execution summary printed (to stdout) after a pipeline run.
 #[derive(Debug, Default)]
@@ -35,7 +79,7 @@ pub enum SummaryStatus {
 }
 
 impl SummaryStatus {
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             SummaryStatus::Success => "success",
             SummaryStatus::Error => "error",

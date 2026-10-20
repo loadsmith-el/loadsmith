@@ -110,9 +110,10 @@ What's shipped and what's queued next. Shipped items are documented in
       `resend` for a malformed control line, and distinct exit codes; a
       complete Arrow field-type vocabulary in the `schema` message (with
       nullability and tolerant reading) and drift detection on the exact Arrow
-      stream schema (state format v2, migrated automatically).
-      Remaining: the policy's open decisions (machine-readable output,
-      experimental kinds, remote state, SDK publishing),
+      stream schema (state format v2, migrated automatically); a versioned
+      JSON run summary (`--output json`, `--summary-file`).
+      Remaining: the policy's open decisions (experimental kinds, remote
+      state, SDK publishing),
       and the canonical plugins' `cancel()` rolling back once they move to
       the new SDK.
 

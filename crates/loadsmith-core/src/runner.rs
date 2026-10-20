@@ -45,7 +45,7 @@ use crate::{
     spawner::{create_data_pipe, spawn_plugin},
     state::{check_schema_drift, new_run_id, open_backend, schema_fingerprint},
     state_supervisor::{run_state_supervisor, StateRun},
-    summary::{Summary, SummaryStatus},
+    summary::{FactsHandle, Summary, SummaryStatus},
 };
 
 /// Capability a destination must advertise for a sink to be attachable: it
@@ -71,6 +71,12 @@ pub struct RunOpts {
     /// Fires on SIGINT/SIGTERM (see [`crate::shutdown::listen_for_signals`]);
     /// the run then aborts gracefully.
     pub shutdown: Shutdown,
+    /// Print the human report (header, summary box, dry-run notice) on
+    /// stdout. Off when stdout carries a machine-readable summary instead.
+    pub human_report: bool,
+    /// Filled in as the run learns about its plugins and state, so the
+    /// caller can report them even when the run fails during setup.
+    pub facts: FactsHandle,
 }
 
 impl RunOpts {
@@ -82,6 +88,8 @@ impl RunOpts {
             color: true,
             version: env!("CARGO_PKG_VERSION").to_string(),
             shutdown: Shutdown::never(),
+            human_report: true,
+            facts: FactsHandle::default(),
         }
     }
 }
@@ -97,7 +105,9 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     validate_pipeline(&config)?;
 
     if opts.dry_run {
-        println!("Dry run — pipeline validated. Not executing.");
+        if opts.human_report {
+            println!("Dry run — pipeline validated. Not executing.");
+        }
         return Ok(Summary {
             pipeline_name: config.pipeline.name.clone(),
             status: SummaryStatus::Success,
@@ -131,6 +141,8 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         None => (None, None, None),
     };
     let resume_value = prior_state.as_ref().map(|d| d.cursor_value.clone());
+    let facts = opts.facts.clone();
+    facts.update(|f| f.watermark_before = resume_value.clone());
     let (checkpoint_tx, checkpoint_rx) = maybe_channel(state_enabled);
     let (committed_tx, committed_rx) = maybe_channel(state_enabled);
 
@@ -138,20 +150,25 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     // always lead the output, then the run log follows underneath it.
     let reporter = Reporter::new(opts.color);
     let sink_type = config.sink.as_ref().map(|s| s.plugin_type.clone());
-    reporter.header(
-        &opts.version,
-        &config.source.plugin_type,
-        &config.destination.plugin_type,
-        sink_type.as_deref(),
-    );
+    if opts.human_report {
+        reporter.header(
+            &opts.version,
+            &config.source.plugin_type,
+            &config.destination.plugin_type,
+            sink_type.as_deref(),
+        );
+    }
 
     let source_bin = find_plugin_binary("source", &config.source.plugin_type, &opts.plugin_dir)?;
+    facts.update(|f| f.source.path = Some(source_bin.clone()));
     let dest_bin =
         find_plugin_binary("destination", &config.destination.plugin_type, &opts.plugin_dir)?;
+    facts.update(|f| f.destination.path = Some(dest_bin.clone()));
     let sink_bin = match &config.sink {
         Some(s) => Some(find_plugin_binary("sink", &s.plugin_type, &opts.plugin_dir)?),
         None => None,
     };
+    facts.update(|f| f.sink.path = sink_bin.clone());
 
     tracing::info!(source = ?source_bin, destination = ?dest_bin, sink = ?sink_bin, "spawning plugins");
 
@@ -254,6 +271,10 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
             &mut shutdown,
         )
         .await?;
+        facts.update(|f| {
+            f.source.name = Some(src_info.name.clone());
+            f.source.version = Some(src_info.version.clone());
+        });
         let dst_info = run_handshake_and_configure(
             &mut dst,
             dest_config,
@@ -262,6 +283,10 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
             &mut shutdown,
         )
         .await?;
+        facts.update(|f| {
+            f.destination.name = Some(dst_info.name.clone());
+            f.destination.version = Some(dst_info.version.clone());
+        });
 
         // Capability gate: a `state:` block requires a source that supports
         // incremental loads (accepts a resume cursor, reports watermarks).
@@ -429,7 +454,7 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     let mut late_failure: Option<String> = None;
     if let Some(task) = state_task {
         match task.await {
-            Ok(Ok(_)) => {}
+            Ok(Ok(persisted)) => facts.update(|f| f.watermark_persisted = persisted),
             Ok(Err(e)) => {
                 tracing::error!("incremental state persistence failed: {e}");
                 late_failure.get_or_insert(format!("incremental state persistence failed: {e}"));
@@ -447,6 +472,10 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         Some(task) => match task.await {
             Ok(Ok(outcome)) => {
                 tracing::info!(objects = outcome.objects_delivered, "sink delivery complete");
+                facts.update(|f| {
+                    f.sink.name = Some(outcome.name.clone());
+                    f.sink.version = Some(outcome.version.clone());
+                });
                 (Some(outcome.name), Some(outcome.objects_delivered), true)
             }
             Ok(Err(e)) => {
@@ -518,7 +547,9 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         signal,
     };
 
-    summary.print();
+    if opts.human_report {
+        summary.print();
+    }
     Ok(summary)
 }
 

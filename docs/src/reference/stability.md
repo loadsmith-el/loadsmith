@@ -27,7 +27,7 @@ SDK version (or language) it was built with.
 | Interface | What is frozen | Compatible evolution (minor) |
 |---|---|---|
 | **Wire protocol v1** | The fd layout (fd0 control core→plugin, fd1 control plugin→core, fd3 Arrow IPC data, fd4 events; stderr is free-form). JSONL framing. Every message's `type` and required fields. The `schema` message's [field-type vocabulary](../protocol/messages.md#schema), its field-object shape, and the rule that the Arrow IPC header is the authoritative schema. Handshake and version negotiation (`protocol_supported_versions` → `set_protocol_version`). Lifecycle ordering, including the commit point (the core ends the destination's fd3 only after the source succeeded). The [abort rules](../protocol/reference.md#abort-rules): `cancel`, `error` and its codes, the grace period, then kill. The [`resend` rule](../protocol/reference.md#malformed-lines-and-resend) for malformed control lines. The [tolerant-reader rule](../protocol/reference.md#compatibility-rule-tolerant-reader). | New optional fields. New message types a receiver may safely ignore. New field types and type parameters (read as unknown by an older receiver). A change the receiver must understand needs **protocol v2**, negotiated in the handshake. Every 1.x engine keeps speaking v1. |
-| **CLI** | Commands and subcommands, flags and their defaults and meaning, the [exit-code table](cli.md#exit-codes) (`0`–`5`, `130`, `143`), graceful cancel on SIGINT/SIGTERM, and the split of the human report on stdout from diagnostics on stderr. | New commands and new flags. A new exit code only for a case that exits `1` today. |
+| **CLI** | Commands and subcommands, flags and their defaults and meaning, the [exit-code table](cli.md#exit-codes) (`0`–`5`, `130`, `143`), graceful cancel on SIGINT/SIGTERM, and the split of the human report on stdout from diagnostics on stderr. The [JSON run summary](cli.md#machine-readable-run-summary) of `run` (`--output json`, `--summary-file`), versioned by its `version` field (now `1`): every field, its type and meaning. | New commands and new flags. A new exit code only for a case that exits `1` today. New run-summary fields (consumers ignore unknown ones); a change to an existing field needs a new summary `version`. |
 | **`pipeline.yaml` schema** | Every core-owned key, its type, default and meaning (including `pipeline.timeouts`). Unknown core-owned keys are rejected. The template syntax `{{ env('VAR') }}` / `{{ file('/path') }}`. | New optional keys and new template functions. The contents of each plugin's `config:` block belong to that plugin and are versioned by it. |
 | **Incremental state file** | The [state file format](../architecture/incremental-state.md#state-file-format), versioned by its `version` field, and the lock file's lease semantics. | A new engine reads every older format and upgrades it on its next save. An engine refuses a format newer than it understands rather than downgrading it. |
 | **Plugin manifest** | `apiVersion: loadsmith.dev/plugin/v1` and its fields (`name`, `version`, `protocol`, `provides`, `runtime`). | New optional fields. Incompatible changes go into a new `apiVersion`, and v1 stays accepted throughout 1.x. |
@@ -50,7 +50,9 @@ These can change in any release:
 - **Engine internals.** `loadsmith-core`, `loadsmith-config` and `loadsmith-cli`
   are not libraries. They are marked `publish = false`.
 - **Human-readable output.** The report header, the summary box, progress lines,
-  log messages and the format of the tracing output on stderr. Don't parse them.
+  log messages and the format of the tracing output on stderr. Don't parse them;
+  use the [JSON run summary](cli.md#machine-readable-run-summary) and the exit
+  code.
 - **Experimental parts** (defined, but not wired into the core):
   - the `parser` and `config-provider` plugin kinds. They exist in the protocol,
     the SDK and the manifest's known kinds, but the core never spawns them.
@@ -119,18 +121,25 @@ These were open and are now settled. 1.0 freezes them as described.
    **version 2**; legacy and version 1 files are migrated (the drift check is
    skipped once, with a warning, and the file is rewritten on the next save).
    See the [state file format](../architecture/incremental-state.md#state-file-format).
+8. **Machine-readable run output: in 1.0.** `loadsmith run --output json`
+   prints one JSON run summary on stdout instead of the human report, and
+   `--summary-file <path>` writes the same document to a file. Two flags
+   because the two consumers differ: a scheduler or container log that captures
+   stdout, and an orchestrator that wants the human report on stdout and a
+   result file beside it. The document has a `version` (now `1`), always
+   carries every field (`null` when unknown), and is produced for setup
+   failures too, with the exit code and the cause. Its schema is frozen in the
+   [CLI reference](cli.md#machine-readable-run-summary); fields are only added
+   within a version.
 
 ## Open decisions before 1.0
 
 These are still open, and each one changes what 1.0 freezes:
 
-1. **Machine-readable run output.** Human output is not covered, so automation
-   has nothing stable to parse except the exit code. A JSON summary (a flag or
-   a file) would close that gap. Add it before 1.0 or as a 1.x minor?
-2. **Experimental kinds.** Wire `config-provider` (and `parser`) into the core
+1. **Experimental kinds.** Wire `config-provider` (and `parser`) into the core
    before 1.0, or ship 1.0 without them and add them in a 1.x minor?
-3. **Remote state backends.** The `s3` state backend will need its own format
+2. **Remote state backends.** The `s3` state backend will need its own format
    and lock semantics. Should they fall under the same state-format version?
-4. **Publishing the SDK crates** to crates.io (they are consumed by git
+3. **Publishing the SDK crates** to crates.io (they are consumed by git
    revision today), and whether `loadsmith-plugin-manifest` should also be
    `publish = false`.
