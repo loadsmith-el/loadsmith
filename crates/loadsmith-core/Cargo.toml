@@ -26,3 +26,11 @@ loadsmith-arrow     = { path = "../loadsmith-arrow" }
 [dev-dependencies]
 arrow-array          = { workspace = true }
 arrow-schema         = { workspace = true }
+async-trait          = { workspace = true }
+loadsmith-plugin-sdk = { path = "../loadsmith-plugin-sdk" }
+
+# End-to-end abort tests: the test binary doubles as the fake plugins, so it
+# needs its own `main` (see tests/abort.rs).
+[[test]]
+name    = "abort"
+harness = false
