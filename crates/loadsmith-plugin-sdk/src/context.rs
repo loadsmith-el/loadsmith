@@ -1,4 +1,4 @@
-use loadsmith_protocol::{Checkpoint, Committed, LogLevel, Message, ObjectReady, Progress};
+use loadsmith_protocol::{Checkpoint, Committed, LogLevel, Message, ObjectParsed, ObjectReady, Progress};
 use loadsmith_transport::EventWriter;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
@@ -55,6 +55,14 @@ impl<W: AsyncWrite + Unpin> EventSender<W> {
     /// event drain forwards it to the sink supervisor.
     pub async fn object_ready(&mut self, path: impl Into<String>) {
         let msg = Message::ObjectReady(ObjectReady { path: path.into() });
+        let _ = self.writer.send(&msg).await;
+    }
+
+    /// Parser → core: a file was fully parsed into `batches` Arrow batches
+    /// (`rows` rows); `last_batch_seq` is the global ordinal of its last
+    /// batch (`0` when it produced none). Informational.
+    pub async fn object_parsed(&mut self, path: impl Into<String>, rows: u64, batches: u64, last_batch_seq: u64) {
+        let msg = Message::ObjectParsed(ObjectParsed { path: path.into(), rows, batches, last_batch_seq });
         let _ = self.writer.send(&msg).await;
     }
 
