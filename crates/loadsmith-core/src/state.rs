@@ -11,9 +11,7 @@
 //! `S3Backend` (conditional PUT for a distributed lock) slots in behind the same
 //! trait later, reusing the s3 sink's SigV4/TLS work.
 
-use std::collections::hash_map::DefaultHasher;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,11 +19,29 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::error::CoreError;
-use loadsmith_config::StateConfig;
+use loadsmith_config::{SchemaChangePolicy, StateConfig};
+
+/// Version of the state document format this build writes.
+///
+/// - `0` (implicit, field absent): written by loadsmith ≤ 0.2.0. Its
+///   `schema_hash` came from std's `DefaultHasher`, which is not stable across
+///   Rust releases, so it cannot be compared with a current fingerprint. Such a
+///   document is accepted (its cursor is honoured) and is rewritten in the
+///   current format on the next save.
+/// - `1`: adds `version`; `schema_hash` is the FNV-1a fingerprint of
+///   [`schema_fingerprint`].
+///
+/// A document with a version **greater** than this one was written by a newer
+/// loadsmith and is refused rather than silently downgraded.
+pub const STATE_FORMAT_VERSION: u32 = 1;
 
 /// The persisted state document for one pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateDoc {
+    /// State format version (see [`STATE_FORMAT_VERSION`]). Absent in legacy
+    /// documents, which deserialize as `0`.
+    #[serde(default)]
+    pub version: u32,
     /// Pipeline name — guards against pointing a run at another pipeline's file.
     pub pipeline: String,
     /// Opaque high watermark of the cursor column. The core never interprets it.
@@ -47,12 +63,19 @@ impl StateDoc {
         run_id: impl Into<String>,
     ) -> Self {
         Self {
+            version: STATE_FORMAT_VERSION,
             pipeline: pipeline.into(),
             cursor_value,
             schema_hash: schema_hash.into(),
             run_id: run_id.into(),
             updated_at_unix_ms: now_unix_ms(),
         }
+    }
+
+    /// True for a document written before the format was versioned (≤ 0.2.0):
+    /// its `schema_hash` is not comparable with [`schema_fingerprint`].
+    pub fn is_legacy(&self) -> bool {
+        self.version == 0
     }
 }
 
@@ -80,15 +103,87 @@ pub fn open_backend(cfg: &StateConfig) -> Result<Box<dyn StateBackend>, CoreErro
     }
 }
 
-/// Fingerprint of a source schema (field names + types), for drift detection.
-/// Not cryptographic — `DefaultHasher` is enough to notice a changed shape.
+/// Fingerprint of a source schema (field names + types, in order), for drift
+/// detection. Persisted in the state file, so it must be **stable across Rust
+/// releases and platforms**: 64-bit FNV-1a over a length-prefixed encoding
+/// (`len(name) name len(type) type` per field, lengths as u64 little-endian;
+/// `type` is the protocol's wire name, e.g. `int64`). Not cryptographic — it
+/// only has to notice a changed shape. Changing this function changes every
+/// stored fingerprint: bump [`STATE_FORMAT_VERSION`] and migrate if you do.
 pub fn schema_fingerprint(schema: &loadsmith_protocol::Schema) -> String {
-    let mut h = DefaultHasher::new();
+    let mut h = Fnv1a64::new();
     for f in &schema.fields {
-        f.name.hash(&mut h);
-        f.field_type.to_string().hash(&mut h);
+        h.write_prefixed(f.name.as_bytes());
+        h.write_prefixed(f.field_type.to_string().as_bytes());
     }
-    format!("{:016x}", h.finish())
+    format!("{:016x}", h.0)
+}
+
+/// Schema-drift guard, run once per run after the source reports its schema:
+/// if the source shape changed since `prior` was written, a blind resume could
+/// corrupt the load, so refuse (default) or warn per `policy`.
+///
+/// A legacy document (see [`STATE_FORMAT_VERSION`]) carries a fingerprint from
+/// an unstable hasher that cannot be compared: it is accepted with a one-time
+/// notice, and the run's next save rewrites it with the current fingerprint
+/// and version.
+pub fn check_schema_drift(
+    prior: &StateDoc,
+    current_hash: &str,
+    policy: SchemaChangePolicy,
+) -> Result<(), CoreError> {
+    if prior.is_legacy() {
+        tracing::warn!(
+            pipeline = %prior.pipeline,
+            "state file predates state format v{STATE_FORMAT_VERSION}: its schema fingerprint \
+             cannot be compared, so schema drift is not checked this run; the file is \
+             upgraded on the next save"
+        );
+        return Ok(());
+    }
+    if prior.schema_hash == current_hash {
+        return Ok(());
+    }
+    match policy {
+        SchemaChangePolicy::Refuse => Err(CoreError::State(format!(
+            "source schema changed since last run (recorded {}, now {current_hash}); \
+             set state.on_schema_change: continue to override",
+            prior.schema_hash
+        ))),
+        SchemaChangePolicy::Continue => {
+            tracing::warn!(
+                recorded = %prior.schema_hash,
+                current = %current_hash,
+                "source schema changed since last run — continuing per policy"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// 64-bit FNV-1a (http://www.isthe.com/chongo/tech/comp/fnv/). Inline so the
+/// persisted fingerprint never depends on a hasher whose output may change.
+struct Fnv1a64(u64);
+
+impl Fnv1a64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn new() -> Self {
+        Self(Self::OFFSET)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 ^= u64::from(*b);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    fn write_prefixed(&mut self, bytes: &[u8]) {
+        self.write(&(bytes.len() as u64).to_le_bytes());
+        self.write(bytes);
+    }
 }
 
 /// A generated run identifier (pid + epoch ms) — no uuid dependency needed.
@@ -255,6 +350,14 @@ impl StateBackend for LocalFileBackend {
         };
         let doc: StateDoc = serde_json::from_str(&raw)
             .map_err(|e| CoreError::State(format!("parse state file: {e}")))?;
+        if doc.version > STATE_FORMAT_VERSION {
+            return Err(CoreError::State(format!(
+                "state file '{}' has format version {}, but this loadsmith only understands \
+                 up to {STATE_FORMAT_VERSION}; it was written by a newer loadsmith — upgrade",
+                self.path.display(),
+                doc.version
+            )));
+        }
         if doc.pipeline != key {
             return Err(CoreError::State(format!(
                 "state file '{}' belongs to pipeline '{}', not '{key}'",
@@ -324,6 +427,108 @@ mod tests {
         assert_eq!(loaded.pipeline, "p1");
         assert_eq!(loaded.cursor_value, "2026-06-09");
         assert_eq!(loaded.schema_hash, "abc");
+    }
+
+    fn schema(fields: &[(&str, loadsmith_protocol::FieldType)]) -> loadsmith_protocol::Schema {
+        loadsmith_protocol::Schema {
+            fields: fields
+                .iter()
+                .map(|(n, t)| loadsmith_protocol::Field { name: (*n).into(), field_type: t.clone() })
+                .collect(),
+        }
+    }
+
+    /// The fingerprint is persisted, so its value is part of the state format:
+    /// this golden value (computed independently) must never change without a
+    /// STATE_FORMAT_VERSION bump.
+    #[test]
+    fn schema_fingerprint_is_pinned() {
+        use loadsmith_protocol::FieldType::*;
+        let s = schema(&[("id", Int64), ("nome", Utf8)]);
+        assert_eq!(schema_fingerprint(&s), "a8e4fe49824728ac");
+    }
+
+    #[test]
+    fn schema_fingerprint_detects_changes() {
+        use loadsmith_protocol::FieldType::*;
+        let base = schema_fingerprint(&schema(&[("id", Int64), ("nome", Utf8)]));
+        assert_ne!(base, schema_fingerprint(&schema(&[("id", Int32), ("nome", Utf8)])));
+        assert_ne!(base, schema_fingerprint(&schema(&[("nome", Utf8), ("id", Int64)])));
+        assert_ne!(base, schema_fingerprint(&schema(&[("id", Int64)])));
+        // Length prefixes keep field boundaries unambiguous.
+        assert_ne!(
+            schema_fingerprint(&schema(&[("ab", Utf8), ("c", Utf8)])),
+            schema_fingerprint(&schema(&[("a", Utf8), ("bc", Utf8)]))
+        );
+    }
+
+    #[test]
+    fn new_docs_carry_the_current_version() {
+        let (_tmp, path) = tmp_state_path("version");
+        let backend = LocalFileBackend::new(&path);
+        backend.store(&StateDoc::new("p1", serde_json::json!(1), "h", "r")).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["version"], STATE_FORMAT_VERSION);
+        assert!(!backend.load("p1").unwrap().unwrap().is_legacy());
+    }
+
+    /// Migration: a state file written by loadsmith ≤ 0.2.0 has no `version`
+    /// and a DefaultHasher fingerprint. It must load, keep its cursor, pass the
+    /// drift check even under `refuse`, and be upgraded by the next save.
+    #[test]
+    fn legacy_doc_loads_and_is_upgraded_on_next_save() {
+        let (_tmp, path) = tmp_state_path("legacy");
+        fs::write(
+            &path,
+            r#"{
+  "pipeline": "p1",
+  "cursor_value": "2026-06-09T10:00:00",
+  "schema_hash": "1f2e3d4c5b6a7980",
+  "run_id": "4242-1760000000000",
+  "updated_at_unix_ms": 1760000000000
+}"#,
+        )
+        .unwrap();
+        let backend = LocalFileBackend::new(&path);
+        let prior = backend.load("p1").unwrap().unwrap();
+        assert!(prior.is_legacy());
+        assert_eq!(prior.cursor_value, "2026-06-09T10:00:00");
+
+        let current = schema_fingerprint(&schema(&[("id", loadsmith_protocol::FieldType::Int64)]));
+        assert_ne!(prior.schema_hash, current);
+        check_schema_drift(&prior, &current, SchemaChangePolicy::Refuse)
+            .expect("a legacy fingerprint must not trigger a drift refusal");
+
+        // Next save (what the state supervisor does) rewrites it in the new format.
+        backend.store(&StateDoc::new("p1", serde_json::json!("2026-06-10"), &current, "r2")).unwrap();
+        let upgraded = backend.load("p1").unwrap().unwrap();
+        assert_eq!(upgraded.version, STATE_FORMAT_VERSION);
+        assert_eq!(upgraded.schema_hash, current);
+        check_schema_drift(&upgraded, &current, SchemaChangePolicy::Refuse).unwrap();
+    }
+
+    #[test]
+    fn drift_check_on_current_docs() {
+        let doc = StateDoc::new("p1", serde_json::json!(1), "aaaa", "r");
+        assert!(check_schema_drift(&doc, "aaaa", SchemaChangePolicy::Refuse).is_ok());
+        assert!(check_schema_drift(&doc, "bbbb", SchemaChangePolicy::Refuse).is_err());
+        assert!(check_schema_drift(&doc, "bbbb", SchemaChangePolicy::Continue).is_ok());
+    }
+
+    #[test]
+    fn load_refuses_a_newer_format_version() {
+        let (_tmp, path) = tmp_state_path("future");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"version":{},"pipeline":"p1","cursor_value":1,"schema_hash":"h","run_id":"r","updated_at_unix_ms":1}}"#,
+                STATE_FORMAT_VERSION + 1
+            ),
+        )
+        .unwrap();
+        let err = LocalFileBackend::new(&path).load("p1").unwrap_err().to_string();
+        assert!(err.contains("newer loadsmith"), "{err}");
     }
 
     #[test]

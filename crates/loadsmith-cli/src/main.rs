@@ -265,6 +265,11 @@ fn cmd_state_show(args: StateArgs) -> Result<()> {
         None => println!("No state recorded for pipeline '{}'.", config.pipeline.name),
         Some(doc) => {
             println!("Pipeline:     {}", doc.pipeline);
+            if doc.is_legacy() {
+                println!("Format:       legacy (pre-v1; upgraded on the next run's save)");
+            } else {
+                println!("Format:       v{}", doc.version);
+            }
             println!("Cursor value: {}", doc.cursor_value);
             println!("Schema hash:  {}", doc.schema_hash);
             println!("Run id:       {}", doc.run_id);

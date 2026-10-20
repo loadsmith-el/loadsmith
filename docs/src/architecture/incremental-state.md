@@ -126,6 +126,43 @@ The state document also records a **schema fingerprint**; if the source shape
 changed since the recorded run, `on_schema_change` decides whether to refuse
 (default) or continue.
 
+## State file format
+
+The local backend's state file is a JSON object. Its format is versioned and
+part of Loadsmith's [stability promise](../reference/stability.md):
+
+```json
+{
+  "version": 1,
+  "pipeline": "orders-incremental",
+  "cursor_value": "2026-06-09T08:00:00Z",
+  "schema_hash": "a8e4fe49824728ac",
+  "run_id": "4242-1781078400000",
+  "updated_at_unix_ms": 1781078400000
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `version` | State format version. Current: **1**. |
+| `pipeline` | Owning pipeline — a run refuses a file that belongs to another pipeline. |
+| `cursor_value` | The opaque watermark, echoed to the source verbatim on resume. |
+| `schema_hash` | Fingerprint of the source schema: 64-bit FNV-1a over each field's name and wire type, in order (length-prefixed), as 16 hex digits. Stable across Loadsmith builds and platforms. |
+| `run_id` | Run that last wrote the file (diagnostic). |
+| `updated_at_unix_ms` | Time of the last write (diagnostic). |
+
+Compatibility rules:
+
+- **Legacy files** (written by Loadsmith ≤ 0.2.0) have no `version` field and a
+  `schema_hash` from Rust's `DefaultHasher`, which is not stable across Rust
+  releases. They are accepted: the cursor is honoured, the schema-drift check is
+  skipped for that one run (with a warning, since the old fingerprint cannot be
+  compared), and the next save rewrites the file as version 1. Until a run saves
+  a new watermark the file stays legacy.
+- A file with a `version` **higher** than the running Loadsmith understands was
+  written by a newer release; it is refused rather than silently downgraded.
+- Unknown extra fields are ignored on read (and dropped on the next write).
+
 ## Operating it
 
 ```bash

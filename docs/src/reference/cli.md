@@ -229,6 +229,7 @@ loadsmith state show pipeline.yaml
 **Output:**
 ```
 Pipeline:     orders-incremental
+Format:       v1
 Cursor value: "2026-06-09T08:00:00Z"
 Schema hash:  …
 Run id:       …

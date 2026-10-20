@@ -9,8 +9,6 @@ use loadsmith_transport::{ControlReader, ControlWriter};
 use tokio::io::BufReader;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use loadsmith_config::SchemaChangePolicy;
-
 use crate::{
     discovery::find_plugin_binary,
     error::CoreError,
@@ -20,7 +18,7 @@ use crate::{
     reporter::Reporter,
     sink_supervisor::run_sink_supervisor,
     spawner::{create_data_pipe, spawn_plugin},
-    state::{new_run_id, open_backend, schema_fingerprint},
+    state::{check_schema_drift, new_run_id, open_backend, schema_fingerprint},
     state_supervisor::{run_state_supervisor, StateRun},
     summary::{Summary, SummaryStatus},
 };
@@ -237,24 +235,7 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     // a blind resume could corrupt the load. Refuse (default) or warn.
     let schema_hash = schema_fingerprint(&schema);
     if let (Some(prior), Some(state_cfg)) = (&prior_state, &config.state) {
-        if prior.schema_hash != schema_hash {
-            match state_cfg.on_schema_change {
-                SchemaChangePolicy::Refuse => {
-                    return Err(CoreError::State(format!(
-                        "source schema changed since last run (recorded {}, now {}); \
-                         set state.on_schema_change: continue to override",
-                        prior.schema_hash, schema_hash
-                    )));
-                }
-                SchemaChangePolicy::Continue => {
-                    tracing::warn!(
-                        recorded = %prior.schema_hash,
-                        current = %schema_hash,
-                        "source schema changed since last run — continuing per policy"
-                    );
-                }
-            }
-        }
+        check_schema_drift(prior, &schema_hash, state_cfg.on_schema_change)?;
     }
 
     // Spawn the state supervisor (before the pump) so it persists watermarks as
