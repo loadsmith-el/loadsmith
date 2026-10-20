@@ -13,8 +13,10 @@ pub struct PipelineConfig {
     pub providers: BTreeMap<String, ProviderRef>,
     pub source: PluginRef,
     /// Optional parsing stage between a raw source (one advertising
-    /// `object_output`: it produces files, not Arrow) and the destination.
-    /// Accepted by the config model; the core does not drive parsers yet.
+    /// `object_output`: it produces files, not Arrow) and the destination:
+    /// the parser turns each file into Arrow batches. Required by a raw
+    /// source, rejected for any other (checked at run time, once the
+    /// capabilities are known); not combinable with `state:` in 1.0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parser: Option<PluginRef>,
     pub destination: PluginRef,

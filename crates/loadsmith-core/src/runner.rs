@@ -1,19 +1,26 @@
 //! Runs one pipeline: spawns the plugins, drives their lifecycle, pumps the
 //! data plane, and enforces the abort rules of protocol v1.
 //!
+//! The Arrow stream comes from the **producer**: the source, or — with a
+//! `parser:` — the parser, fed the files a raw source announces (see
+//! [`crate::parser_feed`]).
+//!
 //! **Abort rules** (normative; see the protocol reference):
 //!
 //! 1. The core ends the destination's fd3 (writes the IPC end-of-stream
-//!    marker) only after the source's stream ended with its own marker **and**
-//!    the source sent `finished` with status `success`. This is the commit
-//!    point: until then a destination must not finalize.
+//!    marker) only after the producer's stream ended with its own marker
+//!    **and** the producer sent `finished` with status `success` — and, with
+//!    a parser, after the raw source too sent `finished` with `success`. This
+//!    is the commit point: until then a destination must not finalize.
 //! 2. On any failure — a plugin crash, exit, `finished` with an error, a
 //!    protocol violation, a timeout, a stalled data plane, an operator signal
 //!    — the core sends `cancel` to every live plugin (`error` to the one at
 //!    fault), waits the grace period, and then kills each plugin's process
 //!    group. The destination's fd3 stays open until the destination is gone,
 //!    so it can never observe a clean end of input after an upstream failure.
-//! 3. Both plugins' outcomes are always collected, and the summary reports the
+//!    A parser's stdin is closed gracefully ("no more files") only after the
+//!    raw source succeeded; after an upstream failure it gets `cancel`.
+//! 3. Every plugin's outcome is always collected, and the summary reports the
 //!    run's status with the root cause (the first failure observed).
 
 use std::fs::File;
@@ -26,7 +33,7 @@ use std::time::Duration;
 use loadsmith_arrow::ipc::IpcError;
 use loadsmith_arrow::IpcReader;
 use loadsmith_config::{validate_pipeline, ConfigError, MaskList, PipelineConfig, Timeouts};
-use loadsmith_protocol::{error_codes, FinishedStatus, Message, PluginKind};
+use loadsmith_protocol::{capabilities, error_codes, FinishedStatus, Message, PluginKind};
 use loadsmith_transport::ControlReader;
 use tokio::io::BufReader;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -36,7 +43,11 @@ use crate::{
     discovery::find_plugin_binary,
     error::CoreError,
     events::{drain_events, EventForward},
-    lifecycle::{run_handshake_and_configure, start_and_await_ready, start_source},
+    lifecycle::{
+        run_handshake_and_configure, run_handshake_and_configure_with, start_and_await_ready, start_source,
+        PluginHandshake,
+    },
+    parser_feed::{await_parser_schema, Feed, FeedEvent},
     peer::{describe_exit, finished_failure, Event, Failure, Peer},
     pump::{pump, PumpControl, PumpOutcome, PumpOutput},
     reporter::Reporter,
@@ -49,12 +60,17 @@ use crate::{
 };
 
 /// Capability a destination must advertise for a sink to be attachable: it
-/// stages files locally and announces each via `ObjectReady`.
-const CAP_OBJECT_OUTPUT: &str = "object_output";
+/// stages files locally and announces each via `ObjectReady`. On a source it
+/// marks a raw source, which requires a `parser:`.
+const CAP_OBJECT_OUTPUT: &str = capabilities::OBJECT_OUTPUT;
 
 /// Capability a source must advertise for a `state:` block to drive incremental
 /// loads: it accepts a resume cursor and reports watermarks.
-const CAP_INCREMENTAL_STATE: &str = "incremental_state";
+const CAP_INCREMENTAL_STATE: &str = capabilities::INCREMENTAL_STATE;
+
+/// The config key a raw source advertising `scratch_dir` receives its
+/// download directory in.
+const SCRATCH_DIR_KEY: &str = "scratch_dir";
 
 /// How often the data-phase watchdog checks deadlines and the stall timer.
 const WATCHDOG_TICK: Duration = Duration::from_millis(250);
@@ -101,19 +117,12 @@ impl RunOpts {
 /// Runs the pipeline described by `config` to completion.
 ///
 /// Returns `Err` when the run fails before data starts flowing (bad config, a
-/// missing or incompatible plugin, a rejected config, the state lock, a
-/// signal); the plugins are cancelled and reaped first. Once data flows, the
-/// outcome — success, error, or cancelled by a signal — is a [`Summary`]
-/// (already printed) with the root cause.
+/// missing or incompatible plugin, a rejected config, a failed capability
+/// gate, the state lock, a signal); the plugins are cancelled and reaped
+/// first. Once data flows, the outcome — success, error, or cancelled by a
+/// signal — is a [`Summary`] (already printed) with the root cause.
 pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summary, CoreError> {
     validate_pipeline(&config)?;
-    if let Some(parser) = &config.parser {
-        return Err(CoreError::Config(ConfigError::Validation(format!(
-            "parser: is not wired into the core yet (parser '{}'); remove the parser: block — \
-             parsing support lands in a later release",
-            parser.plugin_type
-        ))));
-    }
 
     if opts.dry_run {
         if opts.human_report {
@@ -160,11 +169,13 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     // Print the header first — before any log line — so the version and route
     // always lead the output, then the run log follows underneath it.
     let reporter = Reporter::new(opts.color);
+    let parser_type = config.parser.as_ref().map(|p| p.plugin_type.clone());
     let sink_type = config.sink.as_ref().map(|s| s.plugin_type.clone());
     if opts.human_report {
         reporter.header(
             &opts.version,
             &config.source.plugin_type,
+            parser_type.as_deref(),
             &config.destination.plugin_type,
             sink_type.as_deref(),
         );
@@ -172,6 +183,11 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
 
     let source_bin = find_plugin_binary(PluginKind::Source, &config.source.plugin_type, &opts.plugin_dir)?;
     facts.update(|f| f.source.path = Some(source_bin.clone()));
+    let parser_bin = match &config.parser {
+        Some(p) => Some(find_plugin_binary(PluginKind::Parser, &p.plugin_type, &opts.plugin_dir)?),
+        None => None,
+    };
+    facts.update(|f| f.parser.path = parser_bin.clone());
     let dest_bin =
         find_plugin_binary(PluginKind::Destination, &config.destination.plugin_type, &opts.plugin_dir)?;
     facts.update(|f| f.destination.path = Some(dest_bin.clone()));
@@ -181,9 +197,19 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     };
     facts.update(|f| f.sink.path = sink_bin.clone());
 
-    tracing::info!(source = ?source_bin, destination = ?dest_bin, sink = ?sink_bin, "spawning plugins");
+    tracing::info!(
+        source = ?source_bin,
+        parser = ?parser_bin,
+        destination = ?dest_bin,
+        sink = ?sink_bin,
+        "spawning plugins"
+    );
 
     let source_config = yaml_value_to_json(&config.source.config)?;
+    let parser_config = match &config.parser {
+        Some(p) => Some(yaml_value_to_json(&p.config)?),
+        None => None,
+    };
     let mut dest_config = yaml_value_to_json(&config.destination.config)?;
     let sink_config = match &config.sink {
         Some(s) => Some(yaml_value_to_json(&s.config)?),
@@ -198,36 +224,45 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     if config.sink.is_some() {
         let has_path = dest_config.get("path").and_then(|v| v.as_str()).is_some();
         if !has_path {
-            let scratch = allocate_scratch_dir(&config.pipeline.name)?;
+            let scratch = allocate_scratch_dir("stage", &config.pipeline.name)?;
             tracing::info!(path = %scratch.display(), "allocated staging scratch dir");
-            if !dest_config.is_object() {
-                dest_config = serde_json::Value::Object(serde_json::Map::new());
-            }
-            dest_config["path"] = serde_json::Value::String(scratch.to_string_lossy().into_owned());
+            set_config_path(&mut dest_config, "path", &scratch);
             scratch_cleanup = Some(scratch);
         }
     }
+    // A raw source that downloads its files (capability `scratch_dir`) gets
+    // a core-allocated directory, unless its config names one. Allocated
+    // during its configure (capabilities arrive first); removed only after a
+    // successful run.
+    let mut download_scratch: Option<PathBuf> = None;
 
     // Unbounded by design: the destination's event drain forwards ObjectReady
     // paths here and must never block (a full fd4 would deadlock the pump).
-    let (object_tx, object_rx) = if config.sink.is_some() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
+    let (object_tx, object_rx) = maybe_channel(config.sink.is_some());
+    // The same for the raw source's files, which go to the parser.
+    let (file_tx, file_rx) = maybe_channel(config.parser.is_some());
 
     // Two pipes, with loadsmith in the middle of the data plane:
-    //   source ──IN──▶ core (pump) ──OUT──▶ destination
-    // Neither plugin sees the other; everything flows through the control plane.
+    //   producer ──IN──▶ core (pump) ──OUT──▶ destination
+    // The producer is the source, or the parser (a raw source has no fd3).
+    // Neither side sees the other; everything flows through the control plane.
     let (in_read, in_write) = create_data_pipe()
         .map_err(|e| CoreError::PluginProcess(format!("create data pipe (in): {e}")))?;
     let (out_read, out_write) = create_data_pipe()
         .map_err(|e| CoreError::PluginProcess(format!("create data pipe (out): {e}")))?;
 
-    // Source's fd3 is the write end of the IN pipe; core keeps the read end.
-    let mut src_sp = spawn_plugin(&source_bin, Some(in_write.into_raw_fd()), StderrRoute::Forward(opts.mask.clone()))
+    // The producer's fd3 is the write end of the IN pipe; core keeps the read end.
+    let mut in_write = Some(in_write);
+    let src_fd3 = if parser_bin.is_some() { None } else { in_write.take().map(IntoRawFd::into_raw_fd) };
+    let mut src_sp = spawn_plugin(&source_bin, src_fd3, StderrRoute::Forward(opts.mask.clone()))
         .map_err(|e| CoreError::PluginIncompatible(format!("spawn source {}: {e}", source_bin.display())))?;
+    let mut prs_sp = match &parser_bin {
+        Some(bin) => Some(
+            spawn_plugin(bin, in_write.take().map(IntoRawFd::into_raw_fd), StderrRoute::Forward(opts.mask.clone()))
+                .map_err(|e| CoreError::PluginIncompatible(format!("spawn parser {}: {e}", bin.display())))?,
+        ),
+        None => None,
+    };
     // Destination's fd3 is the read end of the OUT pipe; core keeps the write end.
     let mut dst_sp = spawn_plugin(&dest_bin, Some(out_read.into_raw_fd()), StderrRoute::Forward(opts.mask.clone())).map_err(|e| {
         CoreError::PluginIncompatible(format!("spawn destination {}: {e}", dest_bin.display()))
@@ -236,7 +271,8 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     // Take the event channels (fd4) out so we can drain them concurrently —
     // a plugin blocked writing progress to a full fd4 would stall the pump.
     // The destination's drain also forwards ObjectReady paths to the sink
-    // supervisor (when a sink is attached).
+    // supervisor (when a sink is attached); a raw source's drain forwards its
+    // files to the parser feed.
     let src_event = tokio::fs::File::from_std(src_sp.event_fd_take());
     let dst_event = tokio::fs::File::from_std(dst_sp.event_fd_take());
     let (src_mask, dst_mask) = (opts.mask.clone(), opts.mask.clone());
@@ -244,9 +280,21 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         drain_events(
             ControlReader::new(BufReader::new(src_event)),
             "source",
-            EventForward { checkpoint_tx, mask: src_mask, ..Default::default() },
+            EventForward { object_tx: file_tx, checkpoint_tx, mask: src_mask, ..Default::default() },
         )
         .await;
+    });
+    let prs_events = prs_sp.as_mut().map(|sp| {
+        let event = tokio::fs::File::from_std(sp.event_fd_take());
+        let mask = opts.mask.clone();
+        tokio::spawn(async move {
+            drain_events(
+                ControlReader::new(BufReader::new(event)),
+                "parser",
+                EventForward { mask, ..Default::default() },
+            )
+            .await;
+        })
     });
     let dst_events = tokio::spawn(async move {
         drain_events(
@@ -258,11 +306,22 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     });
 
     let mut src = Peer::new(PluginKind::Source.as_str(), src_sp).with_mask(opts.mask.clone());
+    let mut prs = prs_sp.map(|sp| {
+        let mut peer = Peer::new(PluginKind::Parser.as_str(), sp).with_mask(opts.mask.clone());
+        // The parser's stdin is owned by a writer task: one `parse_object`
+        // per file must never stall the runner on a full pipe.
+        peer.queue_input();
+        peer
+    });
     let mut dst = Peer::new(PluginKind::Destination.as_str(), dst_sp).with_mask(opts.mask.clone());
+    // With a parser, the source is a raw source: its files reach the parser
+    // through the feed, and the parser is the producer.
+    let mut feed: Option<Feed> = file_rx.map(|rx| Feed::new(rx, &timeouts));
 
-    // Read the header of the source's Arrow IPC stream (its exact schema) on
-    // a blocking thread. It only completes once the source writes it, right
-    // after its `schema` message; setup waits for it before the drift check.
+    // Read the header of the producer's Arrow IPC stream (its exact schema)
+    // on a blocking thread. It only completes once the producer writes it,
+    // right after its `schema` message; setup waits for it before the drift
+    // check.
     let mut source_stream: Option<StreamOpen> =
         Some(tokio::task::spawn_blocking(move || IpcReader::new(in_read)));
 
@@ -275,9 +334,23 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
 
     // ── Setup: handshake, gates, start ────────────────────────────────────
     let setup = async {
-        let src_info = run_handshake_and_configure(
+        let wants_scratch = config.parser.is_some();
+        let pipeline_name = config.pipeline.name.clone();
+        let scratch_slot = &mut download_scratch;
+        let src_info = run_handshake_and_configure_with(
             &mut src,
-            source_config,
+            move |supports| {
+                let mut source_config = source_config;
+                let asks = supports.iter().any(|c| c == capabilities::SCRATCH_DIR);
+                let given = source_config.get(SCRATCH_DIR_KEY).and_then(|v| v.as_str()).is_some();
+                if wants_scratch && asks && !given {
+                    let dir = allocate_scratch_dir("download", &pipeline_name).map_err(Failure::new)?;
+                    tracing::info!(path = %dir.display(), "allocated download scratch dir for the source");
+                    set_config_path(&mut source_config, SCRATCH_DIR_KEY, &dir);
+                    *scratch_slot = Some(dir);
+                }
+                Ok(source_config)
+            },
             PluginKind::Source,
             &timeouts,
             &mut shutdown,
@@ -287,6 +360,17 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
             f.source.name = Some(src_info.name.clone());
             f.source.version = Some(src_info.version.clone());
         });
+        let prs_info = match (prs.as_mut(), parser_config) {
+            (Some(peer), Some(cfg)) => {
+                let info = run_handshake_and_configure(peer, cfg, PluginKind::Parser, &timeouts, &mut shutdown).await?;
+                facts.update(|f| {
+                    f.parser.name = Some(info.name.clone());
+                    f.parser.version = Some(info.version.clone());
+                });
+                Some(info)
+            }
+            _ => None,
+        };
         let dst_info = run_handshake_and_configure(
             &mut dst,
             dest_config,
@@ -299,6 +383,10 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
             f.destination.name = Some(dst_info.name.clone());
             f.destination.version = Some(dst_info.version.clone());
         });
+
+        // Capability gate: a raw source (it produces files, `object_output`)
+        // and a `parser:` go together.
+        check_parser_gates(&config, &src_info, prs_info.as_ref())?;
 
         // Capability gate: a `state:` block requires a source that supports
         // incremental loads (accepts a resume cursor, reports watermarks).
@@ -328,16 +416,29 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
                 Some(tokio::spawn(run_sink_supervisor(bin, cfg, rx, timeouts, sink_shutdown, opts.mask.clone())));
         }
 
-        // Start source (returns its schema) and destination (signals ready). The
-        // resume cursor (if any) tells an incremental source where to pick up.
-        let declared = start_source(&mut src, resume_value, &timeouts, &mut shutdown).await?;
+        // Start the producer. A plain source answers `start` with its schema.
+        // With a parser: start the parser (it answers with its schema, maybe
+        // only after its first file), then the raw source (it answers
+        // `ready` and starts announcing files), and hand the parser every
+        // file until its schema arrives.
+        let declared = match prs.as_mut() {
+            None => start_source(&mut src, resume_value, &timeouts, &mut shutdown).await?,
+            Some(parser) => {
+                tracing::debug!(plugin = "parser", "→ start");
+                parser.send(Message::Start(Default::default())).await?;
+                start_and_await_ready(&mut src, &timeouts, &mut shutdown).await?;
+                let feed = feed.as_mut().expect("a parser has a feed");
+                await_parser_schema(parser, &mut src, feed, &timeouts, &mut shutdown).await?
+            }
+        };
 
         // The Arrow IPC stream header is the authoritative schema: the `schema`
         // message is informational (and lossy from older SDKs).
-        let reader = open_source_stream(&mut src, &mut source_stream, &timeouts, &mut shutdown).await?;
+        let producer = prs.as_mut().unwrap_or(&mut src);
+        let reader = open_source_stream(producer, &mut source_stream, &timeouts, &mut shutdown).await?;
         let arrow_schema = reader.schema();
         let fields = loadsmith_arrow::protocol_fields_from_schema(&arrow_schema);
-        warn_on_schema_mismatch(&declared.fields, &fields);
+        warn_on_schema_mismatch(producer.label(), &declared.fields, &fields);
         reporter.schema(&fields);
 
         // Schema-drift guard: if the source shape changed since the recorded state,
@@ -363,17 +464,20 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
 
         start_and_await_ready(&mut dst, &timeouts, &mut shutdown).await?;
         tracing::info!("destination ready — pump starting");
-        Ok((src_info, dst_info, reader))
+        Ok((src_info, prs_info, dst_info, reader))
     }
     .await;
 
-    let (src_info, dst_info, source_reader) = match setup {
+    let (src_info, prs_info, dst_info, source_reader) = match setup {
         Ok(infos) => infos,
         Err(failure) => {
             tracing::error!("aborting the run: {}", opts.mask.apply(&failure.reason()));
             sink_trigger.trigger(halt_for(&failure));
-            abort_plugins(&mut src, &mut dst, &failure, grace).await;
+            abort_plugins(&mut src, prs.as_mut(), &mut dst, &failure, grace).await;
             let _ = src_events.await;
+            if let Some(task) = prs_events {
+                let _ = task.await;
+            }
             let _ = dst_events.await;
             if let Some(task) = state_task {
                 let _ = task.await;
@@ -381,19 +485,22 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
             if let Some(task) = sink_task {
                 let _ = task.await;
             }
-            // The source is gone, so a header read still in flight ends now.
+            // The producer is gone, so a header read still in flight ends now.
             if let Some(task) = source_stream {
                 let _ = task.await;
             }
             // The destination is gone; only now close its fd3.
             drop(out_write);
+            if let Some(dir) = &download_scratch {
+                release_download_scratch(dir, false);
+            }
             return Err(failure.error);
         }
     };
 
     // ── Data phase ────────────────────────────────────────────────────────
     // Run the data pump on a blocking thread: it copies every batch from the
-    // source's IN stream to the destination's OUT stream, reporting progress.
+    // producer's IN stream to the destination's OUT stream, reporting progress.
     tracing::info!("data pump started");
     let pump_control = Arc::new(PumpControl::default());
     let mut pump_join = {
@@ -417,15 +524,14 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         })
     });
 
-    let supervised = supervise_data_phase(
-        &mut src,
-        &mut dst,
-        &mut pump_join,
-        &pump_control,
-        &timeouts,
-        &mut shutdown,
-    )
-    .await;
+    // The producer is the parser (fed by the raw source) or the source.
+    let (producer, upstream) = match (prs.as_mut(), feed.as_mut()) {
+        (Some(parser), Some(f)) => (parser, Some(Upstream { raw: &mut src, feed: f })),
+        _ => (&mut src, None),
+    };
+    let supervised =
+        supervise_data_phase(producer, upstream, &mut dst, &mut pump_join, &pump_control, &timeouts, &mut shutdown)
+            .await;
     if let Some(h) = heartbeat {
         h.abort(); // pump finished — stop the heartbeat log
     }
@@ -436,14 +542,19 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
             tracing::error!("aborting the run: {}", opts.mask.apply(&failure.reason()));
             pump_control.abort.store(true, Ordering::Relaxed);
             sink_trigger.trigger(halt_for(failure));
-            abort_plugins(&mut src, &mut dst, failure, grace).await;
+            abort_plugins(&mut src, prs.as_mut(), &mut dst, failure, grace).await;
         }
         None => {
-            // Both plugins sent `finished`; let them exit.
-            tokio::join!(src.reap(grace), dst.reap(grace));
+            // Every plugin sent `finished`; let them exit.
+            let reap_parser = async {
+                if let Some(p) = prs.as_mut() {
+                    p.reap(grace).await;
+                }
+            };
+            tokio::join!(src.reap(grace), reap_parser, dst.reap(grace));
         }
     }
-    // The source is gone, so the pump has ended (it drains to EOF); and the
+    // The producer is gone, so the pump has ended (it drains to EOF); and the
     // destination is gone, so dropping its stream can no longer be mistaken
     // for anything.
     if pump_outcome.is_none() {
@@ -454,6 +565,9 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     tracing::info!(rows = pump_stats.rows, batches = pump_stats.batches, "data pump completed");
 
     let _ = src_events.await;
+    if let Some(task) = prs_events {
+        let _ = task.await;
+    }
     // Draining the destination's events to completion drops the ObjectReady
     // sender, which closes the supervisor's input channel — so this must finish
     // before awaiting the sink.
@@ -524,6 +638,10 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
             );
         }
     }
+    // The raw source's downloads: removed only after the whole run succeeded.
+    if let Some(dir) = &download_scratch {
+        release_download_scratch(dir, failure.is_none() && late_failure.is_none());
+    }
 
     tracing::debug!(
         source = %src_info.name,
@@ -540,18 +658,24 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         (None, None) => (SummaryStatus::Success, None, None),
     };
 
-    let src_finished = src.finished();
+    // Rows and batches read are the producer's: the parser's with a parser
+    // (a raw source reports files, not rows).
+    let produced = match prs.as_ref() {
+        Some(parser) => parser.finished(),
+        None => src.finished(),
+    };
     let dst_finished = dst.finished();
     let summary = Summary {
         pipeline_name: config.pipeline.name.clone(),
         status,
         loadsmith_version: opts.version.clone(),
         source_name: src_info.name,
+        parser_name: prs_info.map(|p| p.name),
         destination_name: dst_info.name,
         sink_name,
-        rows_read: src_finished.and_then(|f| f.rows_read).unwrap_or(pump_stats.rows),
+        rows_read: produced.and_then(|f| f.rows_read).unwrap_or(pump_stats.rows),
         rows_written: dst_finished.and_then(|f| f.rows_written).unwrap_or(0),
-        batches_read: src_finished.and_then(|f| f.batches_read).unwrap_or(pump_stats.batches),
+        batches_read: produced.and_then(|f| f.batches_read).unwrap_or(pump_stats.batches),
         batches_written: dst_finished.and_then(|f| f.batches_written).unwrap_or(0),
         objects_delivered,
         duration,
@@ -565,21 +689,87 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     Ok(summary)
 }
 
+/// The capability gates of the parser stage: a `parser:` needs a raw source
+/// (`object_output`) and a parser advertising `parse`; a raw source needs a
+/// `parser:`. Failing one is a configuration error.
+fn check_parser_gates(
+    config: &PipelineConfig,
+    src: &PluginHandshake,
+    parser: Option<&PluginHandshake>,
+) -> Result<(), Failure> {
+    let gate = |msg: String| Err(Failure::new(CoreError::Config(ConfigError::Validation(msg))));
+    let raw_source = src.supports.iter().any(|c| c == CAP_OBJECT_OUTPUT);
+    match (&config.parser, parser) {
+        (Some(p), Some(info)) => {
+            if !raw_source {
+                return gate(format!(
+                    "parser '{}' needs a source that produces files, but source '{}' streams \
+                     Arrow (missing '{CAP_OBJECT_OUTPUT}' capability); remove the parser: block",
+                    p.plugin_type, config.source.plugin_type
+                ));
+            }
+            if !info.supports.iter().any(|c| c == capabilities::PARSE) {
+                return gate(format!(
+                    "parser '{}' does not parse files (missing '{}' capability)",
+                    p.plugin_type,
+                    capabilities::PARSE
+                ));
+            }
+        }
+        _ if raw_source => {
+            return gate(format!(
+                "source '{}' produces files, not Arrow ('{CAP_OBJECT_OUTPUT}' capability): add a \
+                 parser: block to parse them",
+                config.source.plugin_type
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Removes the raw source's core-allocated download directory after a
+/// successful run. After a failure only an empty one is removed; downloaded
+/// files are kept for inspection.
+fn release_download_scratch(dir: &std::path::Path, success: bool) {
+    if success {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => tracing::debug!(path = %dir.display(), "removed download scratch dir"),
+            Err(e) => tracing::warn!(path = %dir.display(), "could not remove download scratch dir: {e}"),
+        }
+    } else if std::fs::remove_dir(dir).is_err() && dir.exists() {
+        tracing::warn!(
+            path = %dir.display(),
+            "the run did not succeed — leaving the source's downloaded files in the scratch dir"
+        );
+    }
+}
+
+/// Sets `key` to `path` in a plugin's config object (made an object if it
+/// was not one).
+fn set_config_path(config: &mut serde_json::Value, key: &str, path: &std::path::Path) {
+    if !config.is_object() {
+        *config = serde_json::Value::Object(serde_json::Map::new());
+    }
+    config[key] = serde_json::Value::String(path.to_string_lossy().into_owned());
+}
+
 /// The blocking read of the source's IPC stream header.
 type StreamOpen = tokio::task::JoinHandle<Result<IpcReader<File>, IpcError>>;
 
-/// Waits for the header of the source's Arrow IPC stream, which a source
-/// writes right after its `schema` message. Bounded by `start_seconds`
-/// (measured from here) and interrupted by `shutdown`; the source's control
-/// channel is watched meanwhile, so a source that gives up is reported as
-/// such. `task` stays `Some` until the read completes, so the abort path can
-/// reap it once the source is gone.
+/// Waits for the header of the producer's Arrow IPC stream, which a source
+/// (or a parser) writes right after its `schema` message. Bounded by
+/// `start_seconds` (measured from here) and interrupted by `shutdown`; the
+/// producer's control channel is watched meanwhile, so a producer that gives
+/// up is reported as such. `task` stays `Some` until the read completes, so
+/// the abort path can reap it once the producer is gone.
 async fn open_source_stream(
     src: &mut Peer,
     task: &mut Option<StreamOpen>,
     timeouts: &Timeouts,
     shutdown: &mut Shutdown,
 ) -> Result<IpcReader<File>, Failure> {
+    let label = src.label();
     let limit = Timeouts::limit(timeouts.start_seconds);
     let deadline = limit.map(|d| Instant::now() + d);
     let handle = task.as_mut().expect("the source stream is opened once");
@@ -590,19 +780,19 @@ async fn open_source_stream(
             res = &mut *handle => break res,
             inbound = src.next_inbound() => match src.process(inbound).await? {
                 Some(Event::Msg(Message::Finished(f))) if f.status != FinishedStatus::Success => {
-                    return Err(Failure::of("source", finished_failure("source", &f, src.mask())));
+                    return Err(Failure::of(label, finished_failure(label, &f, src.mask())));
                 }
-                // EOF on fd1: the source is exiting, and its fd3 closes with it,
-                // which ends the header read below.
+                // EOF on fd1: the producer is exiting, and its fd3 closes with
+                // it, which ends the header read below.
                 Some(Event::Eof) | Some(Event::ResendRequested) | None => {}
-                Some(Event::Msg(other)) => ignore_mid_stream("source", &other),
+                Some(Event::Msg(other)) => ignore_mid_stream(label, &other),
             },
             () = sleep_until(deadline) => {
                 return Err(Failure::by(
-                    "source",
+                    label,
                     error_codes::TIMEOUT,
                     CoreError::Timeout(format!(
-                        "source: no Arrow IPC stream header on fd3 within {}s after its schema \
+                        "{label}: no Arrow IPC stream header on fd3 within {}s after its schema \
                          (timeouts.start_seconds)",
                         timeouts.start_seconds
                     )),
@@ -613,7 +803,7 @@ async fn open_source_stream(
     *task = None;
     match opened {
         Ok(Ok(reader)) => Ok(reader),
-        Ok(Err(e)) => Err(source_failure(src, format!("the source's data stream has no valid header: {e}")).await),
+        Ok(Err(e)) => Err(source_failure(src, format!("the {label}'s data stream has no valid header: {e}")).await),
         Err(e) => Err(Failure::new(CoreError::PluginProcess(format!("stream header task: {e}")))),
     }
 }
@@ -626,9 +816,14 @@ async fn sleep_until(deadline: Option<Instant>) {
     }
 }
 
-/// Warns when a source's `schema` message does not describe its Arrow stream
-/// (a plugin built with an older SDK labels types lossily). The stream wins.
-fn warn_on_schema_mismatch(declared: &[loadsmith_protocol::Field], actual: &[loadsmith_protocol::Field]) {
+/// Warns when a producer's `schema` message does not describe its Arrow
+/// stream (a plugin built with an older SDK labels types lossily). The stream
+/// wins.
+fn warn_on_schema_mismatch(
+    label: &str,
+    declared: &[loadsmith_protocol::Field],
+    actual: &[loadsmith_protocol::Field],
+) {
     if declared == actual {
         return;
     }
@@ -648,30 +843,52 @@ fn warn_on_schema_mismatch(declared: &[loadsmith_protocol::Field], actual: &[loa
             .unwrap_or_default()
     };
     tracing::warn!(
-        "the source's schema message does not match its Arrow stream ({detail}); using the \
+        "the {label}'s schema message does not match its Arrow stream ({detail}); using the \
          stream. A plugin built with a current SDK sends the exact schema"
     );
 }
 
 /// What the data phase ended with.
 struct DataPhase {
-    /// The first failure observed; `None` ⇒ both plugins finished successfully
-    /// after the commit point.
+    /// The first failure observed; `None` ⇒ every plugin finished
+    /// successfully after the commit point.
     failure: Option<Failure>,
     pump_outcome: Option<PumpOutcome>,
 }
 
-/// Supervises the running pipeline until both plugins finished successfully
+/// With a parser: the raw source and the feed that hands its files to the
+/// parser.
+struct Upstream<'a> {
+    raw: &'a mut Peer,
+    feed: &'a mut Feed,
+}
+
+/// The next event upstream of the parser; never, without one.
+async fn upstream_next(upstream: &mut Option<Upstream<'_>>) -> FeedEvent {
+    match upstream {
+        Some(up) => up.feed.next(up.raw).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Supervises the running pipeline until every plugin finished successfully
 /// (after the commit point) or something failed. Never aborts anything
 /// itself: it returns the first failure, and the caller runs the abort path.
+///
+/// `src` is the producer of the Arrow stream: the source, or the parser.
+/// With a parser, `upstream` carries the raw source: its files keep flowing
+/// to the parser, the parser's input ends only after the raw source
+/// succeeded, and the commit point needs both to have succeeded.
 async fn supervise_data_phase(
     src: &mut Peer,
+    mut upstream: Option<Upstream<'_>>,
     dst: &mut Peer,
     pump_join: &mut tokio::task::JoinHandle<PumpOutcome>,
     pump_control: &PumpControl,
     timeouts: &Timeouts,
     shutdown: &mut Shutdown,
 ) -> DataPhase {
+    let label = src.label();
     let mut failure: Option<Failure> = None;
     let mut pump_outcome: Option<PumpOutcome> = None;
     // The commit (end-of-stream marker to the destination) runs on a blocking
@@ -692,9 +909,23 @@ async fn supervise_data_phase(
     let mut watchdog = tokio::time::interval(WATCHDOG_TICK);
 
     loop {
+        // ── The parser's input ───────────────────────────────────────────
+        // "No more files" only once every file was handed over and the raw
+        // source succeeded.
+        if let Some(up) = upstream.as_mut() {
+            if failure.is_none() {
+                up.feed.maybe_end_input(up.raw, src);
+            }
+        }
+
         // ── Commit point ─────────────────────────────────────────────────
         if failure.is_none() && !committed && commit.is_none() {
-            let source_ok = src.finished().is_some_and(|f| f.status == FinishedStatus::Success);
+            // The producer succeeded, and with a parser so did the raw
+            // source, after which (only) the parser's input was ended.
+            let upstream_ok = upstream
+                .as_ref()
+                .is_none_or(|up| src.input_closed() && Feed::raw_succeeded(up.raw));
+            let source_ok = upstream_ok && src.finished().is_some_and(|f| f.status == FinishedStatus::Success);
             if let (true, Some(out)) = (source_ok, pump_outcome.as_mut()) {
                 if out.source_clean {
                     match std::mem::replace(&mut out.output, PumpOutput::Closed) {
@@ -735,7 +966,7 @@ async fn supervise_data_phase(
                 match res {
                     Ok(Ok(())) => {
                         committed = true;
-                        tracing::info!("source finished — input to the destination ended");
+                        tracing::info!("{label} finished — input to the destination ended");
                     }
                     Ok(Err(e)) => {
                         failure = Some(Failure::of(
@@ -752,12 +983,14 @@ async fn supervise_data_phase(
                 match res {
                     Ok(out) => {
                         if let Some(e) = &out.read_error {
-                            failure = Some(source_failure(src, format!("the source's data stream is unreadable: {e}")).await);
+                            failure = Some(source_failure(src, format!("the {label}'s data stream is unreadable: {e}")).await);
                         } else if !out.source_clean {
                             failure = Some(source_failure(
                                 src,
-                                "the source's data stream ended without an end-of-stream marker \
-                                 (the source crashed or exited early)".into(),
+                                format!(
+                                    "the {label}'s data stream ended without an end-of-stream marker \
+                                     (the {label} crashed or exited early)"
+                                ),
                             ).await);
                         } else if src.finished().is_none() {
                             source_end_deadline = finish_limit.map(|d| Instant::now() + d);
@@ -774,7 +1007,15 @@ async fn supervise_data_phase(
                     Err(f) => failure = Some(f),
                     Ok(Some(Event::Msg(Message::Finished(f)))) => {
                         if f.status != FinishedStatus::Success {
-                            failure = Some(Failure::of("source", finished_failure("source", &f, src.mask())));
+                            failure = Some(Failure::of(label, finished_failure(label, &f, src.mask())));
+                        } else if upstream.is_some() && !src.input_closed() {
+                            // A parser that finishes while files may still
+                            // come would end the load early.
+                            failure = Some(Failure::by(
+                                label,
+                                error_codes::PROTOCOL_VIOLATION,
+                                CoreError::Protocol(format!("{label} reported success before its input ended")),
+                            ));
                         } else if pump_outcome.is_none() {
                             source_end_deadline = finish_limit.map(|d| Instant::now() + d);
                         }
@@ -783,16 +1024,23 @@ async fn supervise_data_phase(
                         if src.finished().is_none() {
                             let status = src.exit_status_soon().await;
                             failure = Some(Failure::of(
-                                "source",
+                                label,
                                 CoreError::PluginFailed(format!(
-                                    "source {} without sending finished",
+                                    "{label} {} without sending finished",
                                     describe_exit(status)
                                 )),
                             ));
                         }
                     }
-                    Ok(Some(Event::Msg(other))) => ignore_mid_stream("source", &other),
+                    Ok(Some(Event::Msg(other))) => ignore_mid_stream(label, &other),
                     Ok(Some(Event::ResendRequested)) | Ok(None) => {}
+                }
+            }
+            event = upstream_next(&mut upstream) => {
+                if let Some(up) = upstream.as_mut() {
+                    if let Err(f) = up.feed.handle(event, up.raw, src).await {
+                        failure = Some(f);
+                    }
                 }
             }
             inbound = dst.next_inbound() => {
@@ -858,14 +1106,17 @@ async fn supervise_data_phase(
                 }
                 if !committed && source_end_deadline.is_some_and(|d| now >= d) {
                     failure = Some(Failure::by(
-                        "source",
+                        label,
                         error_codes::TIMEOUT,
                         CoreError::Timeout(format!(
-                            "source: did not complete within {}s after its data ended \
+                            "{label}: did not complete within {}s after its data ended \
                              (timeouts.finish_seconds)",
                             timeouts.finish_seconds
                         )),
                     ));
+                }
+                if let Some(f) = upstream.as_ref().and_then(|up| up.feed.overdue(now)) {
+                    failure = Some(f);
                 }
                 if finalize_deadline.is_some_and(|d| now >= d) {
                     failure = Some(Failure::by(
@@ -889,10 +1140,11 @@ async fn supervise_data_phase(
     DataPhase { failure, pump_outcome }
 }
 
-/// The failure for a broken source data stream. When the source's control
-/// channel already explains it (a `finished` error, a crash), that is the
-/// root cause; otherwise it is the stream itself.
+/// The failure for a broken data stream of the producer (source or parser).
+/// When its control channel already explains it (a `finished` error, a
+/// crash), that is the root cause; otherwise it is the stream itself.
 async fn source_failure(src: &mut Peer, stream_problem: String) -> Failure {
+    let label = src.label();
     // The data stream and the control channel race: a failing source closes
     // fd3 right after (or before) its `finished`. Give fd1 a moment to explain.
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -907,19 +1159,19 @@ async fn source_failure(src: &mut Peer, stream_problem: String) -> Failure {
     }
     match src.finished() {
         Some(f) if f.status != FinishedStatus::Success => {
-            Failure::of("source", finished_failure("source", f, src.mask()))
+            Failure::of(label, finished_failure(label, f, src.mask()))
         }
         None if src.at_eof() => {
             let status = src.exit_status_soon().await;
             Failure::of(
-                "source",
+                label,
                 CoreError::PluginFailed(format!(
-                    "source {} without sending finished ({stream_problem})",
+                    "{label} {} without sending finished ({stream_problem})",
                     describe_exit(status)
                 )),
             )
         }
-        _ => Failure::of("source", CoreError::PluginFailed(stream_problem)),
+        _ => Failure::of(label, CoreError::PluginFailed(stream_problem)),
     }
 }
 
@@ -932,14 +1184,26 @@ fn ignore_mid_stream(label: &str, msg: &Message) {
 
 /// Sends `cancel` (or `error` to the plugin at fault) to every live plugin,
 /// waits the grace period, then kills and reaps what is left.
-async fn abort_plugins(src: &mut Peer, dst: &mut Peer, failure: &Failure, grace: Duration) {
+async fn abort_plugins(
+    src: &mut Peer,
+    mut parser: Option<&mut Peer>,
+    dst: &mut Peer,
+    failure: &Failure,
+    grace: Duration,
+) {
     // Plugins echo the reason (to stderr): it must not carry a value.
     let reason = src.mask().apply(&failure.reason());
-    for peer in [&mut *src, &mut *dst] {
+    let peers = std::iter::once(&mut *src).chain(parser.as_deref_mut()).chain(std::iter::once(&mut *dst));
+    for peer in peers {
         let code = if failure.culprit == Some(peer.label()) { failure.code } else { None };
         peer.notify_abort(&reason, code).await;
     }
-    tokio::join!(src.wind_down(grace), dst.wind_down(grace));
+    let parser_down = async {
+        if let Some(p) = parser {
+            p.wind_down(grace).await;
+        }
+    };
+    tokio::join!(src.wind_down(grace), parser_down, dst.wind_down(grace));
 }
 
 /// How a run failure is relayed to the sink stage.
@@ -967,14 +1231,17 @@ fn yaml_value_to_json(val: &serde_yaml::Value) -> Result<serde_json::Value, Core
     serde_json::to_value(val).map_err(|e| CoreError::Protocol(format!("yaml->json: {e}")))
 }
 
-/// Creates a fresh staging directory for a destination whose output a sink will
-/// deliver. Named with the pipeline and pid so concurrent runs don't collide.
-fn allocate_scratch_dir(pipeline_name: &str) -> Result<PathBuf, CoreError> {
+/// Creates a fresh scratch directory the core owns: `stage` for a
+/// destination whose output a sink will deliver, `download` for a raw source
+/// that downloads its files. Named with the purpose, the pipeline and the pid
+/// so concurrent runs (and the two purposes) don't collide. The core removes
+/// only directories it allocated.
+fn allocate_scratch_dir(purpose: &str, pipeline_name: &str) -> Result<PathBuf, CoreError> {
     let slug: String = pipeline_name
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    let dir = std::env::temp_dir().join(format!("loadsmith-stage-{slug}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("loadsmith-{purpose}-{slug}-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }

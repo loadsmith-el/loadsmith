@@ -21,6 +21,8 @@ pub struct PluginFacts {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RunFacts {
     pub source: PluginFacts,
+    /// The parser, when the pipeline has a `parser:` block.
+    pub parser: PluginFacts,
     pub destination: PluginFacts,
     pub sink: PluginFacts,
     /// The incremental watermark loaded at the start (`None`: no `state:`
@@ -53,6 +55,8 @@ pub struct Summary {
     pub status: SummaryStatus,
     pub loadsmith_version: String,
     pub source_name: String,
+    /// Parsing stage, when a parser is attached. `None` ⇒ no parser.
+    pub parser_name: Option<String>,
     pub destination_name: String,
     /// Delivery stage, when a sink is attached. `None` ⇒ no sink.
     pub sink_name: Option<String>,
@@ -98,15 +102,12 @@ impl Summary {
         println!("{rule}");
         println!("Pipeline:     {}", self.pipeline_name);
         if !self.source_name.is_empty() {
-            match &self.sink_name {
-                Some(sink) => println!(
-                    "Route:        {} → {} → {}",
-                    self.source_name, self.destination_name, sink
-                ),
-                None => {
-                    println!("Route:        {} → {}", self.source_name, self.destination_name)
-                }
-            }
+            let stages: Vec<&str> = std::iter::once(self.source_name.as_str())
+                .chain(self.parser_name.as_deref())
+                .chain(std::iter::once(self.destination_name.as_str()))
+                .chain(self.sink_name.as_deref())
+                .collect();
+            println!("Route:        {}", stages.join(" → "));
         }
         println!("Status:       {}", self.status.as_str());
         if let Some(cause) = &self.root_cause {

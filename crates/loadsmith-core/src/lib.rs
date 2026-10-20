@@ -4,6 +4,7 @@ pub mod events;
 pub mod fmt;
 pub mod lifecycle;
 pub mod load;
+pub mod parser_feed;
 pub mod peer;
 pub mod providers;
 pub mod pump;

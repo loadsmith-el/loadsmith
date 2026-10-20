@@ -90,10 +90,19 @@ impl From<CoreError> for Failure {
     }
 }
 
+/// Where the core's control lines to a plugin go.
+enum Outlet {
+    /// Written to the plugin's stdin in place (each `send` waits for it).
+    Direct(ControlWriter<ChildStdin>),
+    /// Queued to a writer task that owns the plugin's stdin
+    /// ([`Peer::queue_input`]): `send` never waits on a full pipe.
+    Queued(mpsc::UnboundedSender<Message>),
+}
+
 pub struct Peer {
     label: &'static str,
     child: Child,
-    writer: Option<ControlWriter<ChildStdin>>,
+    writer: Option<Outlet>,
     rx: UnboundedReceiver<Inbound>,
     reader_task: tokio::task::JoinHandle<()>,
     last_sent: Option<Message>,
@@ -135,7 +144,7 @@ impl Peer {
         Self {
             label,
             child,
-            writer: Some(ControlWriter::new(control_in)),
+            writer: Some(Outlet::Direct(ControlWriter::new(control_in))),
             rx,
             reader_task,
             last_sent: None,
@@ -183,15 +192,47 @@ impl Peer {
     /// Sends without remembering (`ping`, `resend`).
     pub async fn send_raw(&mut self, msg: &Message) -> Result<(), CoreError> {
         let label = self.label;
-        let writer = self.writer.as_mut().ok_or_else(|| {
-            CoreError::PluginProcess(format!("{label}: control input already closed"))
-        })?;
-        writer.send(msg).await.map_err(|e| CoreError::PluginProcess(format!("{label}: write: {e}")))
+        let closed = || CoreError::PluginProcess(format!("{label}: control input already closed"));
+        match self.writer.as_mut().ok_or_else(closed)? {
+            Outlet::Direct(writer) => {
+                writer.send(msg).await.map_err(|e| CoreError::PluginProcess(format!("{label}: write: {e}")))
+            }
+            Outlet::Queued(tx) => tx.send(msg.clone()).map_err(|_| closed()),
+        }
     }
 
-    /// Closes the plugin's stdin (EOF). For a sink, "no more objects".
+    /// Hands the plugin's stdin to a writer task: from now on `send` queues
+    /// the line and returns at once, so a plugin that reads its stdin slowly
+    /// (a parser fed one `parse_object` per file while it is busy writing
+    /// Arrow) never stalls the caller's supervision loop. Lines keep their
+    /// order; [`close_input`](Self::close_input) ends stdin after the queued
+    /// ones.
+    pub fn queue_input(&mut self) {
+        let Some(Outlet::Direct(mut writer)) = self.writer.take() else { return };
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let label = self.label;
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if let Err(e) = writer.send(&msg).await {
+                    // The plugin is gone; its fd1 reports that.
+                    tracing::debug!(plugin = label, "control write failed: {e}");
+                    break;
+                }
+            }
+            // Dropping the writer closes the plugin's stdin (EOF).
+        });
+        self.writer = Some(Outlet::Queued(tx));
+    }
+
+    /// Closes the plugin's stdin (EOF), after any queued lines. For a sink,
+    /// "no more objects"; for a parser, "no more files".
     pub fn close_input(&mut self) {
         self.writer = None;
+    }
+
+    /// Whether the core closed the plugin's stdin.
+    pub fn input_closed(&self) -> bool {
+        self.writer.is_none()
     }
 
     /// The next raw line from the plugin. Cancel-safe; hand the result to

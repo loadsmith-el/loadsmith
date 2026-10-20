@@ -32,10 +32,11 @@ pub struct RunContext {
 impl RunContext {
     pub fn learn(&mut self, config: &PipelineConfig) {
         self.pipeline = Some(config.pipeline.name.clone());
-        self.route = vec![
-            ("source", config.source.plugin_type.clone()),
-            ("destination", config.destination.plugin_type.clone()),
-        ];
+        self.route = vec![("source", config.source.plugin_type.clone())];
+        if let Some(parser) = &config.parser {
+            self.route.push(("parser", parser.plugin_type.clone()));
+        }
+        self.route.push(("destination", config.destination.plugin_type.clone()));
         if let Some(sink) = &config.sink {
             self.route.push(("sink", sink.plugin_type.clone()));
         }
@@ -136,6 +137,7 @@ pub fn build(rec: &RunRecord<'_>) -> RunDocument {
         .map(|(kind, plugin_type)| {
             let facts = match *kind {
                 "source" => &rec.facts.source,
+                "parser" => &rec.facts.parser,
                 "destination" => &rec.facts.destination,
                 _ => &rec.facts.sink,
             };
@@ -268,6 +270,32 @@ mod tests {
         assert_eq!(v["duration_ms"], 7);
         assert_eq!(v["state"]["watermark_before"], Value::Null);
         assert_eq!(v["sink"], Value::Null);
+    }
+
+    #[test]
+    fn a_parser_is_a_route_stage_between_source_and_destination() {
+        let yaml = "pipeline:\n  name: p\nsource:\n  type: file\nparser:\n  type: csv\n\
+                    destination:\n  type: postgres\n";
+        let (config, _) = loadsmith_config::parse_pipeline_yaml(yaml).unwrap();
+        let mut ctx = RunContext::default();
+        ctx.learn(&config);
+        let mut facts = RunFacts::default();
+        facts.parser.name = Some("loadsmith-parser-csv".into());
+        let doc = build(&RunRecord {
+            ctx: &ctx,
+            facts: &facts,
+            summary: None,
+            error: None,
+            mask: &MaskList::new(),
+            exit_code: 0,
+            started: UNIX_EPOCH,
+            finished: UNIX_EPOCH,
+        });
+        let v = serde_json::to_value(&doc).unwrap();
+        let kinds: Vec<&str> = v["route"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["source", "parser", "destination"]);
+        assert_eq!(v["route"][1]["type"], "csv");
+        assert_eq!(v["route"][1]["name"], "loadsmith-parser-csv");
     }
 
     #[test]

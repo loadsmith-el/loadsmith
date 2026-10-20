@@ -457,7 +457,12 @@ pub mod capabilities {
     /// Sink: delivers staged files (`deliver_object`).
     pub const OBJECT_DELIVERY: &str = "object_delivery";
     /// Parser: turns files (`parse_object`) into Arrow batches on fd3.
+    /// Required of a `parser:`.
     pub const PARSE: &str = "parse";
+    /// Raw source: downloads its files to a local directory. The core then
+    /// adds `scratch_dir` (a fresh directory) to its config unless the user
+    /// set one, and removes that directory after a successful run.
+    pub const SCRATCH_DIR: &str = "scratch_dir";
     /// Provider: answers `resolve` with `resolved`.
     pub const RESOLVE: &str = "resolve";
 }

@@ -23,20 +23,19 @@ impl Reporter {
         Self { color }
     }
 
-    /// Printed once, before data starts flowing. `sink` is shown only when a
-    /// delivery stage is attached.
-    pub fn header(&self, version: &str, source: &str, destination: &str, sink: Option<&str>) {
-        let arrow = self.dim("→");
+    /// Printed once, before data starts flowing. `parser` and `sink` are
+    /// shown only when that stage is attached.
+    pub fn header(&self, version: &str, source: &str, parser: Option<&str>, destination: &str, sink: Option<&str>) {
+        let arrow = format!(" {} ", self.dim("→"));
+        let stages: Vec<&str> =
+            std::iter::once(source).chain(parser).chain(std::iter::once(destination)).chain(sink).collect();
         println!();
         println!("{} {}", self.bold("loadsmith"), self.dim(version));
-        match sink {
-            Some(sink) => println!("{source} {arrow} {destination} {arrow} {sink}"),
-            None => println!("{source} {arrow} {destination}"),
-        }
+        println!("{}", stages.join(&arrow));
         println!();
     }
 
-    /// Reports the source's schema (from its Arrow stream header) — one line
+    /// Reports the schema of the Arrow stream (the source's, or the parser's) (from its Arrow stream header) — one line
     /// per field with its exact type (`timestamp(us, UTC)`,
     /// `decimal128(12, 2)`, `list<utf8?>`, a nullable child marked `?`) and
     /// `not null` on a non-nullable column, plus a summary line. Emitted

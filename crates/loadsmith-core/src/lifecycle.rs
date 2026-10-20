@@ -43,6 +43,19 @@ pub async fn run_handshake_and_configure(
     timeouts: &Timeouts,
     shutdown: &mut Shutdown,
 ) -> Result<PluginHandshake, Failure> {
+    run_handshake_and_configure_with(peer, |_| Ok(config), expected_kind, timeouts, shutdown).await
+}
+
+/// [`run_handshake_and_configure`], with the config built from the
+/// capabilities the plugin advertised (they arrive before `configure`): for
+/// a raw source that asks for a scratch directory.
+pub async fn run_handshake_and_configure_with(
+    peer: &mut Peer,
+    config: impl FnOnce(&[String]) -> Result<serde_json::Value, Failure>,
+    expected_kind: PluginKind,
+    timeouts: &Timeouts,
+    shutdown: &mut Shutdown,
+) -> Result<PluginHandshake, Failure> {
     let label = peer.label();
     let handshake_limit = Timeouts::limit(timeouts.handshake_seconds);
 
@@ -105,6 +118,7 @@ pub async fn run_handshake_and_configure(
     };
 
     // Send configuration
+    let config = config(&supports)?;
     tracing::debug!(plugin = %label, "→ configure");
     peer.send(Message::Configure(Configure { config })).await?;
 
