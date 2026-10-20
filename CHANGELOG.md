@@ -121,6 +121,9 @@ release notes in their repositories.
 
 ### Fixed
 
+- The core no longer warns "ignoring unexpected message on the event channel"
+  for every `object_parsed` a parser sends; it is logged at debug level.
+
 - A source that sends `finished` while the core still reads its Arrow stream
   header (a small source) no longer logs "ignoring unexpected control
   message"; the `finished` was always kept for the commit point. On the

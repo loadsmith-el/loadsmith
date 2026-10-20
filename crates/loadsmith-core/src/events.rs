@@ -64,7 +64,7 @@ pub async fn hold_events<R: AsyncBufRead + Unpin>(mut reader: ControlReader<R>) 
 /// Drains the log/progress event channel (fd4) of a plugin, forwarding to
 /// `tracing` (stderr, controlled by `--log-level`) and routing structured
 /// events (`ObjectReady`, `Checkpoint`, `Committed`) to the supervisors via
-/// `forward`.
+/// `forward` (`ObjectParsed` is only logged).
 ///
 /// Draining is mandatory: with loadsmith in the data path, a plugin that blocks
 /// writing to a full fd4 pipe would stall the whole pipeline. Running this
@@ -90,6 +90,17 @@ pub async fn drain_events<R: AsyncBufRead + Unpin>(
                 if let Some(tx) = &forward.object_tx {
                     let _ = tx.send(PathBuf::from(o.path));
                 }
+            }
+            // Informational, from a parser: one per file it finished.
+            Ok(Some(Message::ObjectParsed(o))) => {
+                tracing::debug!(
+                    plugin,
+                    path = %o.path,
+                    rows = o.rows,
+                    batches = o.batches,
+                    last_batch_seq = o.last_batch_seq,
+                    "object parsed"
+                );
             }
             Ok(Some(Message::Checkpoint(c))) => {
                 tracing::debug!(plugin, batch_seq = c.batch_seq, "source checkpoint");
