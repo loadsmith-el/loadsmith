@@ -48,3 +48,40 @@ fn error_fixture_codes_are_the_published_constants() {
         [UNSUPPORTED_PROTOCOL_VERSION, WRONG_PLUGIN_KIND, PROTOCOL_VIOLATION, MALFORMED_MESSAGE, TIMEOUT]
     );
 }
+
+#[test]
+fn schema_vocabulary_matches_golden_fixture() {
+    let msgs = check_fixture("schema_v1.jsonl", include_str!("fixtures/schema_v1.jsonl"));
+    for msg in &msgs {
+        let Message::Schema(s) = msg else { panic!("not a schema: {msg:?}") };
+        for f in &s.fields {
+            assert!(!f.field_type.is_unknown(), "{} parsed as unknown", f.name);
+        }
+    }
+}
+
+/// Plugins built with an SDK before the rich vocabulary send bare type
+/// strings, no `nullable`, and `timestamp_ms`. They must keep parsing.
+#[test]
+fn legacy_schema_messages_still_parse() {
+    use loadsmith_protocol::{Field, FieldType};
+    let line = r#"{"type":"schema","fields":[{"name":"id","type":"int64"},{"name":"name","type":"utf8"},{"name":"created_at","type":"timestamp_ms"}]}"#;
+    let Message::Schema(s) = serde_json::from_str(line).unwrap() else { panic!() };
+    assert_eq!(
+        s.fields,
+        [
+            Field::new("id", FieldType::Int64),
+            Field::new("name", FieldType::Utf8),
+            Field::new("created_at", FieldType::timestamp_ms()),
+        ]
+    );
+}
+
+/// A type from a newer vocabulary never makes the message malformed.
+#[test]
+fn unknown_field_types_do_not_fail_the_message() {
+    let line = r#"{"type":"schema","fields":[{"name":"g","type":"geometry","srid":4326},{"name":"id","type":"int64"}]}"#;
+    let Message::Schema(s) = serde_json::from_str(line).unwrap() else { panic!() };
+    assert!(s.fields[0].field_type.is_unknown());
+    assert!(!s.fields[1].field_type.is_unknown());
+}

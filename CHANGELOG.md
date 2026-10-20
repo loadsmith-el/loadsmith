@@ -45,6 +45,18 @@ release notes in their repositories.
   [CLI reference](docs/src/reference/cli.md#exit-codes).
 - The run summary has a `Cause:` line with the root cause when a run fails or
   is cancelled.
+- Protocol: a **complete field-type vocabulary** for the `schema` message,
+  covering Arrow's common types with their parameters: `int8`…`uint64`,
+  `float16`, `decimal128`/`decimal256` (precision, scale), `large_utf8`,
+  `utf8_view`, `large_binary`, `binary_view`, `fixed_size_binary`, `date64`,
+  `time32`/`time64`, `timestamp` (unit `s`/`ms`/`us`/`ns`, optional
+  `timezone`), `duration`, `interval`, `list`/`large_list`/`fixed_size_list`,
+  `struct`, `map`, `dictionary`, `null`, and a per-field `nullable`. Parameters
+  sit beside `type` in the field object. Older plugins keep working: bare type
+  strings and `timestamp_ms` still parse, and `nullable` defaults to `true`. An
+  unknown type (or a known one with invalid parameters) is read as unknown and
+  never fails a run. See the
+  [messages reference](docs/src/protocol/messages.md#schema).
 - SDK: every plugin kind reads its control channel concurrently with its
   work, answers `ping`, honours `resend`, and stops on `cancel`, `error`, or a
   lost core. `cancel()` is now called whenever a run will not complete after
@@ -85,6 +97,13 @@ release notes in their repositories.
   `rust:1-alpine`, run the workspace tests on each architecture before
   building, and build with `--locked`. The hermetic `Dockerfile` uses the same
   pinned image. Workflow actions moved to their current major versions.
+- SDK: a source's `schema` message is now derived from its Arrow schema
+  exactly. Before, every timestamp unit was labelled `timestamp_ms` and every
+  other type outside nine names (a postgres array, a decimal, a time) was
+  reported as `utf8`. Crate API: `loadsmith_protocol::Field` gains `nullable`
+  (build fields with `Field::new`), `FieldType` gains the new types, and
+  `loadsmith-arrow` gains exact Arrow ↔ protocol conversions
+  (`protocol_fields_from_schema`, `arrow_type_from_protocol`, …).
 - `loadsmith-core`, `loadsmith-config` and `loadsmith-cli` are marked
   `publish = false`.
 - `async-trait` 0.1.89 → 0.1.92, which clears 17 clippy `double_must_use`

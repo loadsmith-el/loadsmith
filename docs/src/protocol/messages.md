@@ -180,45 +180,100 @@ receiving `start`, before writing any Arrow data to fd3.
 {
   "type": "schema",
   "fields": [
-    {"name": "id",         "type": "utf8"},
-    {"name": "amount",     "type": "float64"},
-    {"name": "created_at", "type": "timestamp_ms"},
-    {"name": "is_active",  "type": "bool"}
+    {"name": "id",         "type": "int64", "nullable": false},
+    {"name": "amount",     "type": "decimal128", "precision": 12, "scale": 2, "nullable": true},
+    {"name": "created_at", "type": "timestamp", "unit": "us", "timezone": "UTC", "nullable": true},
+    {"name": "tags",       "type": "list",
+                           "item": {"name": "item", "type": "utf8", "nullable": true},
+                           "nullable": true}
   ]
 }
 ```
 
 | Field | Type | Description |
 |---|---|---|
-| `fields` | array of Field | A summary of the Arrow schema (see the note below) |
+| `fields` | array of Field | The columns, in order |
 
-**Field object:**
+**Field object.** A JSON object with the column's `name`, its `type`, the
+type's parameters beside `type` in the same object, and `nullable`:
 
-| Field | Type | Values |
+| Key | Type | Description |
 |---|---|---|
-| `name` | string | Column name |
-| `type` | string | One of the types below |
+| `name` | string | Column name. Required |
+| `type` | string | A type name from the table below. Required |
+| *(parameters)* | | Per type, see the table |
+| `nullable` | bool | Whether the column may hold nulls. Optional; absent means `true` |
 
-**Available types:**
+A child that is itself a field (a list `item`, a `struct` member, a `map`
+`key`/`value`) is a full field object with its own `name` and `nullable`. A
+child that is only a type (a `dictionary`'s `index` and `value`) is a **type
+object**: a field object without `name` and `nullable`, such as
+`{"type": "int32"}`.
 
-| Type string | Arrow type | Notes |
+**Types.** The names follow Arrow's logical types; each maps to exactly one
+Arrow type:
+
+| `type` | Parameters | Arrow type |
 |---|---|---|
-| `"int32"` | `Int32` | 32-bit signed integer |
-| `"int64"` | `Int64` | 64-bit signed integer |
-| `"float32"` | `Float32` | 32-bit IEEE 754 |
-| `"float64"` | `Float64` | 64-bit IEEE 754 |
-| `"utf8"` | `Utf8` | UTF-8 string |
-| `"bool"` | `Boolean` | Boolean |
-| `"date32"` | `Date32` | Days since Unix epoch (1970-01-01) |
-| `"timestamp_ms"` | `Timestamp(Millisecond, None)` | Milliseconds since Unix epoch |
-| `"binary"` | `Binary` | Raw byte array |
+| `null` | — | `Null` |
+| `bool` | — | `Boolean` |
+| `int8`, `int16`, `int32`, `int64` | — | `Int8` … `Int64` |
+| `uint8`, `uint16`, `uint32`, `uint64` | — | `UInt8` … `UInt64` |
+| `float16`, `float32`, `float64` | — | `Float16` … `Float64` |
+| `decimal128` | `precision` (1–38), `scale` (integer, may be negative; default 0) | `Decimal128(p, s)` |
+| `decimal256` | `precision` (1–76), `scale` | `Decimal256(p, s)` |
+| `utf8`, `large_utf8`, `utf8_view` | — | `Utf8`, `LargeUtf8`, `Utf8View` |
+| `binary`, `large_binary`, `binary_view` | — | `Binary`, `LargeBinary`, `BinaryView` |
+| `fixed_size_binary` | `byte_width` | `FixedSizeBinary(n)` |
+| `date32` | — | `Date32` (days since 1970-01-01) |
+| `date64` | — | `Date64` (milliseconds since the epoch) |
+| `time32` | `unit`: `s` or `ms` | `Time32(unit)` |
+| `time64` | `unit`: `us` or `ns` | `Time64(unit)` |
+| `timestamp` | `unit`: `s`, `ms`, `us` or `ns`; `timezone` (optional: an IANA name such as `UTC` or an offset such as `+02:00`; absent means no time zone) | `Timestamp(unit, tz)` |
+| `duration` | `unit`: `s`, `ms`, `us` or `ns` | `Duration(unit)` |
+| `interval` | `unit`: `year_month`, `day_time` or `month_day_nano` | `Interval(unit)` |
+| `list`, `large_list` | `item` (field) | `List`, `LargeList` |
+| `fixed_size_list` | `item` (field), `size` | `FixedSizeList(item, size)` |
+| `struct` | `fields` (array of fields) | `Struct` |
+| `map` | `key` (field), `value` (field), `keys_sorted` (bool, default `false`) | `Map` (entries struct named `entries`) |
+| `dictionary` | `index` (type object, an integer type), `value` (type object) | `Dictionary(index, value)` |
 
-> **Note:** the `schema` message is a summary label set, not the authoritative
-> schema. The exact Arrow types travel in the IPC stream header on fd3. The SDK
-> derives this message from the real Arrow schema lossily: any
-> `Timestamp(unit, tz)` is labelled `timestamp_ms`, `LargeUtf8` becomes `utf8`,
-> `LargeBinary` becomes `binary`, and every other type falls back to `utf8`. The
-> core uses it for the run report and the incremental-state schema fingerprint.
+Arrow types outside this vocabulary (`union`, `run_end_encoded`, `list_view`,
+`large_list_view`) are sent with that name and no parameters, and every
+receiver treats them as unknown (below). Field metadata is not carried.
+
+**Older plugins.** Plugins built with an SDK before this vocabulary send only
+`name` and `type` (no `nullable`) and use the type names `int32`, `int64`,
+`float32`, `float64`, `utf8`, `bool`, `date32`, `binary` and `timestamp_ms`.
+All of them stay valid: `nullable` defaults to `true`, and `timestamp_ms` reads
+as `{"type": "timestamp", "unit": "ms"}` (no time zone). A new plugin must not
+send `timestamp_ms`.
+
+**Tolerant reading.** The `schema` message is informational; the
+authoritative schema is the Arrow IPC stream header on fd3 (see below). A
+receiver therefore never fails a run over a field type:
+
+- a `type` it does not know (from a newer vocabulary, or an Arrow type outside
+  it) is read as *unknown*, keeping the raw name, and shown as
+  `<name> (unknown)` in the run log;
+- a known `type` with missing or invalid parameters (a `decimal128` without
+  `precision`, a `time32` in `ns`) is read as unknown too;
+- unknown extra keys are ignored.
+
+Only a field that is not an object, or has no string `name` or `type`, makes
+the message malformed (and subject to [`resend`](reference.md#malformed-lines-and-resend)).
+
+New types and new optional parameters are added in minor releases, so a plugin
+that emits a type newer than the engine still runs: the engine shows it as
+unknown, and the data itself flows through the IPC stream untouched.
+
+> **Authoritative schema.** The exact Arrow schema travels in the IPC stream
+> header on fd3. The core reads that header before it starts the destination,
+> and uses it for the run log and for the incremental-state
+> [schema fingerprint](../architecture/incremental-state.md#state-file-format).
+> The SDK derives the `schema` message from the same Arrow schema exactly. If a
+> (non-SDK) plugin's message disagrees with its stream, the core logs a warning
+> and goes by the stream.
 
 ---
 

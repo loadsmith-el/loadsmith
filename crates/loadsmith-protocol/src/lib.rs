@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+mod schema;
+pub use schema::{Field, FieldType, IntervalUnit, TimeUnit};
+
 // ── Top-level message enum ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,47 +165,6 @@ pub struct Committed {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schema {
     pub fields: Vec<Field>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Field {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub field_type: FieldType,
-}
-
-/// Arrow-compatible type names used in the protocol.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum FieldType {
-    Int32,
-    Int64,
-    Float32,
-    Float64,
-    Utf8,
-    Bool,
-    Date32,
-    TimestampMs,
-    Binary,
-}
-
-/// Matches the protocol's own `snake_case` wire representation — what the
-/// human report shows is exactly what appears on the wire.
-impl std::fmt::Display for FieldType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            FieldType::Int32 => "int32",
-            FieldType::Int64 => "int64",
-            FieldType::Float32 => "float32",
-            FieldType::Float64 => "float64",
-            FieldType::Utf8 => "utf8",
-            FieldType::Bool => "bool",
-            FieldType::Date32 => "date32",
-            FieldType::TimestampMs => "timestamp_ms",
-            FieldType::Binary => "binary",
-        };
-        write!(f, "{s}")
-    }
 }
 
 // ── Progress ──────────────────────────────────────────────────────────────────
@@ -579,9 +541,9 @@ mod tests {
     fn schema_roundtrip() {
         let msg = Message::Schema(Schema {
             fields: vec![
-                Field { name: "id".into(), field_type: FieldType::Int64 },
-                Field { name: "nome".into(), field_type: FieldType::Utf8 },
-                Field { name: "ativo".into(), field_type: FieldType::Bool },
+                Field::new("id", FieldType::Int64).with_nullable(false),
+                Field::new("nome", FieldType::Utf8),
+                Field::new("ativo", FieldType::Bool),
             ],
         });
         if let Message::Schema(s) = roundtrip(&msg) {

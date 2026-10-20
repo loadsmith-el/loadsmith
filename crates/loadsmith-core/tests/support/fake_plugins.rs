@@ -323,10 +323,8 @@ fn raw_source(scenario: &str) -> ! {
     raw.send(&Message::ConfigureAck(ConfigureAck::ok()));
     assert!(matches!(raw.recv(true), Message::Start(_)));
     raw.send(&Message::Schema(loadsmith_protocol::Schema {
-        fields: vec![loadsmith_protocol::Field {
-            name: "id".into(),
-            field_type: loadsmith_protocol::FieldType::Int64,
-        }],
+        fields: vec![loadsmith_protocol::Field::new("id", loadsmith_protocol::FieldType::Int64)
+            .with_nullable(false)],
     }));
 
     let fd3 = unsafe { std::fs::File::from_raw_fd(3) };

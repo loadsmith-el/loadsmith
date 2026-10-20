@@ -536,7 +536,7 @@ mod tests {
         loadsmith_protocol::Schema {
             fields: fields
                 .iter()
-                .map(|(n, t)| loadsmith_protocol::Field { name: (*n).into(), field_type: t.clone() })
+                .map(|(n, t)| loadsmith_protocol::Field::new(*n, t.clone()))
                 .collect(),
         }
     }

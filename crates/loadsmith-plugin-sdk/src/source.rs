@@ -105,7 +105,10 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin>(
 
     // ── Schema ────────────────────────────────────────────────────────────
     let schema = plugin.schema().await.map_err(|e| Flow::fatal("SCHEMA_FAILED", e))?;
-    let protocol_fields = schema_to_protocol_fields(&schema);
+    // The exact protocol form of the Arrow schema (types, units, time zones,
+    // precision, nullability, children). The IPC header written next carries
+    // the same schema and is what the core treats as authoritative.
+    let protocol_fields = loadsmith_arrow::protocol_fields_from_schema(&schema);
     ctl.send(Message::Schema(loadsmith_protocol::Schema { fields: protocol_fields })).await?;
 
     // ── Data loop (Arrow IPC on fd3) ──────────────────────────────────────
@@ -173,29 +176,4 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin>(
 
     ctl.send(Message::Finished(Finished::success_source(rows_total, batches_total))).await?;
     Ok(())
-}
-
-fn schema_to_protocol_fields(schema: &Schema) -> Vec<loadsmith_protocol::Field> {
-    use arrow_schema::DataType;
-    use loadsmith_protocol::{Field, FieldType};
-
-    schema
-        .fields()
-        .iter()
-        .map(|f| Field {
-            name: f.name().clone(),
-            field_type: match f.data_type() {
-                DataType::Int32 => FieldType::Int32,
-                DataType::Int64 => FieldType::Int64,
-                DataType::Float32 => FieldType::Float32,
-                DataType::Float64 => FieldType::Float64,
-                DataType::Utf8 | DataType::LargeUtf8 => FieldType::Utf8,
-                DataType::Boolean => FieldType::Bool,
-                DataType::Date32 => FieldType::Date32,
-                DataType::Timestamp(_, _) => FieldType::TimestampMs,
-                DataType::Binary | DataType::LargeBinary => FieldType::Binary,
-                _ => FieldType::Utf8,
-            },
-        })
-        .collect()
 }

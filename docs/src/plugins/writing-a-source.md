@@ -236,11 +236,16 @@ use loadsmith_arrow::schema_from_protocol_fields;
 use loadsmith_protocol::{Field, FieldType};
 
 let fields = vec![
-    Field { name: "id".into(), field_type: FieldType::Utf8 },
-    Field { name: "amount".into(), field_type: FieldType::Float64 },
+    Field::new("id", FieldType::Utf8).with_nullable(false),
+    Field::new("amount", FieldType::Decimal128 { precision: 12, scale: 2 }),
 ];
 let schema = schema_from_protocol_fields(&fields);
 ```
+
+You never build the `schema` message yourself: the SDK derives it from the
+Arrow `Schema` you return, exactly (types, units, time zones, precision,
+nullability and nested children). See the
+[type vocabulary](../protocol/messages.md#schema).
 
 This needs `loadsmith-protocol` as a dependency too (a git dep from the same repo
 and `rev` as `loadsmith-plugin-sdk`). Alternatively, build the Arrow `Schema`
@@ -258,9 +263,17 @@ Arrow types cover most SQL types, but some require special handling:
 | DOUBLE, FLOAT8 | `Float64` | |
 | BOOLEAN | `Boolean` | |
 | DATE | `Date32` | days since Unix epoch |
-| TIMESTAMP | `Timestamp(Millisecond, None)` | millis since Unix epoch |
+| TIMESTAMP | `Timestamp(Microsecond, None)` | pick the unit that matches the database's precision |
+| TIMESTAMPTZ | `Timestamp(Microsecond, Some("UTC"))` | normalise to UTC |
+| NUMERIC(p, s), DECIMAL(p, s) | `Decimal128(p, s)` | `Decimal256` above 38 digits |
+| TIME | `Time64(Microsecond)` | |
 | BYTEA, BLOB | `Binary` | raw bytes |
-| VARCHAR, TEXT, NUMERIC, DECIMAL, TIME | `Utf8` | stringify everything else |
+| arrays | `List(item)` | |
+| VARCHAR, TEXT | `Utf8` | also a safe fallback for types you cannot map |
+
+Every one of these is in the protocol's
+[type vocabulary](../protocol/messages.md#schema), so the run log and the
+schema fingerprint show the real type.
 
 **Lesson from the Postgres source:** the binary wire protocol for some databases
 does not decode `NUMERIC`, `DECIMAL`, or `TIME` out of the box. The Postgres

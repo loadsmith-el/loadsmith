@@ -288,15 +288,35 @@ is optional).
 **Plugin → Core. Sources only.** Sent before the first batch. Describes the schema of the data that will be produced.
 
 ```jsonl
-{"type":"schema","fields":[{"name":"id","type":"int64"},{"name":"name","type":"utf8"},{"name":"created_at","type":"timestamp_ms"}]}
+{"type":"schema","fields":[{"name":"id","type":"int64","nullable":false},{"name":"name","type":"utf8","nullable":true},{"name":"created_at","type":"timestamp","unit":"us","timezone":"UTC","nullable":true}]}
 ```
 
-`fields` entries:
+`fields` entries are field objects: `name` (string), `type` (string), the
+type's parameters beside `type`, and `nullable` (bool, optional, default
+`true`). Nested children (`item`, struct `fields`, map `key`/`value`) are field
+objects; a dictionary's `index`/`value` are type objects (no `name`/`nullable`).
 
-| Field | Type | Description |
-|---|---|---|
-| `name` | `string` | Column name |
-| `type` | `string` | Arrow type: `int32`, `int64`, `float32`, `float64`, `utf8`, `bool`, `date32`, `timestamp_ms`, `binary` |
+| `type` | Parameters |
+|---|---|
+| `null`, `bool`, `int8`…`int64`, `uint8`…`uint64`, `float16`, `float32`, `float64` | — |
+| `decimal128`, `decimal256` | `precision`, `scale` |
+| `utf8`, `large_utf8`, `utf8_view`, `binary`, `large_binary`, `binary_view` | — |
+| `fixed_size_binary` | `byte_width` |
+| `date32`, `date64` | — |
+| `time32` (`s`/`ms`), `time64` (`us`/`ns`), `duration` | `unit` |
+| `timestamp` | `unit` (`s`/`ms`/`us`/`ns`), optional `timezone` |
+| `interval` | `unit` (`year_month`/`day_time`/`month_day_nano`) |
+| `list`, `large_list` | `item` |
+| `fixed_size_list` | `item`, `size` |
+| `struct` | `fields` |
+| `map` | `key`, `value`, `keys_sorted` |
+| `dictionary` | `index`, `value` |
+
+The legacy name `timestamp_ms` (older SDKs) still reads as a millisecond
+timestamp without a time zone. An unknown `type`, or a known one with invalid
+parameters, is read as unknown and never fails the run: the authoritative
+schema is the Arrow IPC header on fd3. Full rules:
+[messages reference](../docs/src/protocol/messages.md#schema).
 
 ---
 
