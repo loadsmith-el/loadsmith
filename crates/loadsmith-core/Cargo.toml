@@ -39,3 +39,8 @@ harness = false
 [[test]]
 name    = "providers"
 harness = false
+
+# End-to-end parser-stage tests: raw source → parser → destination.
+[[test]]
+name    = "parser"
+harness = false

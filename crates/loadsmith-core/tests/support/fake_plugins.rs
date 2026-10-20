@@ -12,6 +12,9 @@
 //! - `provider-fake` is an SDK provider: it resolves references from its
 //!   `values` config and can fail, hang, crash or leak a value into its logs
 //!   (see [`FakeProvider`]).
+//! - `source-files` is an SDK raw source (`object_output`) announcing the
+//!   files listed in its config, and `parser-fake` an SDK parser of a tiny
+//!   text format (see [`FakeFiles`], [`FakeParser`]).
 //! - `source-<scenario>` for the scenarios in [`RAW_SOURCES`] are hand-rolled
 //!   protocol speakers that misbehave on the wire in ways the SDK never would
 //!   (malformed lines, unknown message types, ignoring `cancel`/`resend`).
@@ -27,7 +30,9 @@ use anyhow::Result;
 use arrow_array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use async_trait::async_trait;
-use loadsmith_plugin_sdk::{DestinationPlugin, ProviderPlugin, ResolveFailure, SourcePlugin};
+use loadsmith_plugin_sdk::{
+    DestinationPlugin, ObjectSourcePlugin, ParserPlugin, ProviderPlugin, ResolveFailure, SourcePlugin,
+};
 use loadsmith_protocol::{
     CapabilitiesResponse, ConfigureAck, Finished, HandshakeAck, Message, PluginKind,
 };
@@ -45,6 +50,8 @@ pub fn install(dir: &Path) -> PathBuf {
         "loadsmith-source-fake".to_string(),
         "loadsmith-destination-fake".to_string(),
         "loadsmith-provider-fake".to_string(),
+        "loadsmith-source-files".to_string(),
+        "loadsmith-parser-fake".to_string(),
     ];
     names.extend(RAW_SOURCES.iter().map(|s| format!("loadsmith-source-{s}")));
     for name in names {
@@ -67,6 +74,8 @@ pub fn run_as_plugin_if_invoked() {
             rt().block_on(loadsmith_plugin_sdk::run_destination(FakeDestination::default()))
         }
         "provider-fake" => rt().block_on(loadsmith_plugin_sdk::run_provider(FakeProvider::default())),
+        "source-files" => rt().block_on(loadsmith_plugin_sdk::run_object_source(FakeFiles::default())),
+        "parser-fake" => rt().block_on(loadsmith_plugin_sdk::run_parser(FakeParser::default())),
         other => match other.strip_prefix("source-") {
             Some(scenario) if RAW_SOURCES.contains(&scenario) => raw_source(scenario),
             _ => {}
@@ -324,6 +333,168 @@ impl DestinationPlugin for FakeDestination {
         }
         note(&self.journal, "finalize");
         Ok(self.rows)
+    }
+    async fn cancel(&mut self) {
+        note(&self.journal, "cancel");
+    }
+}
+
+// ── SDK raw source + parser ───────────────────────────────────────────────────
+
+/// A raw source. Config: `journal`; `files` (paths, announced in order);
+/// `delay_ms` before each; at most one fault, applied when file N+1 is asked
+/// for: `crash_after` (exit 46), `fail_after` (`next_object` errors),
+/// `hang_after` (never returns); `download: true` advertises `scratch_dir`
+/// and announces a copy of each file made in the injected `scratch_dir`.
+#[derive(Default)]
+pub struct FakeFiles {
+    config: serde_json::Value,
+    journal: Option<PathBuf>,
+    given: u64,
+}
+
+impl FakeFiles {
+    fn downloads(&self) -> bool {
+        self.config.get("download").and_then(|v| v.as_bool()) == Some(true)
+    }
+}
+
+#[async_trait]
+impl ObjectSourcePlugin for FakeFiles {
+    fn plugin_name(&self) -> &str {
+        "fake-files"
+    }
+    fn plugin_version(&self) -> &str {
+        "0.0.0"
+    }
+    fn capabilities(&self) -> Vec<String> {
+        // Capabilities come before the config, so the fake always asks for
+        // a scratch dir; it writes to it only with `download: true`.
+        vec!["object_output".into(), "scratch_dir".into()]
+    }
+    async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
+        self.journal = config.get("journal").and_then(|v| v.as_str()).map(PathBuf::from);
+        self.config = config;
+        note(&self.journal, "configure");
+        if let Some(dir) = self.config.get("scratch_dir").and_then(|v| v.as_str()) {
+            note(&self.journal, &format!("scratch {dir}"));
+        }
+        Ok(())
+    }
+    async fn next_object(&mut self) -> Result<Option<PathBuf>> {
+        let n = self.given;
+        if let Some(ms) = opt_u64(&self.config, "delay_ms") {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+        if opt_u64(&self.config, "crash_after") == Some(n) {
+            note(&self.journal, "crash");
+            std::process::exit(46);
+        }
+        if opt_u64(&self.config, "fail_after") == Some(n) {
+            anyhow::bail!("fake raw source failure after {n} files");
+        }
+        if opt_u64(&self.config, "hang_after") == Some(n) {
+            note(&self.journal, "hang");
+            std::future::pending::<()>().await;
+        }
+        let files = self.config["files"].as_array().cloned().unwrap_or_default();
+        let Some(file) = files.get(n as usize).and_then(|f| f.as_str()) else {
+            note(&self.journal, "done");
+            return Ok(None);
+        };
+        self.given += 1;
+        let mut path = PathBuf::from(file);
+        if self.downloads() {
+            let dir = PathBuf::from(self.config["scratch_dir"].as_str().expect("an injected scratch_dir"));
+            let copy = dir.join(path.file_name().unwrap());
+            std::fs::copy(&path, &copy)?;
+            path = copy;
+        }
+        note(&self.journal, &format!("file {}", path.file_name().unwrap().to_string_lossy()));
+        Ok(Some(path))
+    }
+    async fn cancel(&mut self) {
+        note(&self.journal, "cancel");
+    }
+}
+
+/// Writes a file in the [`FakeParser`] format: a header line of column
+/// names, then one line per row of comma-separated integers.
+pub fn write_fake_file(path: &Path, columns: &[&str], rows: u64) {
+    let mut text = columns.join(",");
+    text.push('\n');
+    for r in 0..rows {
+        let row: Vec<String> = columns.iter().enumerate().map(|(i, _)| (r * 10 + i as u64).to_string()).collect();
+        text.push_str(&row.join(","));
+        text.push('\n');
+    }
+    std::fs::write(path, text).unwrap();
+}
+
+/// A parser of [`write_fake_file`] files (every column `int64`, not null).
+/// Config: `journal`; `columns` (declares the schema); `batch_rows`
+/// (default 2); `delay_ms` before each batch; `crash_on` / `fail_on` (a
+/// file name: exit 45 / an error when opening it).
+#[derive(Default)]
+pub struct FakeParser {
+    config: serde_json::Value,
+    journal: Option<PathBuf>,
+    header: Vec<String>,
+    rows: std::collections::VecDeque<Vec<i64>>,
+}
+
+fn int_schema(names: &[String]) -> Schema {
+    Schema::new(names.iter().map(|n| Field::new(n, DataType::Int64, false)).collect::<Vec<_>>())
+}
+
+#[async_trait]
+impl ParserPlugin for FakeParser {
+    fn plugin_name(&self) -> &str {
+        "fake-parser"
+    }
+    fn plugin_version(&self) -> &str {
+        "0.0.0"
+    }
+    async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
+        self.journal = config.get("journal").and_then(|v| v.as_str()).map(PathBuf::from);
+        self.config = config;
+        note(&self.journal, "configure");
+        Ok(())
+    }
+    fn declared_schema(&self) -> Option<Schema> {
+        let cols = self.config.get("columns")?.as_array()?;
+        Some(int_schema(&cols.iter().filter_map(|c| c.as_str().map(str::to_string)).collect::<Vec<_>>()))
+    }
+    async fn open(&mut self, path: &Path) -> Result<Schema> {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        note(&self.journal, &format!("open {name}"));
+        if self.config.get("crash_on").and_then(|v| v.as_str()) == Some(name.as_str()) {
+            note(&self.journal, "crash");
+            std::process::exit(45);
+        }
+        if self.config.get("fail_on").and_then(|v| v.as_str()) == Some(name.as_str()) {
+            anyhow::bail!("fake parser cannot read {name}");
+        }
+        let text = std::fs::read_to_string(path)?;
+        let mut lines = text.lines();
+        let header: Vec<String> = lines.next().unwrap_or("").split(',').map(str::to_string).collect();
+        self.header = header.clone();
+        self.rows = lines.map(|l| l.split(',').map(|v| v.parse().unwrap()).collect()).collect();
+        Ok(int_schema(&header))
+    }
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        if let Some(ms) = opt_u64(&self.config, "delay_ms") {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+        if self.rows.is_empty() {
+            return Ok(None);
+        }
+        let take = (opt_u64(&self.config, "batch_rows").unwrap_or(2) as usize).min(self.rows.len());
+        let rows: Vec<Vec<i64>> = self.rows.drain(..take).collect();
+        let columns: Vec<arrow_array::ArrayRef> = (0..self.header.len())
+            .map(|c| Arc::new(Int64Array::from(rows.iter().map(|r| r[c]).collect::<Vec<_>>())) as _)
+            .collect();
+        Ok(Some(RecordBatch::try_new(Arc::new(int_schema(&self.header)), columns)?))
     }
     async fn cancel(&mut self) {
         note(&self.journal, "cancel");
