@@ -35,6 +35,11 @@ state:                    # optional — incremental state (core-owned watermark
                             #   committed batches; 0 ⇒ only at end of run
 ```
 
+The core-owned keys above are **strict**: an unknown key anywhere in this
+schema (a typo such as `confg:` or `heartbeat_secs:`) is a validation error,
+not silently ignored. The *contents* of each `config:` block are free-form as far
+as the core is concerned — the plugin validates them.
+
 ## Field reference
 
 ### `pipeline`

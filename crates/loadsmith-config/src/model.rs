@@ -32,8 +32,12 @@ fn default_heartbeat_seconds() -> u64 {
     30
 }
 
-/// A reference to a plugin with its opaque config block.
+/// A reference to a plugin with its opaque config block. Strict like the rest
+/// of the core-owned schema (a typo such as `confg:` must not silently drop
+/// the plugin's whole config); only `config`'s *contents* are free-form — the
+/// plugin validates those.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginRef {
     #[serde(rename = "type")]
     pub plugin_type: String,

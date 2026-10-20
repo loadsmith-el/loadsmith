@@ -60,6 +60,43 @@ unknown_field: bad
         assert!(result.is_err());
     }
 
+    /// Regression: plugin blocks accepted any key, so `confg:` validated and
+    /// the plugin silently ran with an empty config.
+    #[test]
+    fn rejects_unknown_keys_in_plugin_blocks() {
+        for block in ["source", "destination", "sink"] {
+            let mut yaml = String::from(
+                "pipeline:\n  name: x\nsource:\n  type: postgres\ndestination:\n  type: jsonl\n",
+            );
+            if block == "sink" {
+                yaml.push_str("sink:\n  type: s3\n");
+            }
+            // Insert a typo'd key right after this block's `type:` line.
+            let at = yaml.find(&format!("{block}:\n")).unwrap();
+            let line_end = at + yaml[at..].find("type:").unwrap();
+            let line_end = line_end + yaml[line_end..].find('\n').unwrap() + 1;
+            yaml.insert_str(line_end, "  confg:\n    host: db\n");
+            let err = parse_pipeline_yaml(&yaml).expect_err(block).to_string();
+            assert!(err.contains("confg"), "{block}: {err}");
+        }
+    }
+
+    #[test]
+    fn plugin_config_contents_stay_free_form() {
+        let yaml = r#"
+pipeline:
+  name: x
+source:
+  type: postgres
+  config:
+    anything: goes
+    nested: { deeply: [1, 2, 3] }
+destination:
+  type: jsonl
+"#;
+        assert!(parse_pipeline_yaml(yaml).is_ok());
+    }
+
     #[test]
     fn resolves_env_template_in_config() {
         std::env::set_var("LS_PARSER_TEST_HOST", "db.example.com");
