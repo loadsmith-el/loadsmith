@@ -96,6 +96,16 @@ What's shipped and what's queued next. Shipped items are documented in
 
 ## Planned
 
+- [ ] **1.0** — freeze the interfaces listed in the
+      [Stability Policy](docs/src/reference/stability.md). Done so far: the
+      policy itself; a CI gate (build/test/clippy `-D warnings`, pinned
+      toolchain) and tests before every release; the 1.0 blockers fixed
+      (tolerant protocol reader and an fd4 drain that never stops, UTF-8-safe
+      templates, a versioned state format with a stable fingerprint, strict
+      plugin blocks in `pipeline.yaml`, lock-lease fixes). Remaining: the
+      policy's open decisions (exit codes, machine-readable output,
+      experimental kinds, core `cancel`/`error`).
+
 - [ ] **`s3` sink** — multipart-upload delivery of staged files to S3. The TLS
       direction is settled (`rustls` + the pure-Rust `rustls-rustcrypto` provider
       — see [docs](docs/src/architecture/multi-arch-and-tls.md)); the remaining

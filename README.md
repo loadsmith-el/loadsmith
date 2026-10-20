@@ -276,6 +276,12 @@ Loadsmith is at **v0.2.0** — the architecture is proven end-to-end:
 - 🔜 Secret-provider plugins (vault, cloud secret managers), remote (`s3`) state
   backend, `s3` sink, more plugins — see [ROADMAP.md](ROADMAP.md)
 
+What a version number promises (and what 1.0 will freeze: the wire protocol,
+CLI, `pipeline.yaml`, state format, plugin manifest/index, image tags and plugin
+discovery) is set out in the
+[Stability Policy](docs/src/reference/stability.md). Changes are tracked in
+[CHANGELOG.md](CHANGELOG.md).
+
 The full design rationale lives in [`definitions/loadsmith.md`](definitions/loadsmith.md)
 and the protocol in [`definitions/protocol.md`](definitions/protocol.md).
 

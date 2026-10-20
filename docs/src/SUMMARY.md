@@ -40,3 +40,4 @@
 
 - [CLI Reference](./reference/cli.md)
 - [Pipeline YAML](./reference/pipeline-yaml.md)
+- [Stability Policy](./reference/stability.md)

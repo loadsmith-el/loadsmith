@@ -3,6 +3,8 @@ name    = "loadsmith-core"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
+# Engine internals: no stable Rust API, never published (see docs/src/reference/stability.md).
+publish = false
 
 [dependencies]
 tokio              = { workspace = true }
