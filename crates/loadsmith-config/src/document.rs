@@ -115,6 +115,13 @@ impl Document {
         Ok(config)
     }
 
+    /// Evaluates every `env()`/`file()` in the whole tree (recording the
+    /// values in `mask`) without resolving `secret()`: surfaces an unset
+    /// variable or an unreadable file before any provider starts.
+    pub fn check_builtins(&self, mask: &MaskList) -> Result<(), ConfigError> {
+        substitute_value(self.raw.clone(), Secrets::Placeholder, mask).map(|_| ())
+    }
+
     /// The fully resolved config: `env()`/`file()` everywhere and each
     /// `secret()` call from `secrets`. Values are recorded in `mask`.
     pub fn resolve(&self, secrets: &SecretValues, mask: &MaskList) -> Result<PipelineConfig, ConfigError> {

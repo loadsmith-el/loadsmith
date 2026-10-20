@@ -19,12 +19,8 @@ pub enum ConfigError {
     Provider(String),
 
     /// The pipeline file could not be read.
-    #[error("cannot read {path}: {source}")]
-    Read {
-        path: String,
-        #[source]
-        source: std::io::Error,
-    },
+    #[error("cannot read {path}: {error}")]
+    Read { path: String, error: std::io::Error },
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

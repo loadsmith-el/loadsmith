@@ -7,7 +7,9 @@
 //! then one `resolve` per distinct reference (one at a time, so the
 //! `resend` rule replays exactly the request in flight), then the core
 //! closes the provider's stdin and waits for its `finished`. fd4 is drained
-//! (and masked) for the whole conversation.
+//! for the whole conversation; its log lines and the provider's stderr are
+//! held and printed (masked) once the provider is gone, because a value is
+//! only known — and maskable — once the core has read its `resolved`.
 //!
 //! Each instance has one budget, from spawn to `finished`
 //! (`providers.<name>.timeout_seconds`, default 60s). The first instance to
@@ -34,11 +36,11 @@ use tokio::io::BufReader;
 use crate::{
     discovery::find_plugin_binary,
     error::CoreError,
-    events::{drain_events, EventForward},
+    events::{emit_log, hold_events},
     lifecycle::{run_handshake_and_configure, start_and_await_ready},
     peer::{describe_exit, finished_failure, Event, Failure, Peer},
     shutdown::{Halt, Shutdown, ShutdownTrigger},
-    spawner::spawn_plugin,
+    spawner::{release_held_stderr, spawn_plugin, StderrRoute},
 };
 
 /// One provider instance to run, with the references to resolve.
@@ -190,19 +192,15 @@ async fn session(
 
     let config = serde_json::to_value(&job.provider.config)
         .map_err(|e| fail(CoreError::Config(ConfigError::Provider(format!("{label}: config: {e}")))))?;
-    let mut sp = spawn_plugin(&bin, None).map_err(|e| {
+    let mut sp = spawn_plugin(&bin, None, StderrRoute::Hold).map_err(|e| {
         fail(CoreError::PluginIncompatible(format!("{label}: spawn {}: {e}", bin.display())))
     })?;
+    // fd4 (always drained) and stderr are held until the conversation is
+    // over: a value the provider logs before the core has read the matching
+    // `resolved` is masked too.
+    let held_stderr = sp.held_stderr.take();
     let event = tokio::fs::File::from_std(sp.event_fd_take());
-    let drain_mask = mask.clone();
-    let drain = tokio::spawn(async move {
-        drain_events(
-            ControlReader::new(BufReader::new(event)),
-            label,
-            EventForward { mask: drain_mask, ..Default::default() },
-        )
-        .await;
-    });
+    let drain = tokio::spawn(hold_events(ControlReader::new(BufReader::new(event))));
     let mut peer = Peer::new(label, sp).with_mask(mask.clone());
 
     let limit = job.provider.timeout();
@@ -240,7 +238,13 @@ async fn session(
             Err(SessionError { error: classify(label, failure.error), induced })
         }
     };
-    let _ = drain.await;
+    // The provider is gone and every value it sent is in the mask.
+    if let Ok(logs) = drain.await {
+        for log in &logs {
+            emit_log(label, log, &mask);
+        }
+    }
+    release_held_stderr(held_stderr, &mask).await;
     outcome
 }
 

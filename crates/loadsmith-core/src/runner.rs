@@ -42,7 +42,7 @@ use crate::{
     reporter::Reporter,
     shutdown::{Halt, Shutdown},
     sink_supervisor::run_sink_supervisor,
-    spawner::{create_data_pipe, spawn_plugin},
+    spawner::{create_data_pipe, spawn_plugin, StderrRoute},
     state::{check_schema_drift, new_run_id, open_backend, schema_fingerprint},
     state_supervisor::{run_state_supervisor, StateRun},
     summary::{FactsHandle, Summary, SummaryStatus},
@@ -226,10 +226,10 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         .map_err(|e| CoreError::PluginProcess(format!("create data pipe (out): {e}")))?;
 
     // Source's fd3 is the write end of the IN pipe; core keeps the read end.
-    let mut src_sp = spawn_plugin(&source_bin, Some(in_write.into_raw_fd()))
+    let mut src_sp = spawn_plugin(&source_bin, Some(in_write.into_raw_fd()), StderrRoute::Forward(opts.mask.clone()))
         .map_err(|e| CoreError::PluginIncompatible(format!("spawn source {}: {e}", source_bin.display())))?;
     // Destination's fd3 is the read end of the OUT pipe; core keeps the write end.
-    let mut dst_sp = spawn_plugin(&dest_bin, Some(out_read.into_raw_fd())).map_err(|e| {
+    let mut dst_sp = spawn_plugin(&dest_bin, Some(out_read.into_raw_fd()), StderrRoute::Forward(opts.mask.clone())).map_err(|e| {
         CoreError::PluginIncompatible(format!("spawn destination {}: {e}", dest_bin.display()))
     })?;
 
@@ -933,7 +933,8 @@ fn ignore_mid_stream(label: &str, msg: &Message) {
 /// Sends `cancel` (or `error` to the plugin at fault) to every live plugin,
 /// waits the grace period, then kills and reaps what is left.
 async fn abort_plugins(src: &mut Peer, dst: &mut Peer, failure: &Failure, grace: Duration) {
-    let reason = failure.reason();
+    // Plugins echo the reason (to stderr): it must not carry a value.
+    let reason = src.mask().apply(&failure.reason());
     for peer in [&mut *src, &mut *dst] {
         let code = if failure.culprit == Some(peer.label()) { failure.code } else { None };
         peer.notify_abort(&reason, code).await;

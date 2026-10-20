@@ -3,6 +3,7 @@
 /// Channel layout:
 ///   fd0 (stdin)  ← control JSONL  (core → plugin)
 ///   fd1 (stdout) → control JSONL  (plugin → core)
+///   fd2 (stderr) → copied to the engine's stderr, line by line, masked
 ///   fd3          Arrow IPC data: source writes, destination reads (shared pipe)
 ///   fd4          → event JSONL    (plugin → core, write end in child)
 ///
@@ -16,7 +17,8 @@ use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::Path;
 
 use anyhow::Result;
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use loadsmith_config::MaskList;
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 use std::process::Stdio;
 
@@ -28,6 +30,9 @@ pub struct SpawnedPlugin {
     pub control_out: ChildStdout,
     /// Core's read end of the event pipe (fd4). Taken once for draining.
     event_fd: Option<std::fs::File>,
+    /// With [`StderrRoute::Hold`]: the plugin's stderr lines, once it closed
+    /// the pipe. Hand it to [`release_held_stderr`].
+    pub held_stderr: Option<tokio::task::JoinHandle<Vec<String>>>,
 }
 
 impl SpawnedPlugin {
@@ -62,11 +67,19 @@ pub fn create_data_pipe() -> Result<(std::fs::File, std::fs::File)> {
 ///
 /// The `child_data_fd` is closed in the parent process after fork.
 /// Call `create_data_pipe()` to get a (read, write) pair.
-pub fn spawn_plugin(binary: &Path, child_data_fd: Option<RawFd>) -> Result<SpawnedPlugin> {
+///
+/// The plugin's stderr is piped through the core (see [`StderrRoute`]) and
+/// masked, so a plugin that prints a resolved value (in a panic, a
+/// fatal-error line) does not leak it.
+pub fn spawn_plugin(
+    binary: &Path,
+    child_data_fd: Option<RawFd>,
+    stderr_route: StderrRoute,
+) -> Result<SpawnedPlugin> {
     let (event_read_raw, event_write_raw) = create_cloexec_pipe()?;
 
     let mut cmd = Command::new(binary);
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     // Each plugin leads its own process group, so a terminal's Ctrl+C (sent
     // to the foreground group) reaches only the core, which then cancels the
     // plugins gracefully instead of having them die mid-write. The abort path
@@ -100,10 +113,81 @@ pub fn spawn_plugin(binary: &Path, child_data_fd: Option<RawFd>) -> Result<Spawn
 
     let control_in = child.stdin.take().expect("stdin was piped");
     let control_out = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let held_stderr = match stderr_route {
+        StderrRoute::Forward(mask) => {
+            tokio::spawn(read_stderr(stderr, move |line| write_stderr(&mask.apply(line))));
+            None
+        }
+        StderrRoute::Hold => {
+            let held = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = std::sync::Arc::clone(&held);
+            let task = tokio::spawn(async move {
+                read_stderr(stderr, move |line| {
+                    let mut lines = sink.lock().unwrap_or_else(|e| e.into_inner());
+                    if lines.len() < MAX_HELD_LINES {
+                        lines.push(line.to_string());
+                    }
+                })
+                .await;
+                std::mem::take(&mut *held.lock().unwrap_or_else(|e| e.into_inner()))
+            });
+            Some(task)
+        }
+    };
 
     let core_event = unsafe { std::fs::File::from_raw_fd(event_read_raw) };
 
-    Ok(SpawnedPlugin { child, control_in, control_out, event_fd: Some(core_event) })
+    Ok(SpawnedPlugin { child, control_in, control_out, event_fd: Some(core_event), held_stderr })
+}
+
+/// Where a plugin's stderr goes.
+pub enum StderrRoute {
+    /// Copied to the engine's stderr as it arrives, line by line, masked.
+    Forward(MaskList),
+    /// Kept until [`release_held_stderr`]: for a provider, whose values the
+    /// core learns only from its replies — a line it prints before the core
+    /// read the matching `resolved` could not be masked yet.
+    Hold,
+}
+
+/// At most this many held stderr lines are kept (the rest are dropped).
+const MAX_HELD_LINES: usize = 10_000;
+
+/// Writes a plugin's held stderr lines to the engine's stderr, masked. Waits
+/// briefly for the pipe to close (the plugin has exited by now).
+pub async fn release_held_stderr(held: Option<tokio::task::JoinHandle<Vec<String>>>, mask: &MaskList) {
+    let Some(task) = held else { return };
+    let lines = match tokio::time::timeout(std::time::Duration::from_secs(2), task).await {
+        Ok(Ok(lines)) => lines,
+        _ => return,
+    };
+    for line in lines {
+        write_stderr(&mask.apply(&line));
+    }
+}
+
+/// Reads a plugin's stderr line by line until every holder of the pipe's
+/// write end (the plugin, anything it spawned) has closed it. Bytes that are
+/// not UTF-8 are replaced.
+async fn read_stderr(stderr: ChildStderr, mut each: impl FnMut(&str)) {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut reader = tokio::io::BufReader::new(stderr);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => each(String::from_utf8_lossy(&line).trim_end_matches('\n')),
+        }
+    }
+}
+
+fn write_stderr(line: &str) {
+    use std::io::Write as _;
+    let mut out = std::io::stderr().lock();
+    let _ = writeln!(out, "{line}");
 }
 
 /// Creates a pipe with O_CLOEXEC on both ends.

@@ -37,7 +37,7 @@ use crate::{
     lifecycle::{run_handshake_and_configure, start_and_await_ready},
     peer::{Event, Peer},
     shutdown::{Halt, Shutdown},
-    spawner::spawn_plugin,
+    spawner::{spawn_plugin, StderrRoute},
 };
 
 /// How often to ping a live sink, and the window for a missing pong to count as
@@ -85,7 +85,7 @@ pub async fn run_sink_supervisor(
 
     loop {
         // ── Spawn one sink instance and bring it up to Ready ──────────────
-        let mut sp = spawn_plugin(&binary, None)
+        let mut sp = spawn_plugin(&binary, None, StderrRoute::Forward(mask.clone()))
             .map_err(|e| CoreError::PluginIncompatible(format!("spawn sink: {e}")))?;
         let event = tokio::fs::File::from_std(sp.event_fd_take());
         let event_mask = mask.clone();
@@ -115,7 +115,8 @@ pub async fn run_sink_supervisor(
         let (sink_name, sink_version) = match setup {
             Ok(id) => id,
             Err(failure) => {
-                peer.notify_abort(&failure.reason(), failure.code).await;
+                let reason = peer.mask().apply(&failure.reason());
+                peer.notify_abort(&reason, failure.code).await;
                 peer.wind_down(grace).await;
                 let _ = event_task.await;
                 return Err(failure.error);
@@ -162,6 +163,7 @@ pub async fn run_sink_supervisor(
                     Halt::Signal(sig) => format!("interrupted by {}", sig.name()),
                     Halt::Abort(reason) => reason.clone(),
                 };
+                let reason = peer.mask().apply(&reason);
                 peer.notify_abort(&reason, None).await;
                 peer.wind_down(grace).await;
             }

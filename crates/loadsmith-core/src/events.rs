@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use loadsmith_config::MaskList;
-use loadsmith_protocol::{LogLevel, Message};
+use loadsmith_protocol::{LogEvent, LogLevel, Message};
 use loadsmith_transport::{ControlReader, TransportError};
 use tokio::io::AsyncBufRead;
 use tokio::sync::mpsc::UnboundedSender;
@@ -24,6 +24,43 @@ pub struct EventForward {
     pub mask: MaskList,
 }
 
+/// Logs one plugin log line through `tracing`, masked.
+pub fn emit_log(plugin: &str, log: &LogEvent, mask: &MaskList) {
+    let message = mask.apply(&log.message);
+    match log.level {
+        LogLevel::Trace => tracing::trace!(target: "plugin", plugin, "{message}"),
+        LogLevel::Debug => tracing::debug!(target: "plugin", plugin, "{message}"),
+        LogLevel::Info => tracing::info!(target: "plugin", plugin, "{message}"),
+        LogLevel::Warn => tracing::warn!(target: "plugin", plugin, "{message}"),
+        LogLevel::Error => tracing::error!(target: "plugin", plugin, "{message}"),
+    }
+}
+
+/// At most this many held log lines are kept by [`hold_events`].
+const MAX_HELD_LOGS: usize = 10_000;
+
+/// Drains a plugin's fd4 to the end (so the plugin never blocks on it) and
+/// returns its log lines instead of logging them: for a provider, whose
+/// values the core learns only from its replies — a log line written before
+/// the core read the matching `resolved` could not be masked yet. Log them
+/// with [`emit_log`] once the conversation is over. Other events are
+/// ignored (a provider has none).
+pub async fn hold_events<R: AsyncBufRead + Unpin>(mut reader: ControlReader<R>) -> Vec<LogEvent> {
+    let mut logs = Vec::new();
+    loop {
+        match reader.recv().await {
+            Ok(Some(Message::Log(log))) => {
+                if logs.len() < MAX_HELD_LOGS {
+                    logs.push(log);
+                }
+            }
+            Ok(Some(_)) | Err(TransportError::Serialize(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+    logs
+}
+
 /// Drains the log/progress event channel (fd4) of a plugin, forwarding to
 /// `tracing` (stderr, controlled by `--log-level`) and routing structured
 /// events (`ObjectReady`, `Checkpoint`, `Committed`) to the supervisors via
@@ -39,16 +76,7 @@ pub async fn drain_events<R: AsyncBufRead + Unpin>(
 ) {
     loop {
         match reader.recv().await {
-            Ok(Some(Message::Log(log))) => {
-                let message = forward.mask.apply(&log.message);
-                match log.level {
-                    LogLevel::Trace => tracing::trace!(target: "plugin", plugin, "{message}"),
-                    LogLevel::Debug => tracing::debug!(target: "plugin", plugin, "{message}"),
-                    LogLevel::Info => tracing::info!(target: "plugin", plugin, "{message}"),
-                    LogLevel::Warn => tracing::warn!(target: "plugin", plugin, "{message}"),
-                    LogLevel::Error => tracing::error!(target: "plugin", plugin, "{message}"),
-                }
-            }
+            Ok(Some(Message::Log(log))) => emit_log(plugin, &log, &forward.mask),
             Ok(Some(Message::Progress(p))) => {
                 tracing::debug!(
                     plugin,

@@ -41,8 +41,11 @@ pub enum CoreError {
     #[error("interrupted by {}", .0.name())]
     Interrupted(StopSignal),
 
+    /// The pipeline's configuration is invalid or could not be resolved.
+    /// Deliberately not a `source()`: the text already carries the inner
+    /// error, and a chain printed with `{:#}` must not repeat it.
     #[error("configuration error: {0}")]
-    Config(#[from] loadsmith_config::ConfigError),
+    Config(loadsmith_config::ConfigError),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -52,4 +55,10 @@ pub enum CoreError {
 
     #[error("state error: {0}")]
     State(String),
+}
+
+impl From<loadsmith_config::ConfigError> for CoreError {
+    fn from(e: loadsmith_config::ConfigError) -> Self {
+        CoreError::Config(e)
+    }
 }

@@ -158,6 +158,10 @@ pub enum Secrets<'a> {
     None,
     /// Provider values; a call missing from the map is an error.
     Values(&'a SecretValues),
+    /// Not resolved yet: a call evaluates to an empty string. For a
+    /// pre-pass that surfaces `env()`/`file()` errors before any provider
+    /// starts; its output is discarded.
+    Placeholder,
 }
 
 /// Evaluates one expression. The value is recorded in `mask`.
@@ -179,6 +183,7 @@ fn eval(expr: &Expr, secrets: Secrets<'_>, mask: &MaskList) -> Result<String, Co
                     "{call} needs provider resolution, which is not available here"
                 )))
             }
+            Secrets::Placeholder => return Ok(String::new()),
         },
     };
     mask.add(value.clone());

@@ -52,6 +52,14 @@ impl MaskList {
                 }
             }
         }
+        // A plugin that logs its config as JSON shows the value escaped
+        // (`\n`, `\"`, `\\`): mask that spelling too.
+        if let Ok(quoted) = serde_json::to_string(&s) {
+            let escaped = &quoted[1..quoted.len() - 1];
+            if escaped != s {
+                parts.push(escaped.to_string());
+            }
+        }
         parts.push(s);
         let mut list = self.0.write().unwrap_or_else(|e| e.into_inner());
         for p in parts {
@@ -121,6 +129,14 @@ mod tests {
         assert_eq!(list.apply("bad key line: MIIEvQIBADANBgkqhkiG9w0BAQEF"), "bad key line: ***");
         // A short line alone is not masked (it would mask common words).
         assert_eq!(list.apply("short"), "short");
+    }
+
+    #[test]
+    fn json_escaped_spellings_are_masked() {
+        let list = MaskList::new();
+        list.add("a\"b\\c\nsecond-line");
+        let logged = serde_json::json!({ "password": "a\"b\\c\nsecond-line" }).to_string();
+        assert_eq!(list.apply(&logged), r#"{"password":"***"}"#);
     }
 
     #[test]

@@ -50,7 +50,7 @@ impl LoadOpts {
 /// Reads and statically checks a pipeline file ([`Mode::Static`]).
 pub fn read_document(path: &Path) -> Result<Document, CoreError> {
     let content = std::fs::read_to_string(path)
-        .map_err(|source| ConfigError::Read { path: path.display().to_string(), source })?;
+        .map_err(|error| ConfigError::Read { path: path.display().to_string(), error })?;
     Ok(Document::parse(&content)?)
 }
 
@@ -63,6 +63,8 @@ pub async fn resolve_document(doc: &Document, mode: Mode, opts: &LoadOpts) -> Re
             // `pipeline:` (the timeouts) and `providers:` resolve without
             // providers; then the referenced instances run.
             let partial = doc.resolve_subtrees(&["pipeline", "providers"], &opts.mask)?;
+            // An unset variable anywhere fails before a provider starts.
+            doc.check_builtins(&opts.mask)?;
             for unused in doc.unused_instances() {
                 tracing::warn!(
                     instance = unused,
