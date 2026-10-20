@@ -9,14 +9,29 @@ while providing strong guarantees about lifecycle ordering.
 ```
 fd0 (stdin)  — JSONL, core → plugin  — lifecycle commands
 fd1 (stdout) — JSONL, plugin → core  — lifecycle responses
-fd3          — Arrow IPC stream       — data (source writes, destination reads)
-fd4          — JSONL, plugin → core  — events (logs, progress, object_ready, checkpoint, committed)
+fd2 (stderr) — free text, plugin → core — copied to the engine's stderr, masked
+fd3          — Arrow IPC stream       — data (sources and parsers write, destinations read)
+fd4          — JSONL, plugin → core  — events (logs, progress, object_ready, object_parsed, checkpoint, committed)
 ```
 
 fd0 and fd1 are the standard Unix stdin/stdout. fd3 and fd4 are created by the
 core as OS pipes before forking, then `dup2`'d into the child at the appropriate
 fd numbers. Plugins must not assume fd3/fd4 are available before the process
 starts — they are set up by the core.
+
+| Kind | fd3 | fd4 |
+|---|---|---|
+| source | writes | yes |
+| destination | reads | yes |
+| sink | none | yes |
+| provider | none | yes |
+| raw source (`object_output`; reserved) | none | yes (`object_ready` per file) |
+| parser (reserved) | writes | yes (`object_parsed`) |
+
+fd4 is always wired and always drained, for every kind. stderr is not a
+protocol channel: the core pipes it and copies it to its own stderr line by
+line with every resolved template value masked (a provider's stderr is held
+until its conversation is over, then printed masked).
 
 ## Message framing
 
@@ -171,6 +186,75 @@ The core owns the delivery ledger (which paths were acked): if the sink hangs
 object, so `deliver` must be idempotent. The sink can outlive source and
 destination, delivering its queue at its own pace. See
 [Sink Delivery](../architecture/sink-delivery.md).
+
+## Providers (value resolution)
+
+A pipeline's `secret('<instance>', '<ref>')` calls are resolved by provider
+plugins (kind `provider`, binary `loadsmith-provider-<type>`) **before** the
+state lock and before any data plugin is spawned. The core spawns each
+referenced instance once, all instances in parallel (a declared instance no
+`secret()` uses is not started):
+
+```
+core                                 provider plugin
+─────────────────────────────────────────────────────────────────────────────
+→ handshake … capabilities_request
+                                     ← capabilities_response  (must include resolve)
+→ configure
+                                     ← configure_ack
+→ start
+                                     ← ready
+→ resolve {id: 1, ref: "db.json#password"}
+                                     ← resolved {id: 1, value: "…"}
+→ resolve {id: 2, ref: "db.json#user"}
+                                     ← resolved {id: 2, error: {code, message}}
+(close stdin / EOF)
+                                     ← finished {status: success}
+```
+
+- One `resolve` in flight at a time, each distinct reference once per run;
+  a `resend` therefore replays exactly the request in flight.
+- A provider has **no fd3**. Its fd4 is drained throughout; its log lines and
+  its stderr are held and printed (masked) once the conversation is over,
+  because a value is known — and maskable — only once the core has read its
+  `resolved`.
+- Each instance has one budget, spawn to `finished`:
+  `providers.<name>.timeout_seconds` (default 60, `0` disables). On expiry the
+  core sends `error` with code `TIMEOUT`.
+- The first failing instance (a `resolved` error, a crash, a protocol
+  violation, a timeout) aborts the others with the [abort rules](#abort-rules):
+  `error` to the culprit, `cancel` to the rest, grace, kill. Nothing else has
+  started, so the run ends there with a configuration error (exit `3`); a
+  missing or incompatible provider binary is exit `4`.
+
+## Parsers (reserved)
+
+The protocol defines parsers in v1, but **the core does not drive parsers
+yet** (a `parser:` block is rejected at run time). A raw source (capability
+`object_output`) has no fd3: it answers `start` with `ready` and announces
+each local file with `object_ready{path}` on fd4. The core forwards each path
+to the parser (capability `parse`) as `parse_object{path}` on fd0; the parser
+takes the source's place on the Arrow side — `schema` after its first file,
+Arrow IPC on fd3, `object_parsed` events on fd4, and on stdin EOF the
+end-of-stream marker and `finished`:
+
+```
+raw source ──fd4 object_ready{path}──▶ core ──fd0 parse_object{path}──▶ parser ──fd3──▶ core ──▶ destination
+```
+
+The commit-point rule then applies to the parser (the Arrow producer) and the
+raw source together: the destination's input ends cleanly only after both
+finished successfully.
+
+## Masking
+
+The core redacts (`***`) every value it resolved from `env()`, `file()` or
+`secret()` templates from: plugin log lines (fd4), the texts of
+`configure_ack`, `finished` and `resolved` errors, the `cancel`/`error`
+reasons it sends to plugins, plugin stderr, the final `error:` line, the
+summary's root cause and the JSON run summary's `cause`. Each line of at least
+8 characters of a multi-line value (a PEM key) and the value's JSON-escaped
+spelling are masked too. A plugin should still never log a value.
 
 ## Ordering guarantees
 

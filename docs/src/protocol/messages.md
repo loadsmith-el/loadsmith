@@ -37,7 +37,7 @@ Sent by the **plugin** in response to `handshake`.
 | `plugin_name` | string | Should match the binary name (convention, shown in the run summary). Not enforced by the core |
 | `plugin_version` | string | Semver version string |
 | `protocol_supported_versions` | array of integers | Protocol versions this plugin understands |
-| `kind` | string | One of: `"source"`, `"destination"`, `"sink"`, `"parser"` (reserved, no runtime yet), `"config_provider"` |
+| `kind` | string | One of: `"source"`, `"destination"`, `"sink"`, `"parser"` (reserved: the core does not drive parsers yet), `"provider"`. The same spelling names the binary: `loadsmith-<kind>-<type>` |
 
 ---
 
@@ -90,10 +90,11 @@ Sent by the **plugin** in response to `capabilities_request`.
 | `schema_inference` | sources (SDK default) | no |
 | `incremental_state` | incremental sources (postgres, mysql, oracle) | yes — required when the pipeline has a `state:` block |
 | `batch_write` | destinations (SDK default) | no |
-| `object_output` | file-output destinations whose files a sink can deliver (parquet) | yes — required when the pipeline has a `sink:` block |
+| `object_output` | file-output destinations whose files a sink can deliver (parquet); also *raw sources*, which produce files instead of Arrow (reserved, see [`parse_object`](#parse_object)) | yes — required on the destination when the pipeline has a `sink:` block |
 | `staged_merge` | postgres, mysql, oracle destinations | no |
 | `object_delivery` | sinks (SDK default) | no |
-| `fetch` | config providers (SDK default) | no |
+| `resolve` | providers (SDK default) | yes — required of every provider instance |
+| `parse` | parsers | not yet (reserved: the core does not drive parsers yet) |
 
 ---
 
@@ -173,7 +174,7 @@ form (no `resume`) is unchanged and still valid.
 
 ### `schema`
 
-Sent by the **source plugin** on the control channel (fd1) immediately after
+Sent by a **source** (or a **parser**, reserved) on the control channel (fd1) immediately after
 receiving `start`, before writing any Arrow data to fd3.
 
 ```json
@@ -279,15 +280,17 @@ unknown, and the data itself flows through the IPC stream untouched.
 
 ### `ready`
 
-Sent by the **destination plugin** on the control channel (fd1) immediately after
-receiving `start`. Signals that the destination has completed preparation and is
-ready to receive Arrow batches on fd3.
+Sent on the control channel (fd1) after receiving `start` by a **destination**
+(ready to receive Arrow batches on fd3), a **sink** (ready for
+`deliver_object`), a **provider** (ready for [`resolve`](#resolve)), or a
+**raw source** (it answers `start` with `ready` instead of `schema` and then
+announces files with [`object_ready`](#object_ready); reserved).
 
 ```json
 {"type": "ready"}
 ```
 
-No fields. The core starts the data pump after receiving `ready`.
+No fields. The core starts the data pump after the destination's `ready`.
 
 ---
 
@@ -340,6 +343,11 @@ Structured log event from a plugin.
 | `level` | string | `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"` |
 | `message` | string | Human-readable message |
 
+The core logs `message` with every resolved `env()`/`file()`/`secret()` value
+masked (`***`). A provider's log lines are held until its conversation is over
+and masked then, so a value it logs before the core read its `resolved` is
+masked too.
+
 ---
 
 ### `object_ready`
@@ -357,6 +365,28 @@ the moment it closes while the pump keeps filling the next.
 | Field | Type | Description |
 |---|---|---|
 | `path` | string | Local path of the finalized file |
+
+A **raw source** (capability `object_output`; reserved — the core does not
+drive parsers yet) sends `object_ready` for each local file it produces; the
+core forwards each path to the parser as [`parse_object`](#parse_object).
+
+---
+
+### `object_parsed`
+
+**Reserved: the core does not drive parsers yet.** Sent by a **parser** to fd4
+when a file is fully parsed. Informational.
+
+```json
+{"type": "object_parsed", "path": "/mnt/s3/inbox/2026-10-01.csv", "rows": 1500, "batches": 2, "last_batch_seq": 2}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `path` | string | The file (as in `parse_object`) |
+| `rows` | integer | Rows parsed from this file |
+| `batches` | integer | Arrow batches written to fd3 for this file |
+| `last_batch_seq` | integer | Global batch ordinal (1-based, as on `checkpoint`) of the file's last batch; `0` if it produced none |
 
 ---
 
@@ -440,6 +470,65 @@ re-sends only the objects not yet acknowledged.
 | Field | Type | Description |
 |---|---|---|
 | `path` | string | Local path that was delivered |
+
+---
+
+### `resolve`
+
+Sent by the **core** to a **provider** on the control channel: resolve one
+reference — the second argument of a `secret('<instance>', '<ref>')` template
+call. The reference is opaque to the core (its syntax is the provider's).
+The core sends each distinct reference once per run, one `resolve` at a time
+(waiting for its `resolved`), then closes the provider's stdin (EOF).
+
+```json
+{"type": "resolve", "id": 1, "ref": "db.json#password"}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | integer | Chosen by the core, unique within the conversation; echoed in `resolved` |
+| `ref` | string | The provider-defined reference |
+
+---
+
+### `resolved`
+
+Sent by a **provider** to the core on the control channel: the answer to the
+`resolve` with the same `id`. Carries **exactly one** of `value` or `error`.
+A reference the provider cannot resolve is an answer, not the end of the
+conversation; the core then aborts resolution with that error (exit 3).
+
+```json
+{"type": "resolved", "id": 1, "value": "s3cr3t"}
+{"type": "resolved", "id": 2, "error": {"code": "NOT_FOUND", "message": "no such file: missing.json"}}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | integer | The `id` of the `resolve` being answered |
+| `value` | string (optional) | The resolved value. Masked by the core everywhere from then on |
+| `error` | object (optional) | `code` (string) and `message` (string). Suggested codes: `NOT_FOUND`, `ACCESS_DENIED`, `INVALID_REF`; SDK default `RESOLVE_FAILED`. Never put a value in `message` |
+
+A wrong `id`, both fields, or neither is a protocol violation (`error`, code
+`PROTOCOL_VIOLATION`).
+
+---
+
+### `parse_object`
+
+**Reserved: the core does not drive parsers yet.** Sent by the **core** to a
+**parser** on the control channel: parse the local file at `path` (from a raw
+source's `object_ready`). Idempotent per path. Stdin EOF means "no more
+files": the parser ends its IPC stream and sends `finished`.
+
+```json
+{"type": "parse_object", "path": "/mnt/s3/inbox/2026-10-01.csv"}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `path` | string | Local path of the file to parse |
 
 ---
 
@@ -568,11 +657,17 @@ after `start` undoes its partial work *before* it sends this `finished`.
 | `rows_written` | integer (optional) | Total rows written (destination only, on success) |
 | `batches_written` | integer (optional) | Total batches written (destination only, on success) |
 | `code` | string (optional) | Machine-readable error code (on error) |
-| `message` | string (optional) | Human-readable error message (on error); for a config provider, the fetched document (see below) |
+| `message` | string (optional) | Human-readable error message (on error). The core masks resolved template values in it |
 
 **Sink form:** a sink reuses `finished` `success` with `rows_written` =
 `batches_written` = the number of objects delivered.
 
-**Config-provider form:** a config provider answers with `status: "success"` and
-carries the fetched document in `message`, as a (lossily converted) UTF-8 string —
-the only channel for the provider's payload.
+**Provider form:** after the core closes its stdin, a provider sends the bare
+`{"type": "finished", "status": "success"}` — no counters and no payload (values
+travel only in [`resolved`](#resolved)).
+
+**Parser form (reserved):** like a source — `rows_read` / `batches_read` over
+all files, sent after the parser ended its IPC stream with the end-of-stream
+marker. A later file whose schema differs from the first is
+`status: "error"`, `code: "SCHEMA_MISMATCH"`; no file and no declared schema is
+`NO_INPUT`.

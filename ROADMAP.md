@@ -9,8 +9,11 @@ What's shipped and what's queued next. Shipped items are documented in
       (control / Arrow IPC data / event)
 - [x] `postgres` source plugin (server-side cursor, full type mapping)
 - [x] `jsonl`, `null`, `parquet` destination plugins
-- [x] `file` config-provider plugin (protocol/SDK level; not yet invoked by the
-      core — `{{ env() }}` / `{{ file() }}` templates are resolved in-process)
+- [x] **Providers** — `providers:` instances and `{{ secret('<instance>', '<ref>') }}`
+      templates, resolved by provider plugins before the state lock and any data
+      plugin (`resolve`/`resolved`, SDK `ProviderPlugin`); every `env()`/`file()`/
+      `secret()` value masked in logs, plugin stderr, errors and the run summary;
+      `validate` static by default, `--resolve` for the full resolution
 - [x] **Sink delivery stage** — separates format from location (no `s3_parquet`
       explosion); `local-copy` sink, `object_ready`/`deliver_object` protocol,
       and a core supervisor that respawns + resumes a crashed/hung sink from the
@@ -112,7 +115,9 @@ What's shipped and what's queued next. Shipped items are documented in
       nullability and tolerant reading) and drift detection on the exact Arrow
       stream schema (state format v2, migrated automatically); a versioned
       JSON run summary (`--output json`, `--summary-file`).
-      Remaining: the policy's open decisions (experimental kinds, remote
+      Done since: providers wired into the core (`providers:` + `secret()`,
+      the `provider` kind rename, masking everywhere, static `validate`) and
+      the parser wire contract. Remaining: the policy's open decisions (the parser kind, remote
       state, SDK publishing),
       and the canonical plugins' `cancel()` rolling back once they move to
       the new SDK.
@@ -121,10 +126,17 @@ What's shipped and what's queued next. Shipped items are documented in
       direction is settled (`rustls` + the pure-Rust `rustls-rustcrypto` provider
       — see [docs](docs/src/architecture/multi-arch-and-tls.md)); the remaining
       work is the pure-Rust multipart upload + SigV4 signing, not the crypto stack.
-- [ ] **Templates & secret providers** — config interpolation today covers
-      `{{ env(...) }}` and `{{ file(...) }}`; broader templating and dedicated secret-provider
-      plugins (vault, cloud secret managers, …) would get credentials out of
-      plain environment variables.
+- [ ] **Parsers** — the protocol is defined (`parse_object` / `object_parsed`,
+      capabilities `parse` / `object_output`, the `parser:` block); next: the
+      core wiring (raw source → core → parser → pump), the SDK runtimes
+      (`ParserPlugin`, `ObjectSourcePlugin`), a `file` raw source, `csv` and
+      `excel` parsers in the canonical plugins.
+- [ ] **More providers** — port the canonical `file` provider to the new
+      `provider` kind and API (pending in loadsmith-canonical-plugins); an
+      `aws-secrets-manager` provider (1.x, needs SigV4 like the s3 sink);
+      Vault and other cloud secret managers.
+- [ ] **Whole-document config loading** (`--config-ref`, 1.x) — load the
+      pipeline document itself from a remote reference through a provider.
 - [ ] **Remote state backend** — an `s3` state backend (conditional PUT for a
       distributed lock) behind the existing `StateBackend` trait, reusing the
       s3 sink's SigV4/TLS. Local-file state with locking ships today.

@@ -114,14 +114,17 @@ export PG_HOST=pg.internal PG_DATABASE=missions PG_USER=loadsmith_reader \
 
 docker run --rm -v "$PWD":/work -w /work \
   -e PG_HOST -e PG_DATABASE -e PG_USER -e PG_PASSWORD -e DATA_DIR -e RUN_ID \
-  ghcr.io/loadsmith-el/loadsmith:v0.2.0-slim validate pipeline.yaml
-# Pipeline 'telemetry-to-jsonl' is valid.
+  ghcr.io/loadsmith-el/loadsmith:v0.2.0-slim validate pipeline.yaml --resolve
+# Pipeline 'telemetry-to-jsonl' is valid (fully resolved; 0 secret() references resolved).
 ```
 
-`validate` checks the YAML, resolves the templates and checks the engine-level
-structure (`pipeline`, `source`, `destination`, `state`). It does not look for
-plugins or check what is inside a plugin's `config:` block: the plugin does
-that when the pipeline runs. `run pipeline.yaml --dry-run` runs the same checks.
+`validate` checks the YAML, the template syntax and the engine-level structure
+(`pipeline`, `source`, `destination`, `state`); on its own it is static and
+needs none of the variables. `--resolve` also resolves the templates (and runs
+any [provider](../plugins/writing-a-provider.md) a `secret()` references), so an
+unset variable fails here. It does not look for data plugins or check what is
+inside a plugin's `config:` block: the plugin does that when the pipeline runs.
+`run pipeline.yaml --dry-run` performs the same full resolution.
 
 To see the config the plugins will receive, with defaults filled in, swap
 `validate pipeline.yaml` for `run pipeline.yaml --print-resolved-config` in the

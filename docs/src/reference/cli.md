@@ -37,8 +37,8 @@ loadsmith run pipeline.yaml --summary-file run.json     # human report on stdout
 | Flag | Default | Description |
 |---|---|---|
 | `--plugin-dir <path>` | `~/.loadsmith/plugins/` | Directory to search for plugin binaries |
-| `--dry-run` | off | Parse, resolve templates and validate the pipeline, then exit without spawning plugins (plugin binaries are not checked) |
-| `--print-resolved-config` | off | Print the resolved config (with secrets masked) to stdout and exit, without running |
+| `--dry-run` | off | Parse, resolve every template and validate the pipeline — the provider instances `secret()` references are started and resolve their values — then exit without spawning any data plugin (source/destination/sink binaries are not checked) |
+| `--print-resolved-config` | off | Resolve the config (providers included), print it to stdout with every `env()`/`file()`/`secret()` value masked, and exit without starting any data plugin |
 | `--output <human\|json>` | `human` | What stdout carries: the human report, or one JSON [run summary](#machine-readable-run-summary) instead |
 | `--summary-file <path>` | — | Also write the JSON [run summary](#machine-readable-run-summary) to this file, whatever `--output` says |
 
@@ -47,6 +47,20 @@ flowing prints the summary with `Status: error` and a `Cause:` line; a run that
 cannot start prints the cause as an `error:` line on stderr. With
 `--output json` or `--summary-file`, both cases also produce the
 [run summary](#machine-readable-run-summary) with the exit code and cause.
+
+**Providers:** before the state lock and before any data plugin, `run`
+(including `--dry-run` and `--print-resolved-config`) starts the
+[provider instances](pipeline-yaml.md#providers) the pipeline's `secret()` calls
+reference and resolves every value. A provider failure stops the command right
+there with exit `3` (a missing provider binary: `4`), for example:
+
+```
+error: configuration error: provider 'creds' could not resolve 'db.json#password': NOT_FOUND: no such file: db.json
+```
+
+Every resolved value is masked in everything the engine prints — logs, plugin
+stderr, error lines, the run summary (see
+[Masking](pipeline-yaml.md#masking)).
 
 **Signals:** SIGINT (Ctrl+C) and SIGTERM stop a run gracefully: the engine
 sends `cancel` to every plugin (a destination rolls back), waits up to
@@ -131,10 +145,10 @@ not applicable.
 | `pipeline` | string \| null | `pipeline.name`; `null` if the pipeline file could not be read or parsed |
 | `status` | string | `success`, `error` or `cancelled` (stopped by SIGINT/SIGTERM) |
 | `exit_code` | integer | The process exit code (see [Exit codes](#exit-codes)) |
-| `cause` | string \| null | The root cause when the run did not succeed (the summary's `Cause:` line, or the `error:` line of a setup failure) |
+| `cause` | string \| null | The root cause when the run did not succeed (the summary's `Cause:` line, or the `error:` line of a setup failure), with every resolved template value masked. A provider failure is a setup failure: `pipeline` and `route` are still known (the static check runs first), `exit_code` is `3`, and `cause` reads e.g. `configuration error: provider 'creds' could not resolve 'db.json#password': NOT_FOUND: …` |
 | `signal` | string \| null | `SIGINT` or `SIGTERM` when a signal stopped the run |
 | `dry_run` | bool | The run was `--dry-run` (nothing was executed) |
-| `route` | array | One entry per stage, in order: `kind` (`source`, `destination`, `sink`), `type` (the `type:` in `pipeline.yaml`), `name` and `version` (from the plugin's handshake), `path` (the binary that was resolved). `name`/`version`/`path` are `null` until the run learned them; `route` is `[]` if the pipeline file could not be parsed |
+| `route` | array | One entry per stage, in order: `kind` (`source`, `destination`, `sink`), `type` (the `type:` in `pipeline.yaml`), `name` and `version` (from the plugin's handshake), `path` (the binary that was resolved). `name`/`version`/`path` are `null` until the run learned them; `route` is `[]` if the pipeline file could not be parsed. Provider instances are not listed |
 | `rows_read` | integer | Rows the source produced |
 | `rows_written` | integer | Rows the destination reported written |
 | `batches` | integer | Batches the source produced |
@@ -158,10 +172,12 @@ Run a pipeline using plugins from a custom directory:
 ./target/debug/loadsmith run pipeline.yaml --plugin-dir /opt/loadsmith/plugins
 ```
 
-Validate without running (useful in CI to catch config errors early):
+Resolve everything (providers included) without starting a data plugin:
 ```bash
 loadsmith run pipeline.yaml --dry-run
 ```
+(For a check with no side effects at all, use
+[`loadsmith validate`](#loadsmith-validate-pipeline).)
 
 See the full resolved config with secrets masked:
 ```bash
@@ -184,13 +200,16 @@ loadsmith run pipeline.yaml --log-level debug 2>handshake.log
 
 ## `loadsmith validate <pipeline>`
 
-Validate a pipeline file. Does not look for plugin binaries, connect to any
-system, or run any data — plugin-specific config is only checked by the plugin
-itself at run time.
+Validate a pipeline file. **Static by default:** it evaluates nothing — no
+environment variable or file is read, no plugin or provider is started, no
+system is contacted. `--resolve` adds the full resolution `run` performs before
+it starts anything, providers included. Plugin-specific config is only checked
+by the plugin itself at run time.
 
 ```bash
-loadsmith validate pipeline.yaml
-loadsmith validate pipeline.yaml --plugin-dir /opt/loadsmith/plugins
+loadsmith validate pipeline.yaml                      # static (CI-friendly)
+loadsmith validate pipeline.yaml --resolve            # also env()/file() and providers
+loadsmith validate pipeline.yaml --resolve --plugin-dir /opt/loadsmith/plugins
 ```
 
 **Arguments:**
@@ -203,17 +222,33 @@ loadsmith validate pipeline.yaml --plugin-dir /opt/loadsmith/plugins
 
 | Flag | Default | Description |
 |---|---|---|
-| `--plugin-dir <path>` | `~/.loadsmith/plugins/` | Accepted but currently unused |
+| `--resolve` | off | Also resolve every template: read the `env()`/`file()` values and run the provider instances the `secret()` calls reference |
+| `--plugin-dir <path>` | `~/.loadsmith/plugins/` | Where `--resolve` finds provider binaries |
 
-**What is checked:**
+**What is checked (always):**
 1. YAML syntax is valid
-2. Template expressions (`{{ env(...) }}`, `{{ file(...) }}`) can be resolved
-3. Unknown keys at the top level, under `pipeline:` and under `state:` are
-   rejected (extra keys beside a plugin's `type`/`config` are not)
-4. `pipeline.name`, `source.type`, `destination.type` and (if present)
-   `sink.type` are non-empty
-5. With a `state:` block, `state.backend` is `local` and `state.path` is
-   non-empty
+2. The core-owned keys are strict: an unknown key at the top level, under
+   `pipeline:`, `providers:`, `state:`, or beside a plugin's `type`/`config` is
+   rejected
+3. `pipeline.name`, `source.type`, `destination.type`, (if present)
+   `sink.type`/`parser.type` and every `providers.<name>.type` are non-empty;
+   provider instance names use letters, digits, `_` and `-`
+4. With a `state:` block, `state.backend` is `local` and `state.path` is
+   non-empty; a `parser:` is not combined with `state:`
+5. Every template parses (`env('…')`, `file('…')`, `secret('…', '…')`), every
+   `secret()` names a declared provider instance, and none sits in `pipeline:`,
+   `state:` or `providers:`
+
+An unset environment variable passes the static check. **With `--resolve`:**
+every `env()`/`file()` is evaluated and every `secret()` is resolved by its
+provider — the same failures, with the same exit codes, as `run` (see
+[Exit codes](#exit-codes)).
+
+**Output:**
+```
+Pipeline 'orders' is valid (static check; --resolve also resolves env()/file() and runs the providers).
+Pipeline 'orders' is valid (fully resolved; 2 secret() references resolved).
+```
 
 ---
 
@@ -272,7 +307,7 @@ loadsmith plugin install --binary ./target/release/loadsmith-destination-jsonl  
 
 | Flag | Default | Description |
 |---|---|---|
-| `--kind <kind>` | — | Install only this kind from the package (`source`/`destination`/`sink`/`parser`/`config-provider`). Same as the `:<kind>` spec suffix. |
+| `--kind <kind>` | — | Install only this kind from the package (`source`/`destination`/`sink`/`parser`/`provider`). Same as the `:<kind>` spec suffix. |
 | `--all` | — | With no name: every package in the index. With a `<name>`: every plugin of that package. |
 | `-f, --manifest <path\|URL>` | — | Install from a `loadsmith-plugin.yaml` |
 | `--binary <path>` | — | Install a single local plugin binary |
@@ -350,6 +385,11 @@ loadsmith state rm pipeline.yaml
 Both commands fail with `pipeline '<name>' has no state: block` when the pipeline
 has no `state:` block.
 
+Both read only what locates the state: `env()`/`file()` are resolved in
+`pipeline:` and `state:` alone, and no provider is ever started (`secret()` is
+not allowed in those blocks). The other blocks' templates — database
+credentials, `secret()` calls — need not resolve.
+
 ---
 
 ## Exit codes
@@ -364,10 +404,10 @@ under `1`.
 | `0` | Success | `run`: summary `Status: success` |
 | `1` | The run failed | A plugin reported an error, crashed, broke the protocol or timed out; the data plane stalled; sink delivery or state persistence failed; any failure not listed below |
 | `2` | Usage error | Unknown flag or missing argument (from the argument parser); conflicting selectors such as `plugin install mysql:source --kind destination` |
-| `3` | Configuration error | Unreadable pipeline file, invalid YAML, unknown key, failed template, validation error, a plugin rejected its `config` (`configure_ack` error), a capability gate (a `sink:` on a destination without `object_output`, a `state:` block with a non-incremental source), `state show` on a pipeline with no `state:` block |
-| `4` | Plugin unavailable | Plugin binary not found, cannot be started, no protocol version in common, wrong kind |
+| `3` | Configuration error | Unreadable pipeline file, invalid YAML, unknown key, failed template, validation error, a `secret()` naming an undeclared provider instance or used in `pipeline:`/`state:`/`providers:`, a provider failure (a reference it could not resolve, a crash, a protocol violation, a timeout), a plugin or provider rejected its `config` (`configure_ack` error), a capability gate (a `sink:` on a destination without `object_output`, a `state:` block with a non-incremental source), `state show` on a pipeline with no `state:` block |
+| `4` | Plugin unavailable | Plugin binary (provider binaries included) not found, cannot be started, no protocol version in common, wrong kind, a provider without the `resolve` capability |
 | `5` | State error | The state lock is held by another run, the state file is unreadable or from a newer engine, the source schema drifted (`on_schema_change: refuse`) |
-| `130` | Interrupted (SIGINT) | Ctrl+C, after cancelling the plugins |
+| `130` | Interrupted (SIGINT) | Ctrl+C, after cancelling the plugins (also while providers are resolving) |
 | `143` | Terminated (SIGTERM) | `docker stop`, a Kubernetes pod shutdown, after cancelling the plugins |
 
 `130` and `143` follow the shell convention of 128 + the signal number.

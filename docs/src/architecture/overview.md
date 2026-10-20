@@ -7,9 +7,9 @@ hierarchy, plus plugin binaries that live outside the core dependency graph.
 
 ```
 loadsmith-cli               ← the loadsmith binary (clap), plugin install/uninstall
-  └─ loadsmith-core         ← orchestration: discovery, spawner, lifecycle, pump, events,
+  └─ loadsmith-core         ← orchestration: pipeline loader, providers, discovery, spawner, lifecycle, pump, events,
   │                           reporter, summary, sink supervisor, incremental state
-  │    └─ loadsmith-config  ← YAML parse, template resolution, secret masking
+  │    └─ loadsmith-config  ← YAML parse, static checks, template resolution (env/file/secret), masking
   │    └─ loadsmith-arrow   ← Arrow IPC reader/writer, schema helpers, JSON conversion
   │    └─ loadsmith-protocol← control message types (serialization/deserialization)
   │    └─ loadsmith-transport← JSONL framing for control + event channels (uses protocol, arrow)
@@ -17,7 +17,7 @@ loadsmith-cli               ← the loadsmith binary (clap), plugin install/unin
   └─ loadsmith-plugin-manifest ← plugin manifest schema + validation for `plugin install`
   └─ loadsmith-tls          ← rustls ClientConfig + TLS modes (installer HTTPS; network plugins)
 
-loadsmith-plugin-sdk        ← drives plugin lifecycle; source/destination/sink/config-provider entry points
+loadsmith-plugin-sdk        ← drives plugin lifecycle; source/destination/sink/provider entry points
   └─ loadsmith-protocol
   └─ loadsmith-transport
   └─ loadsmith-arrow
@@ -40,14 +40,24 @@ There are four runnable kinds of plugin:
 | `source` | Reads from an origin system and emits Arrow batches | `run_source` |
 | `destination` | Consumes Arrow batches and writes them to a target | `run_destination` |
 | `sink` | Delivers finalized staged files to a target (see [Sink Delivery](./sink-delivery.md)) | `run_sink` |
-| `config-provider` | Loads configuration YAML content from a URI (not yet invoked by the core) | `run_config_provider` |
+| `provider` | Resolves the pipeline's `secret('<instance>', '<ref>')` values before the run (`resolve` → `resolved`) | `run_provider` |
 
-`parser` is a reserved kind in the protocol, with no SDK runtime yet.
+`parser` is a reserved kind: its protocol messages (`parse_object`,
+`object_parsed`) are defined in v1, but the core does not drive parsers yet and
+the SDK has no parser runtime.
+
+Providers run before anything else: the core's loader (`load.rs`) checks the
+pipeline file statically, starts each provider instance a `secret()` call
+references (`providers.rs`, all in parallel), substitutes the values, and
+only then takes the state lock and spawns the data plugins. Every resolved
+value goes into a shared mask that redacts it from plugin logs, plugin
+stderr, error texts and the summary.
 
 ### Binary naming convention
 
 The core discovers plugins by resolving the binary name from the pipeline's
-`source.type`, `destination.type` and (when present) `sink.type` fields:
+`source.type`, `destination.type`, (when present) `sink.type`, and each
+`providers.<name>.type` that a `secret()` call references:
 
 ```
 loadsmith-{kind}-{type}
@@ -60,6 +70,7 @@ Examples:
 | `postgres` | source | `loadsmith-source-postgres` |
 | `jsonl` | destination | `loadsmith-destination-jsonl` |
 | `local-copy` | sink | `loadsmith-sink-local-copy` |
+| `file` (under `providers:`) | provider | `loadsmith-provider-file` |
 
 The core searches for the binary first in the plugin directory (default
 `~/.loadsmith/plugins/`, override with `--plugin-dir`), then in `PATH`.
@@ -67,7 +78,8 @@ The core searches for the binary first in the plugin directory (default
 ## Process isolation in practice
 
 Each `loadsmith run` spawns two child processes — the source plugin and the
-destination plugin — plus a sink process when a `sink:` block is configured (see
+destination plugin — plus a sink process when a `sink:` block is configured, and,
+before those, one short-lived process per referenced provider instance (see
 [Sink Delivery](./sink-delivery.md)). The core communicates with them via file descriptors — no
 network sockets, no shared memory, no IPC libraries.
 

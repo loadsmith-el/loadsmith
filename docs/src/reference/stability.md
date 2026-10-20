@@ -26,14 +26,14 @@ SDK version (or language) it was built with.
 
 | Interface | What is frozen | Compatible evolution (minor) |
 |---|---|---|
-| **Wire protocol v1** | The fd layout (fd0 control core→plugin, fd1 control plugin→core, fd3 Arrow IPC data, fd4 events; stderr is free-form). JSONL framing. Every message's `type` and required fields. The `schema` message's [field-type vocabulary](../protocol/messages.md#schema), its field-object shape, and the rule that the Arrow IPC header is the authoritative schema. Handshake and version negotiation (`protocol_supported_versions` → `set_protocol_version`). Lifecycle ordering, including the commit point (the core ends the destination's fd3 only after the source succeeded). The [abort rules](../protocol/reference.md#abort-rules): `cancel`, `error` and its codes, the grace period, then kill. The [`resend` rule](../protocol/reference.md#malformed-lines-and-resend) for malformed control lines. The [tolerant-reader rule](../protocol/reference.md#compatibility-rule-tolerant-reader). | New optional fields. New message types a receiver may safely ignore. New field types and type parameters (read as unknown by an older receiver). A change the receiver must understand needs **protocol v2**, negotiated in the handshake. Every 1.x engine keeps speaking v1. |
+| **Wire protocol v1** | The fd layout (fd0 control core→plugin, fd1 control plugin→core, fd3 Arrow IPC data, fd4 events; stderr is free-form). JSONL framing. Every message's `type` and required fields, including the provider conversation (`resolve`/`resolved`, capability `resolve`, `ready` after `start`, stdin EOF ends it) and the kind spellings `source`, `destination`, `sink`, `parser`, `provider`. The `schema` message's [field-type vocabulary](../protocol/messages.md#schema), its field-object shape, and the rule that the Arrow IPC header is the authoritative schema. Handshake and version negotiation (`protocol_supported_versions` → `set_protocol_version`). Lifecycle ordering, including the commit point (the core ends the destination's fd3 only after the source succeeded). The [abort rules](../protocol/reference.md#abort-rules): `cancel`, `error` and its codes, the grace period, then kill. The [`resend` rule](../protocol/reference.md#malformed-lines-and-resend) for malformed control lines. The [tolerant-reader rule](../protocol/reference.md#compatibility-rule-tolerant-reader). | New optional fields. New message types a receiver may safely ignore. New field types and type parameters (read as unknown by an older receiver). A change the receiver must understand needs **protocol v2**, negotiated in the handshake. Every 1.x engine keeps speaking v1. |
 | **CLI** | Commands and subcommands, flags and their defaults and meaning, the [exit-code table](cli.md#exit-codes) (`0`–`5`, `130`, `143`), graceful cancel on SIGINT/SIGTERM, and the split of the human report on stdout from diagnostics on stderr. The [JSON run summary](cli.md#machine-readable-run-summary) of `run` (`--output json`, `--summary-file`), versioned by its `version` field (now `1`): every field, its type and meaning. | New commands and new flags. A new exit code only for a case that exits `1` today. New run-summary fields (consumers ignore unknown ones); a change to an existing field needs a new summary `version`. |
-| **`pipeline.yaml` schema** | Every core-owned key, its type, default and meaning (including `pipeline.timeouts`). Unknown core-owned keys are rejected. The template syntax `{{ env('VAR') }}` / `{{ file('/path') }}`. | New optional keys and new template functions. The contents of each plugin's `config:` block belong to that plugin and are versioned by it. |
+| **`pipeline.yaml` schema** | Every core-owned key, its type, default and meaning (including `pipeline.timeouts`). Unknown core-owned keys are rejected. The `providers:` block (`type`, `config`, `timeout_seconds`). The template syntax `{{ env('VAR') }}` / `{{ file('/path') }}` / `{{ secret('<instance>', '<ref>') }}`, the `secret()` rules (declared instance; not in `pipeline:`/`state:`/`providers:`) and the masking of every resolved value. | New optional keys and new template functions. The contents of each plugin's `config:` block belong to that plugin and are versioned by it. |
 | **Incremental state file** | The [state file format](../architecture/incremental-state.md#state-file-format), versioned by its `version` field, and the lock file's lease semantics. | A new engine reads every older format and upgrades it on its next save. An engine refuses a format newer than it understands rather than downgrading it. |
 | **Plugin manifest** | `apiVersion: loadsmith.dev/plugin/v1` and its fields (`name`, `version`, `protocol`, `provides`, `runtime`). | New optional fields. Incompatible changes go into a new `apiVersion`, and v1 stays accepted throughout 1.x. |
 | **Plugin index** | The `index.json` shape: `{"plugins": {"<name>": {"latest": "<version>", "versions": {"<version>": "<manifest URL>"}}}}`. | New optional fields. |
 | **Image tags** | `ghcr.io/loadsmith-el/loadsmith` with the flavors `static`, `static-debug`, `slim` and `bundled`. Each release publishes `:vX.Y.Z-<flavor>` and `:sha-<sha7>-<flavor>`. A stable release also moves the rolling `:<flavor>` and `:latest` (= `slim`); a prerelease moves no rolling tag. The binary is `/usr/local/bin/loadsmith` and is the entrypoint. | New flavors. |
-| **Plugin discovery** | A plugin of kind `<kind>` and type `<type>` is the executable `loadsmith-<kind>-<type>`. It is looked up in `--plugin-dir` (default `$HOME/.loadsmith/plugins`) first, then on `PATH`. | New kinds. |
+| **Plugin discovery** | A plugin of kind `<kind>` and type `<type>` is the executable `loadsmith-<kind>-<type>` (a provider: `loadsmith-provider-<type>`). It is looked up in `--plugin-dir` (default `$HOME/.loadsmith/plugins`) first, then on `PATH`. | New kinds. |
 
 ## Not covered
 
@@ -54,8 +54,11 @@ These can change in any release:
   use the [JSON run summary](cli.md#machine-readable-run-summary) and the exit
   code.
 - **Experimental parts** (defined, but not wired into the core):
-  - the `parser` and `config-provider` plugin kinds. They exist in the protocol,
-    the SDK and the manifest's known kinds, but the core never spawns them.
+  - the `parser` plugin kind: its messages (`parse_object`, `object_parsed`),
+    the `parse` capability, a raw source's `object_output`/`ready` form and the
+    `parser:` pipeline block. They exist in the protocol and the config model,
+    but the core never spawns a parser (`loadsmith run` rejects a `parser:`
+    block) and the SDK has no parser runtime yet.
 
   Experimental parts become covered when they are documented without this label.
 - **Behavior that contradicts the documentation** is a bug. Fixing it is not a
@@ -131,13 +134,34 @@ These were open and are now settled. 1.0 freezes them as described.
    failures too, with the exit code and the cause. Its schema is frozen in the
    [CLI reference](cli.md#machine-readable-run-summary); fields are only added
    within a version.
+9. **Providers are wired into 1.0 (inline values).** A `providers:` block
+   declares instances; `{{ secret('<instance>', '<ref>') }}` reads a value from
+   one. The core runs the referenced instances before the state lock and before
+   any data plugin, one `resolve` per distinct reference, and fails the run
+   with exit `3` (`4` for a missing binary) if a value cannot be had. Loading a
+   whole document from a remote reference (`--config-ref`) is deferred to 1.x.
+   Three details were decided with it:
+   - **D1 — one kind name: `provider`.** The former `config_provider` /
+     `config-provider` kind is renamed everywhere: wire `"provider"`, manifest
+     `kind: provider`, `--kind provider`, binary `loadsmith-provider-<type>`. The
+     old spelling is not accepted (no engine ever ran one). Its `fetch`
+     capability and the `finished.message` payload form are gone; a provider
+     speaks `resolve`/`resolved`.
+   - **D2 — `file()` values are masked**, like `env()` and `secret()` values:
+     every resolved template value is treated as a secret, in logs, plugin
+     stderr, error texts, the run summary and `--print-resolved-config`.
+   - **D3 — `loadsmith validate` is static by default**: structure, template
+     syntax, and every `secret()` naming a declared instance, with nothing
+     evaluated or started. `validate --resolve` performs the full resolution,
+     providers included.
 
 ## Open decisions before 1.0
 
 These are still open, and each one changes what 1.0 freezes:
 
-1. **Experimental kinds.** Wire `config-provider` (and `parser`) into the core
-   before 1.0, or ship 1.0 without them and add them in a 1.x minor?
+1. **The parser kind.** Its wire contract is defined in v1 (experimental); the
+   core wiring and SDK runtime are the next step. Ship 1.0 with it covered, or
+   keep it experimental and cover it in a 1.x minor?
 2. **Remote state backends.** The `s3` state backend will need its own format
    and lock semantics. Should they fall under the same state-format version?
 3. **Publishing the SDK crates** to crates.io (they are consumed by git

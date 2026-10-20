@@ -109,6 +109,9 @@ handles:
 
 2. **Draining destination fd4** — same reasoning.
 
+   Each plugin's stderr is copied to the engine's stderr by its own task
+   too, line by line, with resolved template values masked.
+
 3. **The sink supervisor** (only with a `sink:` block) — spawned before the
    pump, it delivers each `object_ready` file as the destination finalizes it
    (see [Sink Delivery](./sink-delivery.md)).

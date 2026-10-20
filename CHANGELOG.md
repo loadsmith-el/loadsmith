@@ -72,8 +72,63 @@ release notes in their repositories.
   work, answers `ping`, honours `resend`, and stops on `cancel`, `error`, or a
   lost core. `cancel()` is now called whenever a run will not complete after
   `start` (including the plugin's own failure), before `finished`.
+- **Providers are wired into the core.** A `providers:` block in
+  `pipeline.yaml` declares provider instances (`type`, `config`,
+  `timeout_seconds`), and `{{ secret('<instance>', '<ref>') }}` reads a value
+  from one. Before the state lock and before any data plugin starts, the core
+  spawns each referenced instance once (in parallel; unused ones are warned
+  about and not started), sends one `resolve` per distinct reference, and
+  substitutes the values. Values stay in memory, never on disk. A provider
+  failure (unresolvable reference, crash, protocol violation, timeout —
+  default 60 s per instance) fails the command with exit `3`; a missing or
+  unusable provider binary with `4`. `secret()` naming an undeclared instance,
+  or used in `pipeline:`, `state:` or `providers:`, is a static error. See the
+  [pipeline reference](docs/src/reference/pipeline-yaml.md#providers).
+- Protocol: `resolve{id, ref}` (core → provider) and `resolved{id, value |
+  error{code, message}}` (provider → core), capability `resolve`; a provider
+  replies `ready` to `start` and sends `finished` after stdin EOF. SDK:
+  `ProviderPlugin` / `run_provider` / `ResolveFailure`. See
+  [Writing a Provider](docs/src/plugins/writing-a-provider.md).
+- Protocol (experimental, not wired into the core yet): the parser messages
+  `parse_object{path}` and `object_parsed{path, rows, batches,
+  last_batch_seq}`, capabilities `parse` and `object_output` for a raw source
+  (which replies `ready` to `start`), and a strict `parser:` block in
+  `pipeline.yaml` (rejected by `loadsmith run` for now; not combinable with
+  `state:`). Golden fixtures pin every new message.
+- `loadsmith validate --resolve`: the full resolution `run` performs,
+  providers included.
+- `loadsmith state show|rm` resolve only `pipeline:` and `state:`: they never
+  start a provider and no longer need the other blocks' templates (database
+  credentials) to resolve.
 
 ### Changed
+
+- **Breaking: the `config_provider` kind is renamed `provider`** (wire
+  `"provider"`, manifest `kind: provider`, `--kind provider`, binary
+  `loadsmith-provider-<type>`); the old spelling is not accepted. The provider
+  `fetch` capability, the `finished.message` payload form and the SDK's
+  `ConfigProviderPlugin` / `run_config_provider` are removed.
+- **Breaking: `loadsmith validate` is static by default.** It checks the
+  structure, the template syntax and that every `secret()` names a declared
+  provider instance, and evaluates nothing (an unset environment variable
+  passes). Use `--resolve` for the previous behavior, plus providers.
+- **Breaking: the `aws.sm(...)` template form is retired** (it only ever
+  returned an error); use a provider and `secret()`. Template arguments are now
+  parsed strictly (string literals, no nesting) and errors name their location.
+- **Breaking: plugin stderr is piped through the core** instead of inherited:
+  it is copied to the engine's stderr line by line, masked. A provider's log
+  lines and stderr are held until its conversation is over, then printed.
+- **Every resolved template value is masked, everywhere**: `env()`, `file()`
+  (newly masked) and `secret()` values, also line by line for multi-line
+  values (trimmed lines of at least 8 characters) and in their JSON-escaped
+  spelling, in plugin log lines, plugin stderr, plugin error texts
+  (`configure_ack`, `finished`, `resolved`), abort reasons, the final `error:`
+  line, the run summary's `cause` and `--print-resolved-config` (before:
+  `env()` values in `--print-resolved-config` only).
+- `run --dry-run` and `run --print-resolved-config` resolve providers too
+  (they start the provider plugins, never the data plugins).
+- `run` evaluates every `env()`/`file()` before it starts a provider, so an
+  unset variable fails without side effects.
 
 - **Protocol v1 now has a commit point.** The core writes the Arrow IPC
   end-of-stream marker to the destination's fd3 only after the source's
@@ -138,6 +193,10 @@ release notes in their repositories.
 
 ### Fixed
 
+- The `error:` line of a configuration error printed the inner message twice
+  (`configuration error: validation error: X: validation error: X`).
+- Error texts no longer print a plugin kind's Rust spelling
+  (`ConfigProvider`): one helper spells every kind.
 - `loadsmith_arrow::record_batch_to_json_rows` (the jsonl destination's
   converter) **panicked on any timestamp not in milliseconds** and silently
   wrote `null` for `int8`/`int16`, unsigned integers, decimals, lists,

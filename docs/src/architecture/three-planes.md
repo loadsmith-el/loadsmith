@@ -9,7 +9,8 @@ different purposes, different failure modes.
 Plugin process
   fd0 (stdin)  ←──── JSONL ──── core    control plane (core → plugin)
   fd1 (stdout) ────► JSONL ──── core    control plane (plugin → core)
-  fd3          ────► Arrow IPC ─ core    data plane    (source → core)
+  fd2 (stderr) ────► text ───── core    copied to the engine's stderr, masked
+  fd3          ────► Arrow IPC ─ core    data plane    (source/parser → core)
                ←──── Arrow IPC ─ core    data plane    (core → destination)
   fd4          ────► JSONL ──── core    event plane   (plugin → core)
 ```
@@ -71,7 +72,11 @@ The event plane carries **plugin-emitted events**: log messages, progress
 updates, and the incremental-state messages `checkpoint` (source) and `committed`
 (destination), which the core routes to its state supervisor (see
 [Incremental State](./incremental-state.md)). Plugins write JSONL events to fd4 at any point during execution; the
-core drains this channel concurrently and routes each event to the tracing system.
+core drains this channel concurrently and routes each event to the tracing system,
+with every resolved `env()`/`file()`/`secret()` value masked in log messages. A
+provider's fd4 is drained the same way but its log lines are held and logged
+(masked) once its conversation is over: a value is maskable only once the core
+has read the `resolved` that carries it.
 
 ```json
 {"type": "log", "level": "info", "message": "cursor opened, fetching batches"}
@@ -103,10 +108,11 @@ makes progress.
 
 | Channel | Format | Direction | What goes here |
 |---|---|---|---|
-| fd0 (stdin) | JSONL | core → plugin | Lifecycle commands (handshake, configure, start; `deliver_object` / `ping` for sinks) |
-| fd1 (stdout) | JSONL | plugin → core | Lifecycle responses (ack, schema, ready, finished) |
-| fd3 | Arrow IPC | source→core, core→dest | Record batches (a sink has no fd3) |
-| fd4 | JSONL | plugin → core | Log events, progress updates, `object_ready`, `checkpoint`, `committed` |
+| fd0 (stdin) | JSONL | core → plugin | Lifecycle commands (handshake, configure, start; `deliver_object` / `ping` for sinks; `resolve` for providers; `parse_object` for parsers, reserved) |
+| fd1 (stdout) | JSONL | plugin → core | Lifecycle responses (ack, schema, ready, `resolved`, finished) |
+| fd3 | Arrow IPC | source/parser→core, core→dest | Record batches (sinks, providers and raw sources have no fd3) |
+| fd4 | JSONL | plugin → core | Log events, progress updates, `object_ready`, `object_parsed`, `checkpoint`, `committed`. Always wired and drained, for every kind |
+| fd2 (stderr) | text | plugin → core | Not a protocol channel: copied to the engine's stderr line by line with resolved values masked (held until the end for a provider) |
 
 No other information crosses these boundaries. A plugin does not know what the
 core will do with its data, and the core does not know how the plugin stores its

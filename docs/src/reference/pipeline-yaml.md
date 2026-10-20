@@ -21,9 +21,21 @@ pipeline:
     stall_seconds: int        # opt-in: no batch for N s fails the run. Default: 0 (off)
     first_batch_seconds: int  # with stall_seconds on: budget for the first batch. Default: 3600
 
+providers:                # optional — provider instances for secret() templates
+  <instance>:             #   name: letters, digits, '_' and '-'
+    type: string          #   required — provider plugin type → loadsmith-provider-<type>
+    config:               #   optional — passed to the provider (env()/file() allowed,
+      # provider fields   #     never secret())
+    timeout_seconds: int  #   optional — budget from spawn to finished. Default: 60; 0 = none
+
 source:
   type: string            # required — source plugin type (e.g., "postgres")
   config:                 # optional — arbitrary object passed to the source plugin
+    # plugin-specific fields
+
+parser:                   # optional — EXPERIMENTAL: accepted by the config model,
+  type: string            #   rejected by `loadsmith run` (not wired into the core yet)
+  config:
     # plugin-specific fields
 
 destination:
@@ -101,6 +113,45 @@ pipeline:
 | `type` | string | yes | Source plugin type. Resolved to binary `loadsmith-source-{type}` |
 | `config` | object | no | Passed verbatim to the source plugin's `configure()` after template resolution. Defaults to empty; the plugin decides which of its fields are required |
 
+### `providers`
+
+Optional. Declares the **provider** instances whose values the pipeline reads
+with [`secret()`](#-secretinstance-ref-). Each key is an instance name
+(letters, digits, `_`, `-`); the same provider type may back several instances
+with different configs.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `type` | string | yes | Provider plugin type. Resolved to binary `loadsmith-provider-{type}` |
+| `config` | object | no | Passed to the provider's `configure()`. May use `env()` and `file()`, never `secret()` |
+| `timeout_seconds` | integer | no | The instance's whole budget, from spawn to its `finished` (every reference included). Default `60`; `0` disables it. A timeout fails the run (exit `3`) |
+
+```yaml
+providers:
+  creds:
+    type: file
+    config: { base_dir: /mnt/secrets }
+source:
+  type: postgres
+  config:
+    password: "{{ secret('creds', 'db.json#password') }}"
+```
+
+Only instances that some `secret()` call references are started; a declared,
+unused instance is logged as a warning and never spawned. Provider instances
+run before the state lock is taken and before any data plugin starts. The
+pipeline-wide `pipeline.timeouts` (handshake, configure, start,
+`cancel_grace_seconds`) apply to providers too, inside their own budget.
+
+### `parser`
+
+**Experimental — not wired into the core yet.** A parser turns the files a
+*raw* source produces (capability `object_output`) into Arrow batches. The block
+is accepted by the config model (strict `type`/`config` keys, like `source`;
+combining it with `state:` is a validation error), but `loadsmith run` rejects a
+pipeline that has one with a "not wired into the core yet" configuration error
+(exit `3`).
+
 ### `destination`
 
 | Field | Type | Required | Description |
@@ -161,15 +212,40 @@ state rm pipeline.yaml` clears it (the next run is a full read).
 ## Template syntax
 
 Any string value anywhere in the file (including the `config` sections,
-`pipeline.name`, `state.path`, …) can include template expressions. Templates are
-resolved by the core over the whole document before it is parsed, and before any
-config is sent to plugins.
+`pipeline.name`, `state.path`, …) can include template expressions; mapping keys
+are never templates. Arguments are string literals in single or double quotes,
+without escapes, and calls do not nest. An unknown expression or a malformed call
+is an error that names its location (e.g. `source.config.password`); the old
+`aws.sm(...)` form is retired (use a provider and `secret()`).
+
+Resolution order, all before the state lock and before any data plugin starts:
+
+1. the file is parsed and checked **statically** — the strict shape and the
+   core-owned validation on the unresolved tree, every template's syntax, and
+   the [`secret()` rules](#-secretinstance-ref-). Nothing is evaluated yet;
+2. `env()`/`file()` everywhere are evaluated (an unset variable fails here,
+   before any provider starts);
+3. the referenced provider instances run and resolve each distinct
+   `secret()` call;
+4. one substitution pass replaces every call with its value, and the result is
+   validated again.
+
+### Masking
+
+Every value produced by `env()`, `file()` or `secret()` is **masked** as `***`
+wherever the engine prints text that could carry it: plugin log lines,
+plugin stderr (piped through the core), plugin error messages (`configure_ack`,
+`finished`, `resolved`), the abort reasons sent to plugins, the final `error:`
+line, the run summary's `cause` and `--print-resolved-config`. A multi-line
+value (a PEM key) is also masked line by line (every trimmed line of at least 8
+characters), and its JSON-escaped spelling is masked too. Masking is substring
+replacement: a very short value (`1`, `on`) masks every occurrence of that text,
+and a value a plugin transforms before printing it (base64, URL-encoding) is not
+recognised.
 
 ### `{{ env('VAR_NAME') }}`
 
-Reads the value of environment variable `VAR_NAME`. The variable is added to the
-mask list; it will appear as `***` in `--print-resolved-config` output. (The
-mask is applied only there — run logs are not masked.)
+Reads the value of environment variable `VAR_NAME`. The value is masked.
 
 ```yaml
 source:
@@ -183,9 +259,9 @@ If the variable is not set, the pipeline fails before spawning any plugin.
 ### `{{ file('/path/to/file') }}`
 
 Reads the contents of the file at `/path/to/file` as a UTF-8 string. The
-contents are inserted with trailing whitespace and newlines trimmed. Unlike
-`env()`, the value is not masked in `--print-resolved-config`. Useful for reading
-key files, certificates, or multi-line secrets.
+contents are inserted with trailing whitespace and newlines trimmed. The value
+is masked, like `env()`'s. Useful for reading key files, certificates, or
+multi-line secrets.
 
 ```yaml
 source:
@@ -195,6 +271,38 @@ source:
       mode: verify-full
       root_cert: "{{ file('/etc/ssl/certs/pg-ca.crt') }}"
 ```
+
+### `{{ secret('instance', 'ref') }}`
+
+Resolved by the provider instance declared as `providers.<instance>`. `ref` is
+opaque to the core — its syntax is the provider's (the `file` provider takes
+`path[#key]`, e.g. `db.json#password`). The value is masked.
+
+```yaml
+providers:
+  creds:
+    type: file
+    config: { base_dir: /mnt/secrets }
+source:
+  type: postgres
+  config:
+    user: "{{ secret('creds', 'db.json#user') }}"
+    password: "{{ secret('creds', 'db.json#password') }}"
+```
+
+Rules:
+
+- the instance must be declared under `providers:` — an undeclared one is a
+  static error (`loadsmith validate` catches it, exit `3`);
+- `secret()` is not allowed in `pipeline:`, `state:` or `providers:`: those
+  blocks resolve without providers (`loadsmith state show|rm` read only
+  `pipeline:` and `state:`, and a provider's own config is resolved before it
+  starts);
+- each distinct `(instance, ref)` pair is resolved once per run, however often
+  it appears; values are kept in memory for the run only, never on disk;
+- a reference the provider cannot resolve, a provider crash, a protocol error
+  or a timeout fails the run before anything else starts (exit `3`); a provider
+  binary that is not installed exits `4`.
 
 ### Combining templates
 

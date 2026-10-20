@@ -29,7 +29,7 @@
 - [Writing a Source Plugin](./plugins/writing-a-source.md)
 - [Writing a Destination Plugin](./plugins/writing-a-destination.md)
 - [Writing a Sink Plugin](./plugins/writing-a-sink.md)
-- [Writing a Config Provider](./plugins/writing-a-config-provider.md)
+- [Writing a Provider](./plugins/writing-a-provider.md)
 
 # Protocol Reference
 

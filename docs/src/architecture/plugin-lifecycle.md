@@ -66,7 +66,7 @@ The plugin responds with `HandshakeAck` announcing:
   shown in the run summary, not enforced by the core
 - `plugin_version` — semver string from `Cargo.toml`
 - `protocol_supported_versions` — the protocol versions this plugin understands
-- `kind` — `source`, `destination`, `sink`, `parser` or `config_provider`; the
+- `kind` — `source`, `destination`, `sink`, `parser` or `provider`; the
   core rejects a plugin whose kind is not the one it expects
 
 ## Phase 2 — Version negotiation
@@ -80,10 +80,11 @@ version is **1**.
 The core asks for a capabilities list. Plugins respond with the `supports` array.
 The SDK defaults are `batch_read` + `schema_inference` for sources and
 `batch_write` for destinations; plugins add their own (e.g. `incremental_state`,
-`object_output`, `staged_merge`). The core enforces two of them:
+`object_output`, `staged_merge`). The core enforces three of them:
 
 - `incremental_state` on the source, required when the pipeline has a `state:`
   block;
+- `resolve` on every provider instance it starts;
 - `object_output` on the destination, required when the pipeline has a `sink:`
   block.
 
@@ -213,3 +214,20 @@ stopping is ignored; the grace period already bounds the wait.
 
 The full rules are in the
 [protocol reference](../protocol/reference.md#abort-rules).
+
+## Providers
+
+A provider goes through the same handshake, capabilities (it must advertise
+`resolve`), configure and `start` phases, answers `start` with `ready`, and
+then, instead of moving data, answers one `resolve{id, ref}` at a time with
+`resolved{id, value}` or `resolved{id, error}`. When every reference is
+resolved the core closes the provider's stdin; the provider sends
+`finished{status: success}` and exits. All of this happens before the state
+lock and before any data plugin is spawned. The SDK (`run_provider`) waits
+for `resolve` and the core at the same time, so `cancel` stops a provider
+mid-resolve. See the
+[protocol reference](../protocol/reference.md#providers-value-resolution).
+
+Parsers (and the raw sources that feed them) have a lifecycle defined in the
+protocol but are not driven by the core yet; see
+[Parsers](../protocol/reference.md#parsers-reserved).

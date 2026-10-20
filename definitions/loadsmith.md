@@ -35,8 +35,8 @@ The goal is not to build a heavy transformation tool, nor to replace dbt, Spark 
 * Use **YAML** as the canonical configuration format.
 * Use typed Rust structs as the internal configuration model.
 * Have a portable architecture, starting with Linux, but without blocking future Windows support.
-* Support local and remote configuration via **configuration providers** (*planned*).
-* Support safe secret resolution via providers.
+* Support remote whole-document configuration loading (*planned*: `--config-ref`, 1.x).
+* Support safe secret resolution via **provider** plugins (`secret()` templates).
 * Have good observability from the start.
 
 ### 2.2 Initial non-goals
@@ -89,8 +89,8 @@ Plugins
   ├── Sources
   ├── Destinations
   ├── Sinks
-  ├── Parsers                        (protocol-level only, not yet run by the core)
-  └── Configuration/Secret Providers (protocol/SDK only, not yet run by the core)
+  ├── Parsers                        (protocol defined; core wiring planned)
+  └── Providers                      (resolve `secret()` values before a run)
 
 Protocols
   ├── Control plane: JSONL
@@ -111,8 +111,8 @@ Responsibilities:
 * read the YAML configuration;
 * parse the configuration safely;
 * resolve templates;
-* resolve external configuration references (*planned*);
-* resolve secrets;
+* resolve external configuration references (*planned*, 1.x);
+* resolve secrets (`secret()` calls, through provider plugins);
 * convert the resolved configuration into typed Rust structs;
 * validate the pipeline;
 * discover available plugins;
@@ -162,13 +162,18 @@ Conceptual flow:
 ```text
 pipeline.yaml
   -> safe YAML parse
-  -> template resolution
-  -> configuration provider resolution (planned)
-  -> secret resolution
-  -> deserialization into typed Rust structs
-  -> strong validation
-  -> execution
+  -> static check of the unresolved tree (strict typed shape, core-owned
+     validation, template syntax, secret() rules)          — no side effects
+  -> env()/file() in providers:, then the referenced provider instances run
+     (one resolve per distinct secret() call)
+  -> one substitution pass: env()/file()/secret() everywhere
+  -> deserialization into typed Rust structs + validation
+  -> state lock, data plugins, execution
 ```
+
+All of this happens before the state lock is taken and before any data
+plugin is spawned. (Whole-document loading from a remote reference,
+`--config-ref`, is planned for 1.x; see §12.)
 
 ### 6.2 Separating core config from plugin config
 
@@ -203,12 +208,27 @@ The model in Rust (`crates/loadsmith-config/src/model.rs`, abridged):
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     pub pipeline: PipelineMeta,
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderRef>, // instance name → provider
     pub source: PluginRef,
+    #[serde(default)]
+    pub parser: Option<PluginRef>, // accepted; not driven by the core yet
     pub destination: PluginRef,
     #[serde(default)]
     pub sink: Option<PluginRef>,
     #[serde(default)]
     pub state: Option<StateConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRef {
+    #[serde(rename = "type")]
+    pub plugin_type: String,
+    #[serde(default)]
+    pub config: serde_yaml::Value,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>, // default 60; 0 disables
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,8 +395,12 @@ Examples:
 
 #### Parser
 
-Converts a raw format into tabular data. (Reserved kind in the protocol; no SDK
-runtime and not run by the core yet.)
+Converts files into tabular data: a *raw* source (capability `object_output`)
+announces local files with `object_ready`, the core hands each to the parser
+(`parse_object`), and the parser writes Arrow on fd3 in the source's place.
+(The protocol messages and the `parser:` config block exist; the core does not
+drive parsers yet — `loadsmith run` rejects a `parser:` block — and there is no
+SDK runtime yet. Experimental.)
 
 Examples:
 
@@ -386,20 +410,19 @@ Examples:
 * XML;
 * Parquet.
 
-#### Configuration Provider
+#### Provider
 
-Loads external configuration. (The SDK runtime and the canonical `file` provider
-exist, but the core does not invoke config providers yet.)
+Resolves configuration values: each `{{ secret('<instance>', '<ref>') }}` call
+is answered by the provider instance declared as `providers.<instance>` (binary
+`loadsmith-provider-<type>`). The core runs the referenced instances before the
+run, sends one `resolve` per distinct reference, and masks every value (see
+§11–13). SDK: `ProviderPlugin` / `run_provider`.
 
 Examples:
 
-* local file;
-* S3;
-* Google Cloud Storage;
-* Azure Blob Storage;
-* HTTP/HTTPS;
-* AWS Secrets Manager;
-* environment variables.
+* local file (`file`, ref `path[#key]`; being updated to the provider API);
+* AWS Secrets Manager (planned, 1.x — needs SigV4);
+* AWS SSM Parameter Store, Vault, Azure Key Vault, Google Secret Manager (future).
 
 ---
 
@@ -531,43 +554,52 @@ Local TCP is not the preference, but may be evaluated as a fallback.
 
 Loadsmith supports templates in the configuration via an **internal expression parser**, with no dependency on external engines such as Jinja2, Liquid or Tera.
 
-The syntax uses `{{ }}` as the delimiter. The expressions implemented today are:
+The syntax uses `{{ }}` as the delimiter. There are three functions:
 
 * `{{ env('VAR') }}` — the value of an environment variable;
-* `{{ file('/path') }}` — the raw contents of a local file, with trailing whitespace trimmed.
+* `{{ file('/path') }}` — the raw contents of a local file, with trailing whitespace trimmed;
+* `{{ secret('<instance>', '<ref>') }}` — a value resolved by the provider
+  instance declared as `providers.<instance>` (see §13). `<ref>` is opaque to the
+  core: its syntax belongs to the provider (e.g. `db.json#password`).
 
-Templates are resolved in any string value of the YAML document, before it is
+Arguments are string literals in single or double quotes, with no escapes; calls
+do not nest (`secret('a', env('X'))` is an error). Templates are resolved in any
+string value of the YAML document (never in mapping keys), before it is
 deserialized.
 
 Examples:
 
 ```yaml
 url: "{{ env('DATABASE_URL') }}"
+password: "{{ secret('creds', 'db.json#password') }}"
 ```
 
-*Planned, not implemented:* chained access with an argument, such as
-`{{ aws.sm('/path').field }}` (today `aws.sm` fails with "provider not
-available"), and dot-field access on `file()`:
+The retired `aws.sm('/path').field` form is rejected with an error pointing to
+`secret()`; AWS Secrets Manager becomes a provider (planned, 1.x). Dot-field
+access on `file()` is not supported — a provider (such as the `file` provider's
+`path#key` reference) selects fields.
 
-```yaml
-username: "{{ aws.sm('/dev/secret').username }}"
-password: "{{ aws.sm('/dev/secret').password }}"
-```
+Resolution is staged: a static pass parses every template (a syntax error
+reports its dotted location, e.g. `source.config.password`) and collects the
+`secret()` calls without evaluating anything; a single substitution pass then
+replaces each call with its value. Every resolved value — `env()`, `file()` and
+`secret()` alike — is masked (see §13).
 
-The parser resolves expressions inside YAML string values. It does not support loops, conditionals, filters or inheritance — these features are out of scope. The surface area is intentionally small: a function call with a string-literal argument (plus, when implemented, field access by dot).
+The parser resolves expressions inside YAML string values. It does not support loops, conditionals, filters or inheritance — these features are out of scope. The surface area is intentionally small: a function call with string-literal arguments.
 
 If the need grows in the future, migrating to MiniJinja is viable without breaking the syntax, since the `{{ }}` delimiter is compatible.
 
 ---
 
-## 12. Configuration Providers
+## 12. Remote configuration documents
 
-> **Planned — not implemented.** The SDK defines a config-provider plugin kind and
-> the canonical `file` provider exists, but the core never invokes one, and the
-> `LOADSMITH_CONFIG_REF` variable and `--config-ref` flag below do not exist. This
-> section is the intended design.
+> **Planned for 1.x — not implemented.** Loading a *whole* pipeline document
+> from a remote reference (the `LOADSMITH_CONFIG_REF` variable and the
+> `--config-ref` flag below) does not exist yet. Providers (kind `provider`)
+> resolve inline `secret()` values today (§13); a later minor release may let
+> them load whole documents too. This section is the intended design.
 
-Configuration providers let the configuration be loaded from external sources. Providers are pluggable — the community can create new ones.
+Remote configuration lets the pipeline document itself be loaded from external sources. Providers are pluggable — the community can create new ones.
 
 ### 12.1 Reference format
 
@@ -598,9 +630,9 @@ Via CLI flag:
 loadsmith run --config-ref "s3://bucket/path/config.yml"
 ```
 
-### 12.3 Planned providers
+### 12.3 Planned document providers
 
-* `file://` — local file (exists as the canonical `file` plugin)
+* `file://` — local file
 * `s3://` — Amazon S3
 * `gs://` — Google Cloud Storage
 * `https://` / `http://` — plain HTTP
@@ -628,20 +660,56 @@ source:
 url: "{{ env('DATABASE_URL') }}"
 ```
 
-Providers:
+Secret stores are reached through **provider** plugins. A pipeline declares the
+instances it uses under `providers:` and references them with `secret()`:
 
-* `env('VAR')` — environment variable (implemented);
-* `file('/path')` — raw contents of a local file (implemented; `.field` access is planned);
-* `aws.sm('/path').field` — AWS Secrets Manager (planned);
-* `aws.ssm('/path')` — AWS SSM Parameter Store (planned);
-* Vault, in the future;
-* Azure Key Vault, in the future;
-* Google Secret Manager, in the future.
+```yaml
+providers:                       # optional; instance name → provider (strict keys)
+  sm:
+    type: aws-secrets-manager    # → loadsmith-provider-aws-secrets-manager (planned)
+    config: { region: us-east-1, prefix: "{{ env('ENV') }}/" }
+    timeout_seconds: 30          # optional; default 60, 0 disables
+  creds:
+    type: file                   # → loadsmith-provider-file
+    config: { base_dir: /mnt/s3/secrets }
+source:
+  type: postgres
+  config:
+    password: "{{ secret('creds', 'db.json#password') }}"
+```
 
-Values resolved via `env()` are masked as `***` in the output of
-`--print-resolved-config`. Today that is the only place the mask is applied — run
-logs and events are not masked, and `file()` values are not added to the mask.
-Masking every resolved secret everywhere remains the goal.
+Rules:
+
+* instance names use letters, digits, `_` and `-`; a `secret()` naming an
+  undeclared instance is a static error;
+* `secret()` is not allowed in `pipeline:`, `state:` or `providers:` — those
+  blocks resolve without providers (the state commands read just `pipeline:` +
+  `state:`; a provider's own config may use `env()`/`file()`);
+* only instances some `secret()` references are started (a declared, unused one
+  is logged as a warning); each is spawned once, all in parallel, and asked once
+  per distinct reference;
+* resolved values live in memory for the run only — never on disk;
+* everything is resolved before the state lock is taken and before any data
+  plugin starts; a provider failure (an unresolvable reference, a crash, a
+  timeout) fails the run with the configuration exit class and nothing runs.
+
+Value sources:
+
+* `env('VAR')` — environment variable;
+* `file('/path')` — raw contents of a local file;
+* `secret('<instance>', '<ref>')` — a provider: `file` (canonical, being updated
+  to the provider API); AWS Secrets Manager (planned, 1.x); AWS SSM Parameter
+  Store, Vault, Azure Key Vault, Google Secret Manager in the future.
+
+**Masking.** Every value resolved by `env()`, `file()` or `secret()` is masked as
+`***` — and, for a multi-line value (a PEM key), every trimmed line of at least 8
+characters, and the JSON-escaped spelling of the value. The mask is applied to
+plugin log lines (fd4), plugin stderr (piped through the core), plugin error
+texts (`configure_ack`, `finished`, `resolved`), the abort reasons sent to
+plugins, the CLI's final `error:` line, the run summary's `cause`, and
+`--print-resolved-config`. Masking is substring replacement: a very short value
+masks every occurrence of that text, and a value a plugin transforms (base64,
+URL-encoding) is not recognised.
 
 ---
 
@@ -857,7 +925,7 @@ The command tree:
 
 ```bash
 loadsmith run pipeline.yaml
-loadsmith validate pipeline.yaml
+loadsmith validate pipeline.yaml [--resolve]   # static by default; --resolve runs the providers
 loadsmith plugin list
 loadsmith plugin install <name>[:<kind>][@<version>] | --all | -f <manifest> | --binary <path>
 loadsmith plugin uninstall <name>[:<kind>]
@@ -971,8 +1039,8 @@ destination:
 
 * JDBC source;
 * S3 Parquet destination;
-* local and S3 configuration provider;
-* secrets via env and AWS Secrets Manager;
+* local and S3 providers (`file` provider; whole-document loading planned for 1.x);
+* secrets via env and providers (AWS Secrets Manager planned, 1.x);
 * configurable batch size;
 * structured logs;
 * final summary;
@@ -1007,18 +1075,18 @@ JDBC -> Arrow batches -> S3 Parquet
 * Windows later, through a transport abstraction.
 * Localhost TCP is not the preference.
 * Templates are required.
-* Configuration providers must be pluggable.
+* Providers must be pluggable (kind `provider`).
 * Secret providers are required.
 * Plugins in other languages must be possible.
 * Complex SQL must stay in the database/query, not in a Loadsmith DSL.
 * **Core language: Rust.**
 * **Async runtime: Tokio.**
-* **Templates via an internal expression parser** — no external engine; `{{ env('VAR') }}` and `{{ file('/path') }}` today, with `{{ obj.method(arg).field }}` (e.g. `aws.sm`) planned; MiniJinja as a future migration option if needed.
+* **Templates via an internal expression parser** — no external engine; `{{ env('VAR') }}`, `{{ file('/path') }}` and `{{ secret('<instance>', '<ref>') }}` (string-literal arguments, no nesting; the old `aws.sm()` form is retired); MiniJinja as a future migration option if needed.
 * **Plugin discovery via a managed directory** — `~/.loadsmith/plugins/` by default, overridden with `--plugin-dir`; lookup is the plugin directory, then `PATH`; managed with `loadsmith plugin install` (index / `--manifest` / `--binary`), `plugin list` and `plugin uninstall`.
 * **The core is the sole owner of state** — plugins report progress and state values to the core via JSONL, but persist nothing directly.
 * **Formalized JSONL protocol** — ordinal integer versioning starting at `1`; handshake initiated by the core; the shapes of every message are defined in `definitions/protocol.md`.
-* **Secrets resolved inline in the template** — same `{{ }}` syntax, no separate block; the core masks `env()` values in `--print-resolved-config` (masking in logs and events is still a goal).
-* **Configuration provider reference format** (*planned*) — a plain URI when the scheme identifies the provider (`s3://`, `gs://`, `file://`, `https://`); a `provider|url` prefix when the provider uses HTTPS but has its own logic (`azure|https://...`).
+* **Secrets resolved inline in the template** — same `{{ }}` syntax; `secret()` calls are resolved by **provider** plugins declared under `providers:`, before the state lock and before any data plugin. Every `env()`/`file()`/`secret()` value is masked in logs, plugin stderr, error texts, the run summary and `--print-resolved-config`.
+* **Remote document reference format** (*planned*, 1.x) — a plain URI when the scheme identifies the provider (`s3://`, `gs://`, `file://`, `https://`); a `provider|url` prefix when the provider uses HTTPS but has its own logic (`azure|https://...`).
 * **Multi-arch first** — images published for `linux/amd64` and `linux/arm64` (AWS Graviton); the rule is not "no TLS", it is **no per-architecture native/assembly code**. Releases build natively on a dedicated runner per architecture (`ubuntu-latest` / `ubuntu-24.04-arm`, no QEMU) inside a pinned `rust:<version>-alpine` (same version as `rust-toolchain.toml`), producing a static musl binary; C/assembly crypto would still mean a fragile toolchain (`cmake`/`perl`/`nasm`).
 * **TLS via `rustls` + `rustls-rustcrypto`** — the TLS protocol through the mature `rustls` layer (a foundational decision); primitives through the pure-Rust `rustls-rustcrypto` provider. Banned as native crypto: `native-tls`, `openssl-sys`, `ring`, `aws-lc-rs`. The provider is swappable via `CryptoProvider::install_default` (a reversible knob, with per-binary blast radius thanks to process isolation); it applies uniformly to every network plugin (postgres, mysql, oracle, sharepoint, s3).
 * **State communication** — the source reports watermarks with `checkpoint` and the destination reports durability with `committed`, both on fd4.

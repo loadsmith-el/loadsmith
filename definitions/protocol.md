@@ -11,9 +11,17 @@ This document defines the communication contract between the Loadsmith Core and 
 | fd3 | Depends on kind* | Apache Arrow IPC | Batches of tabular data |
 | fd4 | Plugin → Core | JSONL | Logs and structured events |
 
-*fd3 is written by sources and read by destinations. Sinks have no fd3.
+*fd3 is written by sources (and parsers) and read by destinations. Raw
+sources, sinks and providers have no fd3. fd4 is always wired and always
+drained, for every kind (providers included).
 
-`stderr` is not used as a communication channel.
+`stderr` is not a communication channel. The core pipes it and copies it to
+its own stderr line by line, masked (see §4.8).
+
+Plugin kinds (`handshake_ack.kind`, binary `loadsmith-<kind>-<type>`):
+`source`, `destination`, `sink`, `parser`, `provider`. The core drives every
+kind except `parser`, whose messages are defined in v1 but reserved: the core
+does not drive parsers yet.
 
 ---
 
@@ -158,6 +166,67 @@ Every wait of the core is bounded by `pipeline.timeouts` in `pipeline.yaml`:
 `0` disables a limit. A timeout aborts the run (§4.5) and sends `error` with
 code `TIMEOUT` to the plugin that is late.
 
+A provider (§4.9) additionally has one budget for its whole conversation, from
+spawn to `finished`: `providers.<name>.timeout_seconds` (default 60, `0`
+disables).
+
+### 4.8 Masking
+
+Every value the core resolves from a `{{ env() }}`, `{{ file() }}` or
+`{{ secret() }}` template is redacted (`***`) from everything the core prints:
+plugin log lines (fd4), the texts of `configure_ack`, `finished` and
+`resolved` errors, the `cancel`/`error` reasons it sends to plugins, plugin
+stderr, the final `error:` line and the run summary's cause. Each line of at
+least 8 characters of a multi-line value is masked on its own, and so is the
+value's JSON-escaped spelling. A provider's fd4 log lines and stderr are held
+(fd4 is still drained) and printed only after its conversation is over, since
+a value is known to the core only once it has read the matching `resolved`.
+
+### 4.9 Provider lifecycle
+
+Providers resolve the pipeline's `secret('<instance>', '<ref>')` calls. The
+core runs each referenced instance once, all in parallel, **before** the state
+lock and before any data plugin starts:
+
+```
+Core → Provider   handshake / set_protocol_version / capabilities_request
+Provider → Core   handshake_ack (kind: provider) / capabilities_response (must include resolve)
+Core → Provider   configure        → Provider → Core   configure_ack
+Core → Provider   start            → Provider → Core   ready
+Core → Provider   resolve{id, ref} → Provider → Core   resolved{id, value | error}
+                  ... one resolve at a time, one per distinct reference ...
+Core              closes the provider's stdin (EOF: nothing more to resolve)
+Provider → Core   finished (status: success, no counters), then exits
+```
+
+A reference the provider cannot resolve is a `resolved` error, not the end of
+the conversation; the core then aborts with that error. `cancel` and `error`
+may arrive at any time, including during a `resolve`. `resend` replays the
+last control message (the core has at most one `resolve` in flight). The
+first failing instance aborts the others with the rules of §4.5.
+
+### 4.10 Parser lifecycle (reserved)
+
+The core does not drive parsers yet; the shape is fixed in v1 so it can be
+wired without a protocol change. A **raw source** (capability
+`object_output`) has no fd3: it answers `start` with `ready` (not `schema`)
+and announces each finished local file with `object_ready{path}` on fd4. The
+core forwards each path to the **parser** as `parse_object{path}` on fd0. The
+parser takes the source's place on the Arrow side:
+
+```
+raw source ──fd4 object_ready{path}──▶ core ──fd0 parse_object{path}──▶ parser ──fd3──▶ core ──▶ destination
+```
+
+The parser (capability `parse`) answers `start` with `schema`, sent
+after its first `parse_object` (or at once if its config declares the
+columns), writes
+Arrow IPC to fd3, emits `progress` and the informational
+`object_parsed{path, rows, batches, last_batch_seq}` on fd4, and, on stdin EOF
+(no more files), ends the IPC stream with its end-of-stream marker and sends
+`finished{rows_read, batches_read}`. `parse_object` is idempotent per path. A
+later file with a different schema is `finished` error `SCHEMA_MISMATCH`.
+
 ---
 
 ## 5. Message reference
@@ -187,7 +256,7 @@ Fields:
 | `protocol_supported_versions` | `int[]` | Versions supported by the plugin, in ascending order |
 | `plugin_name` | `string` | Plugin identifier (by convention the binary name; not enforced by the core) |
 | `plugin_version` | `string` | Version of the plugin binary |
-| `kind` | `string` | `"source"`, `"destination"`, `"sink"`, `"parser"` or `"config_provider"` |
+| `kind` | `string` | `"source"`, `"destination"`, `"sink"`, `"parser"` or `"provider"` |
 
 ---
 
@@ -229,10 +298,11 @@ Defined capabilities (extensible):
 | `batch_read` | Reads in batches (source SDK default) |
 | `incremental_state` | Source: accepts a resume cursor and reports watermarks via `checkpoint`. Required by the core when the pipeline has a `state:` block |
 | `batch_write` | Writes in batches (destination SDK default) |
-| `object_output` | Destination: stages files and announces each via `object_ready`. Required by the core when the pipeline has a `sink:` block |
+| `object_output` | Destination: stages files and announces each via `object_ready`; required by the core when the pipeline has a `sink:` block. Source: a *raw* source — produces files instead of Arrow (no fd3), answers `start` with `ready`, announces each file via `object_ready` (requires a `parser:`; reserved) |
 | `staged_merge` | Destination: writes to staging and does a `MERGE` by PK at the end — exactly-once effective. Advertised, but not read by the core |
 | `object_delivery` | Sink: delivers staged objects (sink SDK default) |
-| `fetch` | Config provider: fetches a configuration document (config-provider SDK default) |
+| `parse` | Parser: turns files (`parse_object`) into Arrow batches on fd3 (reserved: the core does not drive parsers yet) |
+| `resolve` | Provider: answers `resolve` with `resolved`. Required by the core of every provider (provider SDK default) |
 
 Intra-run durability needs no capability: a destination reports it by emitting `committed` during the run (in the SDK, by implementing `durable_through()`).
 
@@ -285,7 +355,7 @@ is optional).
 
 ### `schema`
 
-**Plugin → Core. Sources only.** Sent before the first batch. Describes the schema of the data that will be produced.
+**Plugin → Core. Sources and parsers.** Sent before the first batch (a raw source sends `ready` instead). Describes the schema of the data that will be produced.
 
 ```jsonl
 {"type":"schema","fields":[{"name":"id","type":"int64","nullable":false},{"name":"name","type":"utf8","nullable":true},{"name":"created_at","type":"timestamp","unit":"us","timezone":"UTC","nullable":true}]}
@@ -322,7 +392,7 @@ schema is the Arrow IPC header on fd3. Full rules:
 
 ### `ready`
 
-**Plugin → Core. Destinations and sinks.** Sent after `start`, signalling that the plugin is ready to receive batches via fd3 (or, for a sink, objects to deliver).
+**Plugin → Core. Destinations, sinks, providers and raw sources.** Sent after `start`, signalling that the plugin is ready: to receive batches via fd3 (destination), objects to deliver (sink), `resolve` requests (provider), or — for a raw source — that it will now announce files via `object_ready`.
 
 ```jsonl
 {"type":"ready"}
@@ -391,14 +461,72 @@ them during the run.
 
 ### `object_ready`
 
-**Destination → Core. Via fd4 (the event channel).** Sent by a file-output
+**Destination or raw source → Core. Via fd4 (the event channel).** Sent by a file-output
 destination when a staged file is finalized (footer written). The core forwards
 the path to the sink supervisor, which delivers it — so delivery overlaps the
 pump. Using the event channel (already drained concurrently) is what allows a
-chunk to be delivered the moment it closes.
+chunk to be delivered the moment it closes. A raw source (capability
+`object_output`) sends it for each local file it produces; the core will
+forward those to the parser as `parse_object` (§4.10, reserved).
 
 ```jsonl
 {"type":"object_ready","path":"/scratch/events.00000001.snappy.parquet"}
+```
+
+---
+
+### `parse_object`
+
+**Core → Parser. Via the control channel. Reserved: the core does not drive
+parsers yet.** Parse the local file at `path` (from a raw source's
+`object_ready`). Idempotent per path. Stdin EOF means "no more files".
+
+```jsonl
+{"type":"parse_object","path":"/mnt/s3/inbox/2026-10-01.csv"}
+```
+
+---
+
+### `object_parsed`
+
+**Parser → Core. Via fd4 (the event channel). Informational; reserved.** A
+file was fully parsed. `last_batch_seq` is the global batch ordinal (1-based,
+as on `checkpoint`) of this file's last batch, `0` when the file produced
+none — defined now so per-file checkpoints stay additive.
+
+```jsonl
+{"type":"object_parsed","path":"/mnt/s3/inbox/2026-10-01.csv","rows":1500,"batches":2,"last_batch_seq":2}
+```
+
+---
+
+### `resolve`
+
+**Core → Provider. Via the control channel.** Resolve one reference — the
+second argument of a `secret('<instance>', '<ref>')` call, opaque to the core.
+`id` is chosen by the core, unique within the conversation, and echoed in
+`resolved`. The core sends one `resolve` at a time and each distinct reference
+once per run (the SDK queues any that arrive while one is in flight).
+
+```jsonl
+{"type":"resolve","id":1,"ref":"db.json#password"}
+```
+
+---
+
+### `resolved`
+
+**Provider → Core. Via the control channel.** The answer to the `resolve` with
+the same `id`: exactly one of `value` (a string) or `error` (`code`,
+`message`). The core masks the value everywhere from then on (§4.8). An answer
+with a wrong `id`, both fields or neither is a protocol violation. An `error`
+fails resolution (exit class "configuration"); the reference is shown in the
+message, the value never. Suggested codes: `NOT_FOUND`, `ACCESS_DENIED`,
+`INVALID_REF`; the SDK default is `RESOLVE_FAILED`.
+
+```jsonl
+{"type":"resolved","id":1,"value":"s3cr3t"}
+{"type":"resolved","id":2,"error":{"code":"NOT_FOUND","message":"no such file: missing.json"}}
 ```
 
 ---
@@ -514,6 +642,12 @@ Success (destination):
 
 ```jsonl
 {"type":"finished","status":"success","rows_written":21473000,"batches_written":2148}
+```
+
+Success (provider, after stdin EOF — no counters, no payload):
+
+```jsonl
+{"type":"finished","status":"success"}
 ```
 
 Error:

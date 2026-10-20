@@ -21,8 +21,8 @@ and a clean separation between control, data, and event channels.
 - **Plugin-first.** Sources, destinations and sinks are separate executables. The
   core knows nothing about Postgres, S3 or Parquet — that knowledge lives in
   plugins. Plugins can be written in any language that speaks the protocol.
-  (Parser and config/secret-provider plugins are defined by the protocol and
-  SDK but not yet wired into the core.)
+  Provider plugins resolve `{{ secret() }}` values before a run. (Parser
+  plugins are defined by the protocol but not yet wired into the core.)
 - **Real streaming.** Data flows in Apache Arrow batches with server-side cursors
   where available, so a 100M-row table never has to fit in RAM.
 - **Three separate planes.** Control, data, and events each get their own channel,
@@ -50,9 +50,9 @@ Plugins (separate processes)
   ├── sources         read data        (e.g. postgres)
   ├── destinations    write data       (e.g. postgres, jsonl, parquet)
   ├── sinks           deliver files    (e.g. local-copy → later s3)
-  ├── parsers         raw → tabular       (protocol-level only, not yet run by the core)
-  └── providers       config / secrets (e.g. file — protocol/SDK only; the core
-                      resolves {{ env() }} / {{ file() }} templates itself)
+  ├── parsers         raw → tabular       (protocol defined; core wiring next)
+  └── providers       secret() values (e.g. file), run by the core before the
+                      data plugins; {{ env() }} / {{ file() }} need none
 
 Channels
   ├── control plane : JSONL over stdin/stdout
@@ -211,13 +211,13 @@ a file; see the [CLI reference](docs/src/reference/cli.md#machine-readable-run-s
 
 ```bash
 loadsmith run pipeline.yaml                 # run a pipeline
-loadsmith run pipeline.yaml --dry-run       # validate without executing
+loadsmith run pipeline.yaml --dry-run       # resolve everything (providers too), run nothing
 loadsmith run pipeline.yaml --print-resolved-config   # show resolved config (secrets masked)
 loadsmith run pipeline.yaml --output json   # one JSON run summary on stdout
 loadsmith run pipeline.yaml --summary-file run.json   # also write it to a file
 loadsmith run pipeline.yaml --plugin-dir ../loadsmith-canonical-plugins/target/debug
 
-loadsmith validate pipeline.yaml            # validate config only
+loadsmith validate pipeline.yaml            # static check, evaluates nothing (--resolve: full)
 loadsmith plugin list                       # list installed plugins
 loadsmith plugin install postgres           # a whole package (source + destination)
 loadsmith plugin install mysql:source@0.1.1 # one kind, pinned version (or --kind source)
@@ -275,19 +275,21 @@ Loadsmith is at **v0.2.0** — the architecture is proven end-to-end:
 - ✅ Control plane (JSONL), data plane (Arrow IPC), event plane (JSONL)
 - ✅ Canonical plugins: `postgres`, `mysql` and `oracle` source + destination
   (`atomic` / `staged_merge`), `sharepoint` source, `jsonl` / `null` / `parquet`
-  destinations, `local-copy` sink, and the `file` config provider (protocol-level
-  only — the core does not invoke config providers yet)
+  destinations, `local-copy` sink, and the `file` provider (being ported to the
+  new `provider` kind)
 - ✅ Sink delivery stage (supervised, respawn + resume from the delivery ledger)
 - ✅ `loadsmith plugin install` / `uninstall` from the canonical index
   (sha256-verified, per-kind, pinned versions)
 - ✅ Static musl binaries and four image flavors (`-static`, `-static-debug`,
   `-slim` = `:latest`, `-bundled`)
-- ✅ `{{ env() }}` / `{{ file() }}` config templates, secret masking in
-  `--print-resolved-config`
+- ✅ `{{ env() }}` / `{{ file() }}` / `{{ secret() }}` config templates; provider
+  plugins resolve `secret()` before a run; every resolved value is masked in
+  logs, plugin stderr, errors, the run summary and `--print-resolved-config`
 - ✅ Live progress + run summary, `--log-level`, `--no-color`
 - ✅ Incremental state & checkpoints (core-owned watermark, locking, `loadsmith
   state`); at-least-once, exactly-once with an idempotent destination
-- 🔜 Secret-provider plugins (vault, cloud secret managers), remote (`s3`) state
+- 🔜 More providers (AWS Secrets Manager, Vault), parsers (`csv`, `excel`),
+  whole-document `--config-ref` (1.x), remote (`s3`) state
   backend, `s3` sink, more plugins — see [ROADMAP.md](ROADMAP.md)
 
 What a version number promises (and what 1.0 will freeze: the wire protocol,
