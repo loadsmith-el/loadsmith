@@ -38,7 +38,7 @@ use loadsmith_protocol::{
 };
 
 /// Raw (non-SDK) source scenarios.
-pub const RAW_SOURCES: &[&str] = &["garbled1", "garbled2", "noresend", "chatty", "deaf", "noheader"];
+pub const RAW_SOURCES: &[&str] = &["garbled1", "garbled2", "noresend", "chatty", "deaf", "noheader", "eager"];
 
 /// Creates a plugin directory under `dir` with every fake plugin linked to the
 /// current executable, and returns it.
@@ -52,6 +52,7 @@ pub fn install(dir: &Path) -> PathBuf {
         "loadsmith-provider-fake".to_string(),
         "loadsmith-source-files".to_string(),
         "loadsmith-parser-fake".to_string(),
+        "loadsmith-parser-eager".to_string(),
     ];
     names.extend(RAW_SOURCES.iter().map(|s| format!("loadsmith-source-{s}")));
     for name in names {
@@ -76,6 +77,7 @@ pub fn run_as_plugin_if_invoked() {
         "provider-fake" => rt().block_on(loadsmith_plugin_sdk::run_provider(FakeProvider::default())),
         "source-files" => rt().block_on(loadsmith_plugin_sdk::run_object_source(FakeFiles::default())),
         "parser-fake" => rt().block_on(loadsmith_plugin_sdk::run_parser(FakeParser::default())),
+        "parser-eager" => eager_parser(),
         other => match other.strip_prefix("source-") {
             Some(scenario) if RAW_SOURCES.contains(&scenario) => raw_source(scenario),
             _ => {}
@@ -614,6 +616,18 @@ fn raw_source(scenario: &str) -> ! {
     if scenario == "noheader" {
         std::process::exit(3);
     }
+    if scenario == "eager" {
+        // `finished` first, the stream after: the core reads `finished`
+        // while it still waits for the stream header.
+        raw.send(&Message::Finished(Finished::success_source(20, 2)));
+        std::thread::sleep(Duration::from_millis(300));
+        let fd3 = unsafe { std::fs::File::from_raw_fd(3) };
+        let mut writer = loadsmith_arrow::IpcWriter::new(fd3, schema().as_ref()).unwrap();
+        writer.write_batch(&batch(1, 10)).unwrap();
+        writer.write_batch(&batch(2, 10)).unwrap();
+        writer.finish().unwrap();
+        std::process::exit(0);
+    }
     let fd3 = unsafe { std::fs::File::from_raw_fd(3) };
     let mut writer = loadsmith_arrow::IpcWriter::new(fd3, schema().as_ref()).unwrap();
     writer.write_batch(&batch(1, 10)).unwrap();
@@ -629,6 +643,38 @@ fn raw_source(scenario: &str) -> ! {
     writer.write_batch(&batch(2, 10)).unwrap();
     writer.finish().unwrap();
     raw.send(&Message::Finished(Finished::success_source(20, 2)));
+    std::process::exit(0);
+}
+
+/// A parser that, on its first `parse_object`, sends `schema` and at once
+/// `finished` success, then writes a one-batch stream and exits — without
+/// waiting for "no more files" (stdin EOF). The core must not commit that.
+fn eager_parser() -> ! {
+    let mut raw = Raw { lines: std::io::stdin().lock().lines(), last: None };
+    assert!(matches!(raw.recv(true), Message::Handshake));
+    raw.send(&Message::HandshakeAck(HandshakeAck {
+        protocol_supported_versions: vec![1],
+        plugin_name: "eager-parser".into(),
+        plugin_version: "0.0.0".into(),
+        kind: PluginKind::Parser,
+    }));
+    assert!(matches!(raw.recv(true), Message::SetProtocolVersion(_)));
+    assert!(matches!(raw.recv(true), Message::CapabilitiesRequest));
+    raw.send(&Message::CapabilitiesResponse(CapabilitiesResponse { supports: vec!["parse".into()] }));
+    assert!(matches!(raw.recv(true), Message::Configure(_)));
+    raw.send(&Message::ConfigureAck(ConfigureAck::ok()));
+    assert!(matches!(raw.recv(true), Message::Start(_)));
+    assert!(matches!(raw.recv(true), Message::ParseObject(_)));
+    raw.send(&Message::Schema(loadsmith_protocol::Schema {
+        fields: vec![loadsmith_protocol::Field::new("id", loadsmith_protocol::FieldType::Int64)
+            .with_nullable(false)],
+    }));
+    raw.send(&Message::Finished(Finished::success_source(10, 1)));
+    std::thread::sleep(Duration::from_millis(300));
+    let fd3 = unsafe { std::fs::File::from_raw_fd(3) };
+    let mut writer = loadsmith_arrow::IpcWriter::new(fd3, schema().as_ref()).unwrap();
+    writer.write_batch(&batch(1, 10)).unwrap();
+    writer.finish().unwrap();
     std::process::exit(0);
 }
 

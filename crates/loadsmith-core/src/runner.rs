@@ -782,6 +782,12 @@ async fn open_source_stream(
                 Some(Event::Msg(Message::Finished(f))) if f.status != FinishedStatus::Success => {
                     return Err(Failure::of(label, finished_failure(label, &f, src.mask())));
                 }
+                // A small producer can be done before the core read its
+                // stream header. Its `finished` is kept (the peer records
+                // it): the data phase checks it at the commit point.
+                Some(Event::Msg(Message::Finished(_))) => {
+                    tracing::debug!(plugin = label, "finished before its stream header was read; kept");
+                }
                 // EOF on fd1: the producer is exiting, and its fd3 closes with
                 // it, which ends the header read below.
                 Some(Event::Eof) | Some(Event::ResendRequested) | None => {}
@@ -910,9 +916,19 @@ async fn supervise_data_phase(
 
     loop {
         // ── The parser's input ───────────────────────────────────────────
-        // "No more files" only once every file was handed over and the raw
-        // source succeeded.
+        // A parser's `finished` may have arrived during setup (while the
+        // core read its stream header), where nothing judged it: a success
+        // before its input ended would end the load early. Checked before
+        // the input is ended below, so it is exact.
         if let Some(up) = upstream.as_mut() {
+            if failure.is_none()
+                && !src.input_closed()
+                && src.finished().is_some_and(|f| f.status == FinishedStatus::Success)
+            {
+                failure = Some(early_success(label));
+            }
+            // "No more files" only once every file was handed over and the
+            // raw source succeeded.
             if failure.is_none() {
                 up.feed.maybe_end_input(up.raw, src);
             }
@@ -1011,11 +1027,7 @@ async fn supervise_data_phase(
                         } else if upstream.is_some() && !src.input_closed() {
                             // A parser that finishes while files may still
                             // come would end the load early.
-                            failure = Some(Failure::by(
-                                label,
-                                error_codes::PROTOCOL_VIOLATION,
-                                CoreError::Protocol(format!("{label} reported success before its input ended")),
-                            ));
+                            failure = Some(early_success(label));
                         } else if pump_outcome.is_none() {
                             source_end_deadline = finish_limit.map(|d| Instant::now() + d);
                         }
@@ -1138,6 +1150,15 @@ async fn supervise_data_phase(
         task.abort();
     }
     DataPhase { failure, pump_outcome }
+}
+
+/// A parser that reported success before the core ended its input.
+fn early_success(label: &'static str) -> Failure {
+    Failure::by(
+        label,
+        error_codes::PROTOCOL_VIOLATION,
+        CoreError::Protocol(format!("{label} reported success before its input ended")),
+    )
 }
 
 /// The failure for a broken data stream of the producer (source or parser).

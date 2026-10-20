@@ -37,6 +37,8 @@ fn main() {
         ("download_scratch_is_removed_after_success", download_scratch_is_removed_after_success),
         ("download_scratch_is_kept_after_a_failure", download_scratch_is_kept_after_a_failure),
         ("a_user_scratch_dir_is_never_removed", a_user_scratch_dir_is_never_removed),
+        ("a_parser_finishing_before_its_input_ended_is_rejected", a_parser_finishing_before_its_input_ended_is_rejected),
+        ("raw_source_finishing_at_once_is_kept", raw_source_finishing_at_once_is_kept),
     ];
     let filter: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
     let mut failed = Vec::new();
@@ -378,4 +380,34 @@ fn a_user_scratch_dir_is_never_removed() {
     assert_eq!(summary.status, SummaryStatus::Success, "{:?}", summary.root_cause);
     assert_eq!(scratch_of(&run.journal("source")), mine);
     assert!(mine.join("a.txt").exists(), "a user-given scratch dir is left alone");
+}
+
+/// A parser whose `finished` (success) arrives while the core still reads its
+/// stream header, and before its input ended, must not be committed: more
+/// files were still coming.
+fn a_parser_finishing_before_its_input_ended_is_rejected() {
+    let run = Run::new("p-eager");
+    let files: Vec<String> = (0..3).map(|i| run.file(&format!("f{i}.txt"), &["id"], 2)).collect();
+    let yaml = run
+        .yaml("files", json!({ "files": files, "delay_ms": 200 }), Some(json!({})), "")
+        .replace("parser:\n  type: fake", "parser:\n  type: eager");
+    let summary = run.exec(&yaml).expect("summary");
+    assert_eq!(summary.status, SummaryStatus::Error);
+    assert_cause(&summary, "parser reported success before its input ended");
+    let dst = run.journal("destination");
+    assert!(has(&dst, "cancel"), "{dst:?}");
+    assert_rolled_back(&dst);
+    assert!(has(&run.journal("source"), "cancel"), "{:?}", run.journal("source"));
+}
+
+/// A raw source that announces its only file and finishes at once (before
+/// the core even waits for the parser's schema): its `finished` is kept, and
+/// the parser's input ends after the file.
+fn raw_source_finishing_at_once_is_kept() {
+    let run = Run::new("p-quick");
+    let file = run.file("only.txt", &["id"], 3);
+    let yaml = run.yaml("files", json!({ "files": [file] }), Some(json!({ "delay_ms": 200 })), "");
+    let summary = run.exec(&yaml).expect("run");
+    assert_eq!(summary.status, SummaryStatus::Success, "{:?}", summary.root_cause);
+    assert_eq!(summary.rows_written, 3);
 }

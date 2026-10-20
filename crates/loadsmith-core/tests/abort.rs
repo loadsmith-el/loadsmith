@@ -20,6 +20,7 @@ use serde_json::json;
 
 fn main() {
     fake_plugins::run_as_plugin_if_invoked();
+    warnings::install();
 
     let tests: &[(&str, fn())] = &[
         ("happy_path_finalizes_once", happy_path_finalizes_once),
@@ -40,6 +41,7 @@ fn main() {
         ("schema_drift_is_detected_from_the_arrow_stream", schema_drift_is_detected_from_the_arrow_stream),
         ("v1_state_file_is_migrated", v1_state_file_is_migrated),
         ("source_without_a_stream_header_fails_setup", source_without_a_stream_header_fails_setup),
+        ("finished_before_the_stream_header_is_kept", finished_before_the_stream_header_is_kept),
     ];
     let filter: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
     let mut failed = Vec::new();
@@ -73,6 +75,39 @@ fn main() {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// The core's `warn`/`error` log lines, captured (not printed) so a test can
+/// assert what the core did not complain about.
+mod warnings {
+    use std::sync::Mutex;
+
+    static LINES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+    struct Capture;
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            LINES.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    pub fn install() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(|| Capture)
+            .try_init();
+    }
+
+    /// Everything captured since the last call.
+    pub fn take() -> String {
+        String::from_utf8_lossy(&std::mem::take(&mut *LINES.lock().unwrap())).into_owned()
+    }
+}
 
 struct Run {
     scratch: Scratch,
@@ -525,4 +560,21 @@ fn source_without_a_stream_header_fails_setup() {
         other => panic!("expected a source failure, got {other:?}"),
     }
     assert!(!has(&run.journal("destination"), "prepare"), "{:?}", run.journal("destination"));
+}
+
+/// Regression (lab, `sharepoint-list-to-jsonl`): a small source sends
+/// `finished` while the core still waits for its stream header. That
+/// `finished` is the source half of the commit point: it must be kept, not
+/// logged as an unexpected message.
+fn finished_before_the_stream_header_is_kept() {
+    let run = Run::new("eager");
+    let yaml = pipeline_yaml("eager", "eager", json!({}), run.dst_config(json!({})), &timeouts(""), "");
+    warnings::take();
+    let summary = run.exec(&yaml).expect("run");
+    let logged = warnings::take();
+    assert_eq!(summary.status, SummaryStatus::Success, "{:?}", summary.root_cause);
+    assert_eq!(summary.rows_read, 20);
+    assert_eq!(summary.rows_written, 20);
+    assert!(has(&run.journal("destination"), "finalize"));
+    assert!(!logged.contains("unexpected control message"), "{logged}");
 }
