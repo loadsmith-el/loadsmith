@@ -129,10 +129,14 @@ until it returns at least one row. This is necessary because `COPY` in Postgres
 is transactional: the TCP port opens long before the 100,000-row import commits.
 Without this probe, loadsmith could start before the table has data.
 
-**`expect`** — the assertions. The lab checks:
-- `status: success` — loadsmith exited with code 0
-- `rows_read: 100000` — the summary box said "Rows read: 100,000"
-- `rows_written: 100000` — the summary box said "Rows written: 100,000"
+**`expect`** — the assertions, checked against the engine's JSON run summary
+(the lab passes `--summary-file`; for engines that predate the flag it falls
+back to reading the human summary box). The lab checks:
+- `status: success` — the run succeeded (exit code 0)
+- `rows_read: 100000` — the summary's `rows_read`
+- `rows_written: 100000` — the summary's `rows_written`
+- optionally `exit_code: <n>` — the exact exit code, for cases that expect a
+  specific failure class (see [CLI exit codes](../reference/cli.md#exit-codes))
 - `output.file` / `output.row_count` — the output file exists and has the right
   number of lines (`file` is relative to the run's `/output` mount)
 
@@ -206,6 +210,7 @@ loadsmith-lab 0.1.0  ·  local loadsmith
   │ Duration:     00:01:14.012
   │ Throughput:   1,351 rows/s
   │ ───────────────────────────────────────────
+  · plugins: postgres 0.2.1 → jsonl 0.1.2
   ✓ postgres-to-jsonl   100,000 read · 100,000 written   74.2s
 
 ──────────────────────────────────────────────────
