@@ -297,6 +297,16 @@ async fn write_batch(&mut self, batch: RecordBatch) -> Result<()> {
 }
 ```
 
+The conversion handles every Arrow type and never panics. Its JSON forms:
+integers and floats as numbers (NaN and ±Infinity as `null`), decimals as exact
+strings (`"123.45"`), strings as strings, binaries as base64, `date32` as
+integer days, `date64`, timestamps of any unit, times and durations as integer
+milliseconds (finer units floored), intervals as objects (`{"months": …}`),
+lists as arrays, structs and maps as objects, dictionaries as their decoded
+values. Types outside the [protocol vocabulary](../protocol/messages.md#schema)
+(`union`, `run_end_encoded`, list views) become `null`. The full table is in
+the `loadsmith_arrow::convert` module docs.
+
 ## End-to-end testing
 
 Add a loadsmith-lab case (in `loadsmith-lab-canonical-catalog/cases/`, or a

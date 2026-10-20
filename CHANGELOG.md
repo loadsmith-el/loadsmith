@@ -111,6 +111,15 @@ release notes in their repositories.
 
 ### Fixed
 
+- `loadsmith_arrow::record_batch_to_json_rows` (the jsonl destination's
+  converter) **panicked on any timestamp not in milliseconds** and silently
+  wrote `null` for `int8`/`int16`, unsigned integers, decimals, lists,
+  structs, maps, `large_binary`, times and more; NaN and ±Infinity became `0`.
+  It now handles every Arrow type without panicking: decimals as exact
+  strings, lists as arrays, structs and maps as objects, timestamps of every
+  unit as epoch milliseconds (like millisecond timestamps already were),
+  NaN/Infinity as `null`. Output for the types that already worked is
+  unchanged.
 - **A source that crashed mid-stream made the destination commit a partial
   load.** arrow-rs reads EOF at a batch boundary as a clean end of stream, so
   the pump ended the destination's input and postgres/mysql/oracle committed
