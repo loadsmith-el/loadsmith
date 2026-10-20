@@ -1138,11 +1138,17 @@ name = "loadsmith-cli"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
  "clap",
  "flate2",
+ "loadsmith-arrow",
  "loadsmith-config",
  "loadsmith-core",
  "loadsmith-plugin-manifest",
+ "loadsmith-plugin-sdk",
+ "loadsmith-protocol",
  "loadsmith-tls",
  "mimalloc",
  "rustls",

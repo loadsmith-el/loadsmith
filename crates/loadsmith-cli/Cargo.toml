@@ -32,3 +32,18 @@ flate2             = "1"
 tar                = "0.4"
 # Global allocator (static musl release builds; see main.rs).
 mimalloc           = { version = "0.1", default-features = false }
+
+[dev-dependencies]
+# The fake plugins the exit-code tests run against (shared with the core's
+# end-to-end tests).
+arrow-array          = { workspace = true }
+arrow-schema         = { workspace = true }
+async-trait          = { workspace = true }
+loadsmith-arrow      = { path = "../loadsmith-arrow" }
+loadsmith-plugin-sdk = { path = "../loadsmith-plugin-sdk" }
+loadsmith-protocol   = { path = "../loadsmith-protocol" }
+
+# The test binary doubles as the fake plugins, so it needs its own `main`.
+[[test]]
+name    = "exit_codes"
+harness = false

@@ -7,7 +7,10 @@ use loadsmith_config::parse_pipeline_yaml;
 use loadsmith_core::{discovery, run_pipeline, RunOpts};
 
 mod download;
+mod exit;
 mod plugin_install;
+
+use exit::{classify, Exit, RunOutcome, UsageError};
 
 #[derive(Parser)]
 #[command(
@@ -167,12 +170,20 @@ async fn main() -> ExitCode {
     init_tracing(&cli.log_level, color);
 
     match run(cli, color).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => ExitCode::from(Exit::Success.code()),
         Err(e) => {
             eprintln!("error: {e:#}");
-            ExitCode::FAILURE
+            ExitCode::from(classify(&e).code())
         }
     }
+}
+
+/// Reads the pipeline file; an unreadable file is a config error (exit 3).
+fn read_pipeline(path: &std::path::Path) -> Result<String> {
+    std::fs::read_to_string(path).map_err(|e| {
+        anyhow::Error::new(loadsmith_config::ConfigError::Io(e))
+            .context(format!("cannot read {}", path.display()))
+    })
 }
 
 async fn run(cli: Cli, color: bool) -> Result<()> {
@@ -195,8 +206,7 @@ async fn cmd_run(args: RunArgs, color: bool) -> Result<()> {
     // Handle SIGINT/SIGTERM explicitly before anything else: in the images the
     // engine is PID 1, where an unhandled SIGTERM is silently ignored.
     let shutdown = loadsmith_core::listen_for_signals()?;
-    let content = std::fs::read_to_string(&args.pipeline)
-        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", args.pipeline.display()))?;
+    let content = read_pipeline(&args.pipeline)?;
 
     let (config, mask) = parse_pipeline_yaml(&content)?;
 
@@ -219,15 +229,22 @@ async fn cmd_run(args: RunArgs, color: bool) -> Result<()> {
     let summary = run_pipeline(config, opts).await?;
     // A pipeline that ran but failed (a plugin error, a failed delivery…) must
     // exit non-zero, or schedulers and the lab read it as a success.
-    if summary.status != loadsmith_core::SummaryStatus::Success {
-        anyhow::bail!("pipeline '{}' failed (see the errors above)", summary.pipeline_name);
+    match summary.status {
+        loadsmith_core::SummaryStatus::Success => Ok(()),
+        loadsmith_core::SummaryStatus::Cancelled => match summary.signal {
+            Some(signal) => {
+                Err(RunOutcome::Cancelled { pipeline: summary.pipeline_name, signal }.into())
+            }
+            None => Err(RunOutcome::Failed { pipeline: summary.pipeline_name }.into()),
+        },
+        loadsmith_core::SummaryStatus::Error => {
+            Err(RunOutcome::Failed { pipeline: summary.pipeline_name }.into())
+        }
     }
-    Ok(())
 }
 
 fn cmd_validate(args: ValidateArgs) -> Result<()> {
-    let content = std::fs::read_to_string(&args.pipeline)
-        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", args.pipeline.display()))?;
+    let content = read_pipeline(&args.pipeline)?;
 
     let (config, _mask) = parse_pipeline_yaml(&content)?;
     loadsmith_config::validate_pipeline(&config)?;
@@ -252,13 +269,14 @@ fn cmd_plugin_list(args: PluginListArgs) -> Result<()> {
 }
 
 fn load_state_cfg(pipeline: &std::path::Path) -> Result<(loadsmith_config::PipelineConfig, loadsmith_config::StateConfig)> {
-    let content = std::fs::read_to_string(pipeline)
-        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", pipeline.display()))?;
+    let content = read_pipeline(pipeline)?;
     let (config, _mask) = parse_pipeline_yaml(&content)?;
-    let state = config
-        .state
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("pipeline '{}' has no state: block", config.pipeline.name))?;
+    let state = config.state.clone().ok_or_else(|| {
+        loadsmith_config::ConfigError::Validation(format!(
+            "pipeline '{}' has no state: block",
+            config.pipeline.name
+        ))
+    })?;
     Ok((config, state))
 }
 
@@ -306,7 +324,10 @@ fn cmd_plugin_install(args: PluginInstallArgs) -> Result<()> {
     let index = args.index.as_deref().unwrap_or(plugin_install::DEFAULT_INDEX_URL);
 
     if args.kind.is_some() && args.name.is_none() && args.manifest.is_none() {
-        anyhow::bail!("--kind needs a package name (e.g. `install mysql --kind source`)");
+        return Err(UsageError(
+            "--kind needs a package name (e.g. `install mysql --kind source`)".into(),
+        )
+        .into());
     }
     if let Some(k) = &args.kind {
         plugin_install::validate_kind(k)?;
@@ -328,13 +349,19 @@ fn cmd_plugin_install(args: PluginInstallArgs) -> Result<()> {
         // Reconcile a `:kind` spec suffix with the --kind flag.
         let kind = match (spec_kind, args.kind) {
             (Some(a), Some(b)) if a != b => {
-                anyhow::bail!("conflicting kind: {a:?} (in spec) vs {b:?} (--kind)")
+                return Err(UsageError(format!(
+                    "conflicting kind: {a:?} (in spec) vs {b:?} (--kind)"
+                ))
+                .into())
             }
             (Some(a), _) => Some(a),
             (None, b) => b,
         };
         if args.all && kind.is_some() {
-            anyhow::bail!("--all installs every kind of the package; drop the kind selector");
+            return Err(UsageError(
+                "--all installs every kind of the package; drop the kind selector".into(),
+            )
+            .into());
         }
         let kinds = if args.all { None } else { kind.map(|k| vec![k]) };
         let index_spec = match version {
@@ -343,7 +370,10 @@ fn cmd_plugin_install(args: PluginInstallArgs) -> Result<()> {
         };
         vec![(plugin_install::resolve_from_index(&index_spec, index)?, kinds)]
     } else {
-        anyhow::bail!("nothing to install: pass a plugin name, --all, --manifest, or --binary")
+        return Err(UsageError(
+            "nothing to install: pass a plugin name, --all, --manifest, or --binary".into(),
+        )
+        .into());
     };
 
     for (spec, kinds) in jobs {
@@ -377,7 +407,10 @@ fn cmd_plugin_uninstall(args: PluginUninstallArgs) -> Result<()> {
     let plugin_dir = args.plugin_dir.unwrap_or_else(discovery::default_plugin_dir);
     let (pkg, spec_kind, version) = plugin_install::parse_install_spec(&args.name)?;
     if version.is_some() {
-        anyhow::bail!("uninstall takes no @version (one version is installed at a time)");
+        return Err(UsageError(
+            "uninstall takes no @version (one version is installed at a time)".into(),
+        )
+        .into());
     }
     if let Some(k) = &args.kind {
         plugin_install::validate_kind(k)?;
