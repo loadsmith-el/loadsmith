@@ -19,9 +19,8 @@ drained, for every kind (providers included).
 its own stderr line by line, masked (see §4.8).
 
 Plugin kinds (`handshake_ack.kind`, binary `loadsmith-<kind>-<type>`):
-`source`, `destination`, `sink`, `parser`, `provider`. The core drives every
-kind except `parser`, whose messages are defined in v1 but reserved: the core
-does not drive parsers yet.
+`source`, `destination`, `sink`, `parser`, `provider`. A raw source is a
+`source` advertising `object_output`; it runs only with a `parser:`.
 
 ---
 
@@ -205,10 +204,9 @@ may arrive at any time, including during a `resolve`. `resend` replays the
 last control message (the core has at most one `resolve` in flight). The
 first failing instance aborts the others with the rules of §4.5.
 
-### 4.10 Parser lifecycle (reserved)
+### 4.10 Parser lifecycle
 
-The core does not drive parsers yet; the shape is fixed in v1 so it can be
-wired without a protocol change. A **raw source** (capability
+A **raw source** (capability
 `object_output`) has no fd3: it answers `start` with `ready` (not `schema`)
 and announces each finished local file with `object_ready{path}` on fd4. The
 core forwards each path to the **parser** as `parse_object{path}` on fd0. The
@@ -224,8 +222,20 @@ columns), writes
 Arrow IPC to fd3, emits `progress` and the informational
 `object_parsed{path, rows, batches, last_batch_seq}` on fd4, and, on stdin EOF
 (no more files), ends the IPC stream with its end-of-stream marker and sends
-`finished{rows_read, batches_read}`. `parse_object` is idempotent per path. A
-later file with a different schema is `finished` error `SCHEMA_MISMATCH`.
+`finished{rows_read, batches_read}`. `parse_object` is idempotent per path (the
+core sends each path once). A file whose schema differs from the stream's is
+`finished` error `SCHEMA_MISMATCH`; stdin EOF before any file without a
+declared schema is `NO_INPUT`.
+
+Abort and commit rules on this path: the core closes the parser's stdin only
+after the raw source's fd4 reached EOF and its `finished` was success; after
+any upstream failure the parser gets `cancel` (§4.5) instead. The destination's
+input ends cleanly only after the parser's stream ended with its marker and
+both the parser and the raw source finished with success. A parser `finished`
+success before its stdin was closed is a protocol violation. A raw source
+advertising `scratch_dir` receives a core-allocated `scratch_dir` in its
+config (unless set), removed only after a successful run. `parser:` and
+`state:` cannot be combined in 1.0.
 
 ---
 
@@ -298,10 +308,11 @@ Defined capabilities (extensible):
 | `batch_read` | Reads in batches (source SDK default) |
 | `incremental_state` | Source: accepts a resume cursor and reports watermarks via `checkpoint`. Required by the core when the pipeline has a `state:` block |
 | `batch_write` | Writes in batches (destination SDK default) |
-| `object_output` | Destination: stages files and announces each via `object_ready`; required by the core when the pipeline has a `sink:` block. Source: a *raw* source — produces files instead of Arrow (no fd3), answers `start` with `ready`, announces each file via `object_ready` (requires a `parser:`; reserved) |
+| `object_output` | Destination: stages files and announces each via `object_ready`; required by the core when the pipeline has a `sink:` block. Source: a *raw* source — produces files instead of Arrow (no fd3), answers `start` with `ready`, announces each file via `object_ready` (requires a `parser:`, and a `parser:` requires it) |
+| `scratch_dir` | Raw source: downloads its files; the core adds a core-owned `scratch_dir` to its config (unless set) and removes it after a successful run |
 | `staged_merge` | Destination: writes to staging and does a `MERGE` by PK at the end — exactly-once effective. Advertised, but not read by the core |
 | `object_delivery` | Sink: delivers staged objects (sink SDK default) |
-| `parse` | Parser: turns files (`parse_object`) into Arrow batches on fd3 (reserved: the core does not drive parsers yet) |
+| `parse` | Parser: turns files (`parse_object`) into Arrow batches on fd3. Required by the core of the pipeline's parser (parser SDK default) |
 | `resolve` | Provider: answers `resolve` with `resolved`. Required by the core of every provider (provider SDK default) |
 
 Intra-run durability needs no capability: a destination reports it by emitting `committed` during the run (in the SDK, by implementing `durable_through()`).
@@ -466,8 +477,8 @@ destination when a staged file is finalized (footer written). The core forwards
 the path to the sink supervisor, which delivers it — so delivery overlaps the
 pump. Using the event channel (already drained concurrently) is what allows a
 chunk to be delivered the moment it closes. A raw source (capability
-`object_output`) sends it for each local file it produces; the core will
-forward those to the parser as `parse_object` (§4.10, reserved).
+`object_output`) sends it for each local file it produces; the core forwards
+those to the parser as `parse_object` (§4.10).
 
 ```jsonl
 {"type":"object_ready","path":"/scratch/events.00000001.snappy.parquet"}
@@ -477,9 +488,9 @@ forward those to the parser as `parse_object` (§4.10, reserved).
 
 ### `parse_object`
 
-**Core → Parser. Via the control channel. Reserved: the core does not drive
-parsers yet.** Parse the local file at `path` (from a raw source's
-`object_ready`). Idempotent per path. Stdin EOF means "no more files".
+**Core → Parser. Via the control channel.** Parse the local file at `path`
+(from a raw source's `object_ready`). Idempotent per path. Stdin EOF means "no
+more files"; the core sends it only after the raw source succeeded.
 
 ```jsonl
 {"type":"parse_object","path":"/mnt/s3/inbox/2026-10-01.csv"}
@@ -489,7 +500,7 @@ parsers yet.** Parse the local file at `path` (from a raw source's
 
 ### `object_parsed`
 
-**Parser → Core. Via fd4 (the event channel). Informational; reserved.** A
+**Parser → Core. Via fd4 (the event channel). Informational.** A
 file was fully parsed. `last_batch_seq` is the global batch ordinal (1-based,
 as on `checkpoint`) of this file's last batch, `0` when the file produced
 none — defined now so per-file checkpoints stay additive.

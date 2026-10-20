@@ -80,13 +80,17 @@ version is **1**.
 The core asks for a capabilities list. Plugins respond with the `supports` array.
 The SDK defaults are `batch_read` + `schema_inference` for sources and
 `batch_write` for destinations; plugins add their own (e.g. `incremental_state`,
-`object_output`, `staged_merge`). The core enforces three of them:
+`object_output`, `staged_merge`). The core enforces these:
 
 - `incremental_state` on the source, required when the pipeline has a `state:`
   block;
 - `resolve` on every provider instance it starts;
 - `object_output` on the destination, required when the pipeline has a `sink:`
-  block.
+  block;
+- `object_output` on the source (a raw source) if and only if the pipeline has
+  a `parser:` block, and `parse` on the parser;
+- `scratch_dir` on a raw source is a request: the core adds a core-owned
+  directory to its config before `configure`.
 
 The full list is in the [Message Reference](../protocol/messages.md#capabilities_response).
 
@@ -228,6 +232,19 @@ for `resolve` and the core at the same time, so `cancel` stops a provider
 mid-resolve. See the
 [protocol reference](../protocol/reference.md#providers-value-resolution).
 
-Parsers (and the raw sources that feed them) have a lifecycle defined in the
-protocol but are not driven by the core yet; see
-[Parsers](../protocol/reference.md#parsers-reserved).
+## Parsers
+
+With a `parser:` block three data plugins run: a raw source, a parser and the
+destination. The raw source answers `start` with `ready` and announces files
+with `object_ready` on fd4; the core hands each to the parser as
+`parse_object`. The parser answers `start` with `schema` — after its first
+file, or at once when its config declares the columns — and then streams Arrow
+on fd3 like a source. The core closes the parser's stdin ("no more files")
+only once the raw source's fd4 reached EOF **and** it sent `finished` with
+success; the parser then ends its stream and sends `finished`, and only then
+(both succeeded) does the core end the destination's input. After any failure
+upstream the parser is cancelled instead. The SDK runtimes (`run_parser`,
+`run_object_source`) read the control channel concurrently with `open`,
+`next_batch` and `next_object`, so `cancel` stops them mid-file. See
+[Writing a Parser](../plugins/writing-a-parser.md) and the
+[protocol reference](../protocol/reference.md#parsers).

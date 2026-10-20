@@ -26,9 +26,9 @@ SDK version (or language) it was built with.
 
 | Interface | What is frozen | Compatible evolution (minor) |
 |---|---|---|
-| **Wire protocol v1** | The fd layout (fd0 control core→plugin, fd1 control plugin→core, fd3 Arrow IPC data, fd4 events; stderr is free-form). JSONL framing. Every message's `type` and required fields, including the provider conversation (`resolve`/`resolved`, capability `resolve`, `ready` after `start`, stdin EOF ends it) and the kind spellings `source`, `destination`, `sink`, `parser`, `provider`. The `schema` message's [field-type vocabulary](../protocol/messages.md#schema), its field-object shape, and the rule that the Arrow IPC header is the authoritative schema. Handshake and version negotiation (`protocol_supported_versions` → `set_protocol_version`). Lifecycle ordering, including the commit point (the core ends the destination's fd3 only after the source succeeded). The [abort rules](../protocol/reference.md#abort-rules): `cancel`, `error` and its codes, the grace period, then kill. The [`resend` rule](../protocol/reference.md#malformed-lines-and-resend) for malformed control lines. The [tolerant-reader rule](../protocol/reference.md#compatibility-rule-tolerant-reader). | New optional fields. New message types a receiver may safely ignore. New field types and type parameters (read as unknown by an older receiver). A change the receiver must understand needs **protocol v2**, negotiated in the handshake. Every 1.x engine keeps speaking v1. |
+| **Wire protocol v1** | The fd layout (fd0 control core→plugin, fd1 control plugin→core, fd3 Arrow IPC data, fd4 events; stderr is free-form). JSONL framing. Every message's `type` and required fields, including the provider conversation (`resolve`/`resolved`, capability `resolve`, `ready` after `start`, stdin EOF ends it), the parser stage (a raw source's `object_output`, `ready` after `start` and `object_ready` per file; the parser's `parse` capability, `parse_object`, `schema` then Arrow on fd3, `object_parsed`, stdin EOF ends it; the `scratch_dir` capability) and the kind spellings `source`, `destination`, `sink`, `parser`, `provider`. The `schema` message's [field-type vocabulary](../protocol/messages.md#schema), its field-object shape, and the rule that the Arrow IPC header is the authoritative schema. Handshake and version negotiation (`protocol_supported_versions` → `set_protocol_version`). Lifecycle ordering, including the commit point (the core ends the destination's fd3 only after the source succeeded; with a parser, after the parser and the raw source both succeeded, and the parser's stdin is closed gracefully only after the raw source succeeded). The [abort rules](../protocol/reference.md#abort-rules): `cancel`, `error` and its codes, the grace period, then kill. The [`resend` rule](../protocol/reference.md#malformed-lines-and-resend) for malformed control lines. The [tolerant-reader rule](../protocol/reference.md#compatibility-rule-tolerant-reader). | New optional fields. New message types a receiver may safely ignore. New field types and type parameters (read as unknown by an older receiver). A change the receiver must understand needs **protocol v2**, negotiated in the handshake. Every 1.x engine keeps speaking v1. |
 | **CLI** | Commands and subcommands, flags and their defaults and meaning, the [exit-code table](cli.md#exit-codes) (`0`–`5`, `130`, `143`), graceful cancel on SIGINT/SIGTERM, and the split of the human report on stdout from diagnostics on stderr. The [JSON run summary](cli.md#machine-readable-run-summary) of `run` (`--output json`, `--summary-file`), versioned by its `version` field (now `1`): every field, its type and meaning. | New commands and new flags. A new exit code only for a case that exits `1` today. New run-summary fields (consumers ignore unknown ones); a change to an existing field needs a new summary `version`. |
-| **`pipeline.yaml` schema** | Every core-owned key, its type, default and meaning (including `pipeline.timeouts`). Unknown core-owned keys are rejected. The `providers:` block (`type`, `config`, `timeout_seconds`). The template syntax `{{ env('VAR') }}` / `{{ file('/path') }}` / `{{ secret('<instance>', '<ref>') }}`, the `secret()` rules (declared instance; not in `pipeline:`/`state:`/`providers:`) and the masking of every resolved value. | New optional keys and new template functions. The contents of each plugin's `config:` block belong to that plugin and are versioned by it. |
+| **`pipeline.yaml` schema** | Every core-owned key, its type, default and meaning (including `pipeline.timeouts`). Unknown core-owned keys are rejected. The `providers:` block (`type`, `config`, `timeout_seconds`). The `parser:` block (`type`, `config`) and its rules (only with a raw source; not with `state:`). The template syntax `{{ env('VAR') }}` / `{{ file('/path') }}` / `{{ secret('<instance>', '<ref>') }}`, the `secret()` rules (declared instance; not in `pipeline:`/`state:`/`providers:`) and the masking of every resolved value. | New optional keys and new template functions. The contents of each plugin's `config:` block belong to that plugin and are versioned by it. |
 | **Incremental state file** | The [state file format](../architecture/incremental-state.md#state-file-format), versioned by its `version` field, and the lock file's lease semantics. | A new engine reads every older format and upgrades it on its next save. An engine refuses a format newer than it understands rather than downgrading it. |
 | **Plugin manifest** | `apiVersion: loadsmith.dev/plugin/v1` and its fields (`name`, `version`, `protocol`, `provides`, `runtime`). | New optional fields. Incompatible changes go into a new `apiVersion`, and v1 stays accepted throughout 1.x. |
 | **Plugin index** | The `index.json` shape: `{"plugins": {"<name>": {"latest": "<version>", "versions": {"<version>": "<manifest URL>"}}}}`. | New optional fields. |
@@ -53,14 +53,9 @@ These can change in any release:
   log messages and the format of the tracing output on stderr. Don't parse them;
   use the [JSON run summary](cli.md#machine-readable-run-summary) and the exit
   code.
-- **Experimental parts** (defined, but not wired into the core):
-  - the `parser` plugin kind: its messages (`parse_object`, `object_parsed`),
-    the `parse` capability, a raw source's `object_output`/`ready` form and the
-    `parser:` pipeline block. They exist in the protocol and the config model,
-    but the core never spawns a parser (`loadsmith run` rejects a `parser:`
-    block) and the SDK has no parser runtime yet.
-
-  Experimental parts become covered when they are documented without this label.
+- **Experimental parts**, when a part is documented with that label. None
+  is today; an experimental part becomes covered when it is documented
+  without the label.
 - **Behavior that contradicts the documentation** is a bug. Fixing it is not a
   breaking change.
 
@@ -155,15 +150,23 @@ These were open and are now settled. 1.0 freezes them as described.
      evaluated or started. `validate --resolve` performs the full resolution,
      providers included.
 
+10. **The parser kind is wired into 1.0 and covered.** A raw source
+    (`object_output`) announces files; the core hands each to the `parser:`
+    (`parse_object`), whose Arrow stream takes the source's place in the pump.
+    The parser's input ends gracefully only after the raw source succeeded,
+    and the commit point needs both to have succeeded, so a failure upstream
+    never commits the files parsed so far. One schema per stream
+    (`SCHEMA_MISMATCH`), zero files is `NO_INPUT` unless the parser declares
+    its columns. **Deferred to 1.x:** a `parser:` combined with `state:`
+    (incremental loads through a parser; `object_parsed.last_batch_seq` keeps
+    per-file checkpoints additive).
+
 ## Open decisions before 1.0
 
 These are still open, and each one changes what 1.0 freezes:
 
-1. **The parser kind.** Its wire contract is defined in v1 (experimental); the
-   core wiring and SDK runtime are the next step. Ship 1.0 with it covered, or
-   keep it experimental and cover it in a 1.x minor?
-2. **Remote state backends.** The `s3` state backend will need its own format
+1. **Remote state backends.** The `s3` state backend will need its own format
    and lock semantics. Should they fall under the same state-format version?
-3. **Publishing the SDK crates** to crates.io (they are consumed by git
+2. **Publishing the SDK crates** to crates.io (they are consumed by git
    revision today), and whether `loadsmith-plugin-manifest` should also be
    `publish = false`.

@@ -33,9 +33,9 @@ source:
   config:                 # optional — arbitrary object passed to the source plugin
     # plugin-specific fields
 
-parser:                   # optional — EXPERIMENTAL: accepted by the config model,
-  type: string            #   rejected by `loadsmith run` (not wired into the core yet)
-  config:
+parser:                   # optional — parses the files of a raw source
+  type: string            #   parser plugin type → loadsmith-parser-<type>
+  config:                 #   optional — passed to the parser
     # plugin-specific fields
 
 destination:
@@ -145,12 +145,33 @@ pipeline-wide `pipeline.timeouts` (handshake, configure, start,
 
 ### `parser`
 
-**Experimental — not wired into the core yet.** A parser turns the files a
-*raw* source produces (capability `object_output`) into Arrow batches. The block
-is accepted by the config model (strict `type`/`config` keys, like `source`;
-combining it with `state:` is a validation error), but `loadsmith run` rejects a
-pipeline that has one with a "not wired into the core yet" configuration error
-(exit `3`).
+Optional. A parser turns the files a *raw* source produces (a source that
+advertises `object_output`, such as `file`) into Arrow batches, which flow to
+the destination like a regular source's. See
+[Writing a Parser](../plugins/writing-a-parser.md).
+
+```yaml
+source: { type: file, config: { path: /mnt/s3/inbox, glob: "*.csv" } }
+parser: { type: csv,  config: { delimiter: ",", header: true } }
+destination: { type: postgres, config: { … } }
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `type` | string | yes | Parser plugin type. Resolved to binary `loadsmith-parser-{type}` |
+| `config` | object | no | Passed verbatim to the parser's `configure()` after template resolution |
+
+- A `parser:` needs a raw source, and a raw source needs a `parser:`: either
+  mismatch is a configuration error (exit `3`), reported before anything
+  starts. A parser without the `parse` capability is exit `4`.
+- Not combinable with `state:` in 1.0 (validation error); incremental loads
+  through a parser are planned for 1.x. A `sink:` works as usual.
+- Every file must have the stream's schema (`SCHEMA_MISMATCH` otherwise). No
+  file at all is an empty load if the parser's config declares the columns,
+  and a `NO_INPUT` failure otherwise.
+- A raw source that downloads files gets a core-allocated `scratch_dir` in its
+  config unless you set one; the core deletes only the directory it
+  allocated, and only after a successful run.
 
 ### `destination`
 

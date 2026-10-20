@@ -25,8 +25,8 @@ starts — they are set up by the core.
 | destination | reads | yes |
 | sink | none | yes |
 | provider | none | yes |
-| raw source (`object_output`; reserved) | none | yes (`object_ready` per file) |
-| parser (reserved) | writes | yes (`object_parsed`) |
+| raw source (`object_output`) | none | yes (`object_ready` per file) |
+| parser | writes | yes (`object_parsed`) |
 
 fd4 is always wired and always drained, for every kind. stderr is not a
 protocol channel: the core pipes it and copies it to its own stderr line by
@@ -150,7 +150,9 @@ Both plugins are spawned up front, but the core drives them in a fixed order:
 
 1. handshake / configure the source, then the destination;
 2. capability gates: `incremental_state` on the source if the pipeline has a
-   `state:` block, `object_output` on the destination if it has a `sink:` block;
+   `state:` block, `object_output` on the destination if it has a `sink:` block,
+   no `object_output` on the source (that is a raw source, which needs a
+   `parser:`; see [Parsers](#parsers));
 3. spawn the sink supervisor (only with `sink:`), which brings the sink up to
    `ready`;
 4. `start` the source and wait for its `schema`, then for the header of its
@@ -227,24 +229,66 @@ core                                 provider plugin
   started, so the run ends there with a configuration error (exit `3`); a
   missing or incompatible provider binary is exit `4`.
 
-## Parsers (reserved)
+## Parsers
 
-The protocol defines parsers in v1, but **the core does not drive parsers
-yet** (a `parser:` block is rejected at run time). A raw source (capability
-`object_output`) has no fd3: it answers `start` with `ready` and announces
-each local file with `object_ready{path}` on fd4. The core forwards each path
-to the parser (capability `parse`) as `parse_object{path}` on fd0; the parser
-takes the source's place on the Arrow side — `schema` after its first file,
-Arrow IPC on fd3, `object_parsed` events on fd4, and on stdin EOF the
-end-of-stream marker and `finished`:
+With a `parser:` block, the source is a **raw source** (capability
+`object_output`): it has no fd3, answers `start` with `ready`, and announces
+each complete local file with `object_ready{path}` on fd4. The core hands each
+path, once, to the parser (capability `parse`) as `parse_object{path}` on fd0.
+The parser takes the source's place on the Arrow side: `schema`, Arrow IPC on
+fd3 (through the unchanged pump), `object_parsed` events on fd4, and on stdin
+EOF the end-of-stream marker and `finished`:
 
 ```
 raw source ──fd4 object_ready{path}──▶ core ──fd0 parse_object{path}──▶ parser ──fd3──▶ core ──▶ destination
 ```
 
-The commit-point rule then applies to the parser (the Arrow producer) and the
-raw source together: the destination's input ends cleanly only after both
-finished successfully.
+```
+core                    raw source                     parser
+──────────────────────────────────────────────────────────────────────────────
+→ handshake … configure (both, then the destination)
+  capability gates
+→ start                                                (parser)
+→ start                 ← ready
+                        [fd4] object_ready{a.csv}
+→ parse_object{a.csv}                                  ← schema (after its
+                                                         first file, or at
+                                                         once if declared)
+  (IPC header read; destination start → ready; pump)
+                        [fd4] object_ready{b.csv}      [fd3] batches…
+→ parse_object{b.csv}                                  [fd4] object_parsed{a.csv}
+                        ← finished{success}
+                        (exits: fd4 EOF)
+(close parser stdin: "no more files")
+                                                       [fd3] end-of-stream
+                                                       ← finished{rows_read, …}
+(end the destination's fd3: commit point)
+```
+
+- The core waits for the parser's `schema` within `start_seconds`, handing it
+  files meanwhile, then for its IPC stream header.
+- **The parser's stdin is closed gracefully only after the raw source's fd4
+  reached EOF (every `object_ready` was read) and the raw source sent
+  `finished` with success.** After any upstream failure the parser gets
+  `cancel` through the [abort rules](#abort-rules) and never sees EOF.
+- **Commit point:** the destination's input ends cleanly only after the
+  parser's stream ended with its marker and both the parser and the raw source
+  finished with success.
+- A parser that sends `finished` success before its stdin was closed is a
+  protocol violation (`PROTOCOL_VIOLATION`); a raw source whose fd4 stays open
+  `finish_seconds` after its `finished` is a timeout.
+- The core's control lines to a parser are written by a task that owns its
+  stdin, so a parser that reads stdin slowly never stalls the core. A parser
+  `resend` replays the most recent line, as for every kind; `parse_object` is
+  idempotent per path.
+- A raw source that advertises `scratch_dir` gets `scratch_dir: <dir>` added
+  to its config (unless set); the core removes that directory after a
+  successful run only.
+- Capability gates: a `parser:` needs a raw source and a raw source needs a
+  `parser:` (configuration error, exit `3`); a parser without `parse` is
+  incompatible (exit `4`). A `parser:` cannot be combined with `state:` in 1.0.
+
+See [Writing a Parser](../plugins/writing-a-parser.md).
 
 ## Masking
 
@@ -265,7 +309,10 @@ spelling are masked too. A plugin should still never log a value.
   batch succeeded, then sends `finished`.
 - **Commit point:** the core writes the end-of-stream marker to the
   destination's fd3 only after the source's stream ended with its marker
-  **and** the source sent `finished` with `status: "success"`. A destination
+  **and** the source sent `finished` with `status: "success"` (with a parser:
+  the parser's stream and `finished`, **and** the raw source's `finished`). A
+  `finished` that arrives before the core read the stream header is kept for
+  this check. A destination
   finalizes (commits) only on that clean end of input; a stream that ends
   without the marker is truncated and must be rolled back.
 - `finished` is always the last message a plugin sends, after any cleanup.
@@ -278,7 +325,8 @@ without `finished`, a `finished` with `status: "error"`, a rejected config, a
 failed capability gate, a protocol violation, two malformed lines in a row, a
 [timeout](#timeouts), a stalled data plane, or SIGINT/SIGTERM. Then it:
 
-1. stops forwarding batches and **never** ends the destination's fd3 cleanly;
+1. stops forwarding batches and **never** ends the destination's fd3 cleanly
+   (nor a parser's stdin);
 2. sends `cancel` to every plugin still running, and `error` instead to the
    plugin at fault, with a code from the
    [`error` reference](./messages.md#error);

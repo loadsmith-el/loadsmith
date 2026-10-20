@@ -117,8 +117,9 @@ What's shipped and what's queued next. Shipped items are documented in
       JSON run summary (`--output json`, `--summary-file`).
       Done since: providers wired into the core (`providers:` + `secret()`,
       the `provider` kind rename, masking everywhere, static `validate`) and
-      the parser wire contract. Remaining: the policy's open decisions (the parser kind, remote
-      state, SDK publishing),
+      the parser stage (wired and covered; `parser:` + `state:` deferred to
+      1.x). Remaining: the policy's open decisions (remote state, SDK
+      publishing),
       and the canonical plugins' `cancel()` rolling back once they move to
       the new SDK.
 
@@ -126,11 +127,13 @@ What's shipped and what's queued next. Shipped items are documented in
       direction is settled (`rustls` + the pure-Rust `rustls-rustcrypto` provider
       — see [docs](docs/src/architecture/multi-arch-and-tls.md)); the remaining
       work is the pure-Rust multipart upload + SigV4 signing, not the crypto stack.
-- [ ] **Parsers** — the protocol is defined (`parse_object` / `object_parsed`,
-      capabilities `parse` / `object_output`, the `parser:` block); next: the
-      core wiring (raw source → core → parser → pump), the SDK runtimes
-      (`ParserPlugin`, `ObjectSourcePlugin`), a `file` raw source, `csv` and
-      `excel` parsers in the canonical plugins.
+- [ ] **Parsers** — done in the engine: the core wiring (raw source → core →
+      parser → pump, abort and commit rules, capability gates, download
+      scratch dir) and the SDK runtimes (`ParserPlugin`,
+      `ObjectSourcePlugin`). Next, in the canonical plugins: a `file` raw
+      source, a streaming `csv` parser, an `excel` parser. Later (1.x):
+      `parser:` + `state:` (per-file checkpoints from
+      `object_parsed.last_batch_seq`), raw-source backpressure.
 - [ ] **More providers** — port the canonical `file` provider to the new
       `provider` kind and API (pending in loadsmith-canonical-plugins); an
       `aws-secrets-manager` provider (1.x, needs SigV4 like the s3 sink);

@@ -89,7 +89,7 @@ Plugins
   ├── Sources
   ├── Destinations
   ├── Sinks
-  ├── Parsers                        (protocol defined; core wiring planned)
+  ├── Parsers                        (raw source → parser → pump)
   └── Providers                      (resolve `secret()` values before a run)
 
 Protocols
@@ -212,7 +212,7 @@ pub struct PipelineConfig {
     pub providers: BTreeMap<String, ProviderRef>, // instance name → provider
     pub source: PluginRef,
     #[serde(default)]
-    pub parser: Option<PluginRef>, // accepted; not driven by the core yet
+    pub parser: Option<PluginRef>, // with a raw source (object_output) only
     pub destination: PluginRef,
     #[serde(default)]
     pub sink: Option<PluginRef>,
@@ -398,9 +398,10 @@ Examples:
 Converts files into tabular data: a *raw* source (capability `object_output`)
 announces local files with `object_ready`, the core hands each to the parser
 (`parse_object`), and the parser writes Arrow on fd3 in the source's place.
-(The protocol messages and the `parser:` config block exist; the core does not
-drive parsers yet — `loadsmith run` rejects a `parser:` block — and there is no
-SDK runtime yet. Experimental.)
+The core closes the parser's input only after the raw source succeeded and
+ends the destination's input only after both succeeded, so a failure upstream
+never commits the files parsed so far. SDK: `ParserPlugin` / `run_parser` and
+`ObjectSourcePlugin` / `run_object_source`.
 
 Examples:
 
@@ -715,11 +716,20 @@ URL-encoding) is not recognised.
 
 ## 14. Internal pipeline
 
-Simple conceptual model:
+The pipeline as implemented: a source writes Arrow, or a raw source produces
+files that a parser turns into Arrow; either way one Arrow stream goes through
+the core's pump to the destination, and an optional sink delivers the
+destination's files:
 
 ```text
-Source -> Parser -> Buffer -> Destination
+Source ────────────────────────────┐
+                                   ├─> core pump -> Destination [-> Sink]
+Raw source -(files)-> core -> Parser┘
 ```
+
+The parser is not a transformation stage: it only changes the representation
+(file → Arrow). The core stays in the middle of every hop — the raw source
+never talks to the parser, the parser never talks to the destination.
 
 A possible future model:
 

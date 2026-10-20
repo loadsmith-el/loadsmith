@@ -30,6 +30,7 @@
 - [Writing a Destination Plugin](./plugins/writing-a-destination.md)
 - [Writing a Sink Plugin](./plugins/writing-a-sink.md)
 - [Writing a Provider](./plugins/writing-a-provider.md)
+- [Writing a Parser](./plugins/writing-a-parser.md)
 
 # Protocol Reference
 

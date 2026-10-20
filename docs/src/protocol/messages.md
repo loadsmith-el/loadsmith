@@ -37,7 +37,7 @@ Sent by the **plugin** in response to `handshake`.
 | `plugin_name` | string | Should match the binary name (convention, shown in the run summary). Not enforced by the core |
 | `plugin_version` | string | Semver version string |
 | `protocol_supported_versions` | array of integers | Protocol versions this plugin understands |
-| `kind` | string | One of: `"source"`, `"destination"`, `"sink"`, `"parser"` (reserved: the core does not drive parsers yet), `"provider"`. The same spelling names the binary: `loadsmith-<kind>-<type>` |
+| `kind` | string | One of: `"source"`, `"destination"`, `"sink"`, `"parser"`, `"provider"`. A raw source is a `"source"`. The same spelling names the binary: `loadsmith-<kind>-<type>` |
 
 ---
 
@@ -90,11 +90,12 @@ Sent by the **plugin** in response to `capabilities_request`.
 | `schema_inference` | sources (SDK default) | no |
 | `incremental_state` | incremental sources (postgres, mysql, oracle) | yes — required when the pipeline has a `state:` block |
 | `batch_write` | destinations (SDK default) | no |
-| `object_output` | file-output destinations whose files a sink can deliver (parquet); also *raw sources*, which produce files instead of Arrow (reserved, see [`parse_object`](#parse_object)) | yes — required on the destination when the pipeline has a `sink:` block |
+| `object_output` | file-output destinations whose files a sink can deliver (parquet); also *raw sources*, which produce files instead of Arrow (see [`parse_object`](#parse_object)) | yes — required on the destination when the pipeline has a `sink:` block; on a source it requires a `parser:` block, and a `parser:` requires it |
+| `scratch_dir` | raw sources that download their files | yes — the core adds a fresh `scratch_dir` path to the source's `config` (unless the user set one) and removes that directory after a successful run |
 | `staged_merge` | postgres, mysql, oracle destinations | no |
 | `object_delivery` | sinks (SDK default) | no |
 | `resolve` | providers (SDK default) | yes — required of every provider instance |
-| `parse` | parsers | not yet (reserved: the core does not drive parsers yet) |
+| `parse` | parsers (SDK default) | yes — required of the pipeline's parser |
 
 ---
 
@@ -174,8 +175,10 @@ form (no `resume`) is unchanged and still valid.
 
 ### `schema`
 
-Sent by a **source** (or a **parser**, reserved) on the control channel (fd1) immediately after
-receiving `start`, before writing any Arrow data to fd3.
+Sent by a **source** on the control channel (fd1) immediately after
+receiving `start`, before writing any Arrow data to fd3. A **parser** sends it
+right after `start` when its config declares the schema, otherwise after it
+opened the first file (the core keeps sending `parse_object` meanwhile).
 
 ```json
 {
@@ -284,7 +287,7 @@ Sent on the control channel (fd1) after receiving `start` by a **destination**
 (ready to receive Arrow batches on fd3), a **sink** (ready for
 `deliver_object`), a **provider** (ready for [`resolve`](#resolve)), or a
 **raw source** (it answers `start` with `ready` instead of `schema` and then
-announces files with [`object_ready`](#object_ready); reserved).
+announces files with [`object_ready`](#object_ready)).
 
 ```json
 {"type": "ready"}
@@ -366,16 +369,19 @@ the moment it closes while the pump keeps filling the next.
 |---|---|---|
 | `path` | string | Local path of the finalized file |
 
-A **raw source** (capability `object_output`; reserved — the core does not
-drive parsers yet) sends `object_ready` for each local file it produces; the
-core forwards each path to the parser as [`parse_object`](#parse_object).
+A **raw source** (capability `object_output`) sends `object_ready` for each
+local file it produces, once the file is complete; the core forwards each
+path to the parser as [`parse_object`](#parse_object). The core tells the
+parser "no more files" only after the raw source's fd4 reached EOF (every
+`object_ready` was read) **and** it sent `finished` with success.
 
 ---
 
 ### `object_parsed`
 
-**Reserved: the core does not drive parsers yet.** Sent by a **parser** to fd4
-when a file is fully parsed. Informational.
+Sent by a **parser** to fd4 when a file is fully parsed. Informational: the
+core logs it. `last_batch_seq` ties the file to the batch ordinals, so
+per-file checkpoints can be added in 1.x without a new message.
 
 ```json
 {"type": "object_parsed", "path": "/mnt/s3/inbox/2026-10-01.csv", "rows": 1500, "batches": 2, "last_batch_seq": 2}
@@ -517,10 +523,14 @@ A wrong `id`, both fields, or neither is a protocol violation (`error`, code
 
 ### `parse_object`
 
-**Reserved: the core does not drive parsers yet.** Sent by the **core** to a
-**parser** on the control channel: parse the local file at `path` (from a raw
-source's `object_ready`). Idempotent per path. Stdin EOF means "no more
-files": the parser ends its IPC stream and sends `finished`.
+Sent by the **core** to a **parser** on the control channel: parse the local
+file at `path` (from a raw source's `object_ready`). The core sends each path
+once; a parser treats a repeated path as already handled (idempotent per
+path). The parser handles files one at a time, in arrival order. Stdin EOF
+means "no more files": the parser ends its IPC stream with the end-of-stream
+marker and sends `finished`. The core closes the parser's stdin only after the
+raw source succeeded; after an upstream failure the parser gets `cancel`
+instead, so it never ends its stream.
 
 ```json
 {"type": "parse_object", "path": "/mnt/s3/inbox/2026-10-01.csv"}
@@ -644,7 +654,9 @@ sending this, the plugin must close fd3 and fd4 and exit.
 The SDK's error codes: `SCHEMA_FAILED`, `BATCH_FAILED`, `IPC_WRITE_FAILED`
 (source); `PREPARE_FAILED`, `WRITE_FAILED`, `IPC_READ_FAILED`,
 `INPUT_TRUNCATED` (fd3 ended without the end-of-stream marker),
-`FINALIZE_FAILED` (destination); `DELIVER_FAILED` (sink); and, for any kind,
+`FINALIZE_FAILED` (destination); `DELIVER_FAILED` (sink); `OBJECT_FAILED`
+(raw source); `OPEN_FAILED`, `PARSE_FAILED`, `SCHEMA_MISMATCH`, `NO_INPUT`,
+`IPC_WRITE_FAILED` (parser); and, for any kind,
 `MALFORMED_MESSAGE`, `PROTOCOL_VIOLATION`, `CONTROL_CHANNEL_FAILED`,
 `PLUGIN_FAILED`. Hand-written plugins may use their own. A plugin that failed
 after `start` undoes its partial work *before* it sends this `finished`.
@@ -652,8 +664,8 @@ after `start` undoes its partial work *before* it sends this `finished`.
 | Field | Type | Description |
 |---|---|---|
 | `status` | string | `"success"`, `"error"`, or `"cancelled"` |
-| `rows_read` | integer (optional) | Total rows read (source only, on success) |
-| `batches_read` | integer (optional) | Total batches read (source only, on success) |
+| `rows_read` | integer (optional) | Total rows read (source or parser, on success) |
+| `batches_read` | integer (optional) | Total batches read (source or parser, on success) |
 | `rows_written` | integer (optional) | Total rows written (destination only, on success) |
 | `batches_written` | integer (optional) | Total batches written (destination only, on success) |
 | `code` | string (optional) | Machine-readable error code (on error) |
@@ -666,8 +678,12 @@ after `start` undoes its partial work *before* it sends this `finished`.
 `{"type": "finished", "status": "success"}` — no counters and no payload (values
 travel only in [`resolved`](#resolved)).
 
-**Parser form (reserved):** like a source — `rows_read` / `batches_read` over
-all files, sent after the parser ended its IPC stream with the end-of-stream
-marker. A later file whose schema differs from the first is
-`status: "error"`, `code: "SCHEMA_MISMATCH"`; no file and no declared schema is
-`NO_INPUT`.
+**Raw-source form:** the bare `{"type": "finished", "status": "success"}`
+once its last file was announced; the core takes the row counts from the
+parser.
+
+**Parser form:** like a source — `rows_read` / `batches_read` over all files,
+sent after the parser ended its IPC stream with the end-of-stream marker. A
+file whose schema differs from the stream's (the declared one, or the first
+file's) is `status: "error"`, `code: "SCHEMA_MISMATCH"`; stdin EOF before any
+file without a declared schema is `NO_INPUT`.

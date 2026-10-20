@@ -89,17 +89,43 @@ release notes in their repositories.
   replies `ready` to `start` and sends `finished` after stdin EOF. SDK:
   `ProviderPlugin` / `run_provider` / `ResolveFailure`. See
   [Writing a Provider](docs/src/plugins/writing-a-provider.md).
-- Protocol (experimental, not wired into the core yet): the parser messages
-  `parse_object{path}` and `object_parsed{path, rows, batches,
-  last_batch_seq}`, capabilities `parse` and `object_output` for a raw source
-  (which replies `ready` to `start`), and a strict `parser:` block in
-  `pipeline.yaml` (rejected by `loadsmith run` for now; not combinable with
-  `state:`). Golden fixtures pin every new message.
+- **The parser stage is wired into the core.** A `parser:` block in
+  `pipeline.yaml` turns the files a *raw source* (a source advertising
+  `object_output`) announces into Arrow: the core hands each `object_ready`
+  path, once, to the parser as `parse_object`, and pumps the parser's Arrow
+  stream to the destination. The parser's stdin is closed ("no more files")
+  only after the raw source finished with success; after any upstream failure
+  the parser is cancelled instead, and the destination's input ends cleanly
+  only after both the parser and the raw source succeeded, so a failure never
+  commits the files parsed so far. A `parser:` without a raw source, or a raw
+  source without a `parser:`, is a configuration error (exit `3`); a parser
+  without the `parse` capability is exit `4`; `parser:` with `state:` stays
+  rejected (incremental loads through a parser are deferred to 1.x). Rows read
+  come from the parser, and the route (human report and JSON summary) lists
+  it. See [Writing a Parser](docs/src/plugins/writing-a-parser.md).
+- Protocol: the parser messages `parse_object{path}` and
+  `object_parsed{path, rows, batches, last_batch_seq}`, capabilities `parse`
+  and `object_output` for a raw source (which replies `ready` to `start`), and
+  the new capability `scratch_dir`: a raw source that downloads its files gets
+  a core-allocated `scratch_dir` in its config (unless set), removed only after
+  a successful run. Golden fixtures pin every new message.
+- SDK: `ParserPlugin` / `run_parser` (`open(path)`, `next_batch`, optional
+  `declared_schema`; one schema per stream, `SCHEMA_MISMATCH`, `NO_INPUT`) and
+  `ObjectSourcePlugin` / `run_object_source` (`next_object`), both reading the
+  control channel concurrently with their work.
 - `loadsmith validate --resolve`: the full resolution `run` performs,
   providers included.
 - `loadsmith state show|rm` resolve only `pipeline:` and `state:`: they never
   start a provider and no longer need the other blocks' templates (database
   credentials) to resolve.
+
+### Fixed
+
+- A source that sends `finished` while the core still reads its Arrow stream
+  header (a small source) no longer logs "ignoring unexpected control
+  message"; the `finished` was always kept for the commit point. On the
+  parser path, a parser `finished` that arrives in that window before its
+  input ended is now rejected as a protocol violation instead of committing.
 
 ### Changed
 

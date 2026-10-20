@@ -50,7 +50,8 @@ Plugins (separate processes)
   ├── sources         read data        (e.g. postgres)
   ├── destinations    write data       (e.g. postgres, jsonl, parquet)
   ├── sinks           deliver files    (e.g. local-copy → later s3)
-  ├── parsers         raw → tabular       (protocol defined; core wiring next)
+  ├── parsers         raw files → Arrow (a raw source announces files, the
+  │                   core hands each to the parser, e.g. file → csv)
   └── providers       secret() values (e.g. file), run by the core before the
                       data plugins; {{ env() }} / {{ file() }} need none
 
@@ -288,7 +289,11 @@ Loadsmith is at **v0.2.0** — the architecture is proven end-to-end:
 - ✅ Live progress + run summary, `--log-level`, `--no-color`
 - ✅ Incremental state & checkpoints (core-owned watermark, locking, `loadsmith
   state`); at-least-once, exactly-once with an idempotent destination
-- 🔜 More providers (AWS Secrets Manager, Vault), parsers (`csv`, `excel`),
+- ✅ Parser stage: a raw source announces files, a parser turns them into
+  Arrow (`ParserPlugin` / `ObjectSourcePlugin` in the SDK); a failure
+  upstream never commits a partial load
+- 🔜 More providers (AWS Secrets Manager, Vault), canonical parsers (`csv`,
+  `excel`) and a `file` raw source,
   whole-document `--config-ref` (1.x), remote (`s3`) state
   backend, `s3` sink, more plugins — see [ROADMAP.md](ROADMAP.md)
 

@@ -108,7 +108,7 @@ makes progress.
 
 | Channel | Format | Direction | What goes here |
 |---|---|---|---|
-| fd0 (stdin) | JSONL | core → plugin | Lifecycle commands (handshake, configure, start; `deliver_object` / `ping` for sinks; `resolve` for providers; `parse_object` for parsers, reserved) |
+| fd0 (stdin) | JSONL | core → plugin | Lifecycle commands (handshake, configure, start; `deliver_object` / `ping` for sinks; `resolve` for providers; `parse_object` for parsers) |
 | fd1 (stdout) | JSONL | plugin → core | Lifecycle responses (ack, schema, ready, `resolved`, finished) |
 | fd3 | Arrow IPC | source/parser→core, core→dest | Record batches (sinks, providers and raw sources have no fd3) |
 | fd4 | JSONL | plugin → core | Log events, progress updates, `object_ready`, `object_parsed`, `checkpoint`, `committed`. Always wired and drained, for every kind |

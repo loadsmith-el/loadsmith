@@ -33,18 +33,20 @@ A **plugin** is an ordinary OS binary that implements the loadsmith protocol ove
 file descriptors. The core spawns it as a child process, wires up the three
 communication channels, and orchestrates its lifecycle.
 
-There are four runnable kinds of plugin:
+There are five kinds of plugin:
 
 | Kind | Role | SDK entry point |
 |---|---|---|
 | `source` | Reads from an origin system and emits Arrow batches | `run_source` |
 | `destination` | Consumes Arrow batches and writes them to a target | `run_destination` |
 | `sink` | Delivers finalized staged files to a target (see [Sink Delivery](./sink-delivery.md)) | `run_sink` |
+| `parser` | Turns the files a *raw source* announces into Arrow batches, in the source's place on the data plane (see [Writing a Parser](../plugins/writing-a-parser.md)) | `run_parser` (raw source: `run_object_source`) |
 | `provider` | Resolves the pipeline's `secret('<instance>', '<ref>')` values before the run (`resolve` → `resolved`) | `run_provider` |
 
-`parser` is a reserved kind: its protocol messages (`parse_object`,
-`object_parsed`) are defined in v1, but the core does not drive parsers yet and
-the SDK has no parser runtime.
+A raw source is a `source` that advertises `object_output`: it produces files,
+not Arrow, and requires a `parser:` block. The core forwards each file the raw
+source announces to the parser and pumps the parser's Arrow stream to the
+destination (`parser_feed.rs`, `runner.rs`).
 
 Providers run before anything else: the core's loader (`load.rs`) checks the
 pipeline file statically, starts each provider instance a `secret()` call
@@ -70,6 +72,7 @@ Examples:
 | `postgres` | source | `loadsmith-source-postgres` |
 | `jsonl` | destination | `loadsmith-destination-jsonl` |
 | `local-copy` | sink | `loadsmith-sink-local-copy` |
+| `csv` (under `parser:`) | parser | `loadsmith-parser-csv` |
 | `file` (under `providers:`) | provider | `loadsmith-provider-file` |
 
 The core searches for the binary first in the plugin directory (default

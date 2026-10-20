@@ -163,6 +163,27 @@ keeps draining the source meanwhile, so a source blocked on a full pipe can
 still read its `cancel`. See the
 [abort rules](../protocol/reference.md#abort-rules).
 
+## With a parser
+
+A raw source has no fd3, so with a `parser:` block the parser is spawned with
+`in_write_raw` as its fd3 instead, and the pump reads the parser's stream:
+
+```
+raw source ──fd4 object_ready──▶ event drain ──channel──▶ feed ──fd0 parse_object──▶ parser
+                                                                                    │ fd3
+                                                                         in_pipe ◀──┘
+                                                          core pump ──▶ out_pipe ──▶ destination
+```
+
+The raw source's event drain forwards each `object_ready` path over an
+unbounded channel (the drain must never block); the runner's feed hands each
+path once to the parser through a writer task that owns the parser's stdin.
+The feed ends the parser's input only when that channel is closed (the raw
+source's fd4 reached EOF) and the raw source sent `finished` with success. The
+commit point then needs the parser's clean end of stream, the parser's
+`finished` success and the raw source's `finished` success. Rows and batches
+read in the summary are the parser's.
+
 ## What the `Finished` message carries
 
 Both plugins end with `Finished`:
