@@ -17,7 +17,7 @@ pub trait DestinationPlugin: Send {
     fn durable_through(&mut self) -> Option<u64> { None }
     fn take_ready_objects(&mut self) -> Vec<PathBuf> { Vec::new() }
 
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()>;
+    async fn configure(&mut self, config: PluginConfig) -> Result<()>;
     async fn prepare(&mut self) -> Result<()>;
     async fn write_batch(&mut self, batch: RecordBatch) -> Result<()>;
     async fn finalize(&mut self) -> Result<u64>;
@@ -30,7 +30,7 @@ pub trait DestinationPlugin: Send {
 | `plugin_name()` | During handshake | Return `"loadsmith-destination-{type}"` (convention, shown in the run summary) |
 | `plugin_version()` | During handshake | Return the semver version string |
 | `capabilities()` | During handshake | Add `"object_output"` (stages files for a sink) or `"staged_merge"` as applicable |
-| `configure(config)` | After protocol negotiation | Deserialize and validate config. Do not open resources yet |
+| `configure(config)` | After protocol negotiation | Parse with `config.parse::<YourConfig>()?` (unknown keys: see [Configuration](writing-a-source.md#configuration)) and validate. Do not open resources yet |
 | `prepare()` | After `start` signal, before first batch | Open files, connections, writers. Send `Ready` when done |
 | `write_batch(batch)` | Once per incoming batch | Write this `RecordBatch` to the sink |
 | `durable_through()` | After each batch | Highest batch ordinal now **durably** committed — gates the core's watermark persistence. Leave `None` if only durable at `finalize` |
@@ -148,7 +148,7 @@ async fn main() {
 use anyhow::Result;
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
-use loadsmith_plugin_sdk::DestinationPlugin;
+use loadsmith_plugin_sdk::{DestinationPlugin, PluginConfig};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -179,8 +179,8 @@ impl DestinationPlugin for ParquetPlugin {
         env!("CARGO_PKG_VERSION")
     }
 
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
-        let cfg: ParquetConfig = serde_json::from_value(config)?;
+    async fn configure(&mut self, config: PluginConfig) -> Result<()> {
+        let cfg: ParquetConfig = config.parse()?;
 
         // Validate — check the parent directory exists, etc.
         // Do NOT open the file here.

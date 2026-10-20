@@ -325,7 +325,10 @@ Intra-run durability needs no capability: a destination reports it by emitting `
 
 ```jsonl
 {"type":"configure","config":{...}}
+{"type":"configure","config":{...},"unknown_keys":"warn"}
 ```
+
+`unknown_keys` (optional, additive): what the plugin does with keys of `config` it does not recognise, at any depth. `"error"` (the default; also when absent or not understood) rejects the config with `configure_ack` error code `UNKNOWN_CONFIG_KEYS`, naming every unknown key path; `"warn"` logs one `warn` event per key on fd4 and ignores them. The core sends `"warn"` only when the operator ran with `--ignore-unknown-keys` / `LOADSMITH_IGNORE_UNKNOWN_KEYS=1`. Older plugins ignore the field (tolerant reader).
 
 ---
 

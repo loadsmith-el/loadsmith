@@ -165,6 +165,11 @@ destination:
     path: /tmp/events.jsonl
 ```
 
+A key Loadsmith does not know, in the file or in a plugin's `config:` (a typo
+such as `batch_sise`), fails the run with every unknown key named;
+`loadsmith run --ignore-unknown-keys` turns them into warnings instead (see
+[Unknown keys](docs/src/reference/cli.md#unknown-keys)).
+
 ### Run it
 
 ```bash

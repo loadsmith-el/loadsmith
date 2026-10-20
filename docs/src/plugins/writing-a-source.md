@@ -17,7 +17,7 @@ pub trait SourcePlugin: Send {
     async fn resume_from(&mut self, _cursor_value: Option<serde_json::Value>) {}
     fn current_watermark(&self) -> Option<serde_json::Value> { None }
 
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()>;
+    async fn configure(&mut self, config: PluginConfig) -> Result<()>;
     async fn schema(&mut self) -> Result<Schema>;
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>>;
     async fn cancel(&mut self);
@@ -29,7 +29,7 @@ pub trait SourcePlugin: Send {
 | `plugin_name()` | During handshake | Return the binary name, `"loadsmith-source-{type}"` (convention, shown in the run summary) |
 | `plugin_version()` | During handshake | Return the semver version string |
 | `capabilities()` | During handshake | Override to add `"incremental_state"` if you support resume |
-| `configure(config)` | After protocol negotiation | Deserialize config, validate, open connection |
+| `configure(config)` | After protocol negotiation | Parse with `config.parse::<YourConfig>()?` (see [Configuration](#configuration)), validate, open connection |
 | `resume_from(cursor)` | After `start`, before `schema()` | Stash the opaque resume watermark (incremental sources) |
 | `schema()` | After `start` signal | Return the Arrow schema of the rows you will emit |
 | `next_batch()` | Repeatedly, until done | Return the next `RecordBatch`, or `Ok(None)` when exhausted |
@@ -41,6 +41,60 @@ pub trait SourcePlugin: Send {
 > never builds queries), and return the running max from `current_watermark`.
 > Declare any cursor lazily — `resume_from` is delivered *after* `configure`. See
 > [Incremental State](../architecture/incremental-state.md).
+
+## Configuration
+
+`configure` receives a `PluginConfig`: the plugin's `config:` block (after
+template resolution) and the operator's unknown-keys policy. Parse it with
+`PluginConfig::parse` into your own `Deserialize` type. Every plugin kind does
+it the same way, so a typo behaves the same in every plugin:
+
+```rust
+use loadsmith_plugin_sdk::PluginConfig;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct MyConfig {
+    host: String,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(flatten)]
+    tls: TlsOptions, // flattened structs are checked too
+}
+
+async fn configure(&mut self, config: PluginConfig) -> Result<()> {
+    let cfg: MyConfig = config.parse()?;
+    // validate, connect, keep `cfg`
+    Ok(())
+}
+```
+
+`parse` finds every key your type does not use, at any depth: nested structs,
+arrays of structs, enum variants, and next to or inside `#[serde(flatten)]`
+structs (where serde's own `deny_unknown_fields` does not work). What happens
+then is the operator's choice, not the plugin's:
+
+- **By default** the config is rejected: `configure_ack` `error` with code
+  `UNKNOWN_CONFIG_KEYS` and a message listing every unknown key path, with a
+  suggestion when one is a likely typo (`` `tls.verfy` (did you mean
+  `tls.verify`?) ``). The run exits `3`.
+- **With `loadsmith run --ignore-unknown-keys`** (or
+  `LOADSMITH_IGNORE_UNKNOWN_KEYS=1`) the SDK logs one warning per unknown key
+  on the event channel and the run continues.
+
+A config that does not have the expected shape (a missing field, a value of
+the wrong type) is rejected under either policy with code `INVALID_CONFIG`
+and the path of the bad value.
+
+Rules for config types:
+
+- **Don't** put `#[serde(deny_unknown_fields)]` on them: it would make the
+  `--ignore-unknown-keys` policy impossible. `parse` does that job.
+- A free-form part (`HashMap<String, String>`, `serde_json::Value`) accepts
+  any key, as it should.
+- `config.unknown_keys()` returns the policy; `config.value()` (or `*config`,
+  it derefs to `serde_json::Value`) the raw block; `loadsmith_plugin_sdk::config::parse`
+  is the same check as a free function, returning the ignored keys.
 
 ## Step-by-step example: MySQL source
 
@@ -134,7 +188,7 @@ use anyhow::Result;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use loadsmith_plugin_sdk::SourcePlugin;
+use loadsmith_plugin_sdk::{PluginConfig, SourcePlugin};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -174,8 +228,8 @@ impl SourcePlugin for MysqlPlugin {
         env!("CARGO_PKG_VERSION")
     }
 
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
-        let cfg: MysqlConfig = serde_json::from_value(config)?;
+    async fn configure(&mut self, config: PluginConfig) -> Result<()> {
+        let cfg: MysqlConfig = config.parse()?;
 
         // Open connection, validate credentials, prepare query.
         // If anything fails here, return Err — the core will abort cleanly.

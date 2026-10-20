@@ -118,8 +118,14 @@ If validation fails, the plugin responds with:
 {"type": "configure_ack", "status": "error", "code": "CONFIGURE_FAILED", "message": "invalid postgres source config: missing field `dbname`"}
 ```
 
-Error codes are free-form strings; SDK-based plugins always use
-`CONFIGURE_FAILED` here.
+Error codes are free-form strings. SDK-based plugins use `UNKNOWN_CONFIG_KEYS`
+(a key the plugin does not know), `INVALID_CONFIG` (a missing field, a value of
+the wrong type) or `CONFIGURE_FAILED` (any other error).
+
+`configure` may also carry `"unknown_keys": "error" | "warn"`, the operator's
+[unknown-keys policy](../reference/cli.md#unknown-keys): under `warn` the plugin
+ignores unknown keys, logging a warning per key, instead of rejecting the
+config. SDK plugins apply it by parsing with `PluginConfig::parse`.
 
 And the core aborts the run immediately, printing the error. If validation
 succeeds, the plugin may open connections, validate credentials, and prepare

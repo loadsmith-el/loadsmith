@@ -41,6 +41,7 @@ loadsmith run pipeline.yaml --summary-file run.json     # human report on stdout
 | `--print-resolved-config` | off | Resolve the config (providers included), print it to stdout with every `env()`/`file()`/`secret()` value masked, and exit without starting any data plugin |
 | `--output <human\|json>` | `human` | What stdout carries: the human report, or one JSON [run summary](#machine-readable-run-summary) instead |
 | `--summary-file <path>` | — | Also write the JSON [run summary](#machine-readable-run-summary) to this file, whatever `--output` says |
+| `--ignore-unknown-keys[=<bool>]` | off | Warn about [unknown keys](#unknown-keys) and ignore them instead of failing (exit `3`). Also `LOADSMITH_IGNORE_UNKNOWN_KEYS=1`; the flag wins |
 
 **Exit codes:** see [Exit codes](#exit-codes). A run that fails once data is
 flowing prints the summary with `Status: error` and a `Cause:` line; a run that
@@ -224,12 +225,15 @@ loadsmith validate pipeline.yaml --resolve --plugin-dir /opt/loadsmith/plugins
 |---|---|---|
 | `--resolve` | off | Also resolve every template: read the `env()`/`file()` values and run the provider instances the `secret()` calls reference |
 | `--plugin-dir <path>` | `~/.loadsmith/plugins/` | Where `--resolve` finds provider binaries |
+| `--ignore-unknown-keys[=<bool>]` | off | Warn about [unknown keys](#unknown-keys) in the file's own blocks and ignore them. Also `LOADSMITH_IGNORE_UNKNOWN_KEYS=1`; the flag wins |
 
 **What is checked (always):**
 1. YAML syntax is valid
 2. The core-owned keys are strict: an unknown key at the top level, under
    `pipeline:`, `providers:`, `state:`, or beside a plugin's `type`/`config` is
-   rejected
+   rejected, listed by path (or only warned about with
+   `--ignore-unknown-keys`). The keys *inside* a plugin's `config:` are
+   checked by the plugin at run time, under the same policy
 3. `pipeline.name`, `source.type`, `destination.type`, (if present)
    `sink.type`/`parser.type` and every `providers.<name>.type` are non-empty;
    provider instance names use letters, digits, `_` and `-`
@@ -392,7 +396,59 @@ has no `state:` block.
 Both read only what locates the state: `env()`/`file()` are resolved in
 `pipeline:` and `state:` alone, and no provider is ever started (`secret()` is
 not allowed in those blocks). The other blocks' templates — database
-credentials, `secret()` calls — need not resolve.
+credentials, `secret()` calls — need not resolve. Both check the file's own
+blocks for [unknown keys](#unknown-keys) and take `--ignore-unknown-keys`.
+
+---
+
+## Unknown keys
+
+A key Loadsmith does not know is an **error** by default (exit `3`), wherever
+it is in the pipeline file:
+
+- in the file's own blocks (the top level, `pipeline:`, `providers:`,
+  `state:`, and beside a plugin's `type`/`config`): `run`, `validate`,
+  `state show` and `state rm` reject the file before anything starts;
+- inside a plugin's `config:`: the plugin rejects its config in `configure`
+  (`configure_ack` code `UNKNOWN_CONFIG_KEYS`), before any data moves.
+
+Every unknown key is named by its path, with a suggestion for a likely typo:
+
+```
+error: configuration error: unknown key in the pipeline file: `x-generator` (fix or remove it, or run with --ignore-unknown-keys to ignore unknown keys)
+error: plugin rejected its config: loadsmith-source-postgres: UNKNOWN_CONFIG_KEYS — unknown config key `tls.verfy` (did you mean `tls.verify`?) (fix or remove it, or run with --ignore-unknown-keys to ignore unknown keys)
+```
+
+To run a file as it is (one written by another program that adds its own
+metadata keys, say), turn the check into warnings **when running it**:
+
+```bash
+loadsmith run pipeline.yaml --ignore-unknown-keys
+LOADSMITH_IGNORE_UNKNOWN_KEYS=1 loadsmith run pipeline.yaml
+```
+
+Each unknown key is then logged once as a warning on stderr and ignored; the
+run goes on:
+
+```
+WARN loadsmith_core::load: ignoring unknown key `x-generator` in the pipeline file key=x-generator
+WARN plugin: ignoring unknown config key `x-generated-at` plugin="destination"
+```
+
+The policy covers the whole file and reaches every plugin (it is sent in
+`configure`; see the [protocol](../protocol/messages.md#configure)). There is
+deliberately no per-block or in-file switch: whether a file may carry keys
+Loadsmith does not know is the operator's decision, made where the file is
+run.
+
+**Precedence:** `--ignore-unknown-keys` (or `--ignore-unknown-keys=true`)
+turns it on and `--ignore-unknown-keys=false` keeps it off, whatever the
+environment says. Without the flag, `LOADSMITH_IGNORE_UNKNOWN_KEYS` decides:
+`1`, `true`, `yes` or `on` (any case) turn it on; unset, empty, `0`, `false`,
+`no` or `off` keep the default; any other value is a usage error (exit `2`).
+
+A plugin built with an SDK older than this policy applies its own rules to
+its `config:` (most accept unknown keys silently) and ignores the setting.
 
 ---
 
@@ -424,6 +480,7 @@ checksum, a manifest whose `protocol` range this engine does not support) exit
 | Variable | Equivalent to | Description |
 |---|---|---|
 | `NO_COLOR` | `--no-color` | Disable ANSI color (when set, to any value — even empty) |
+| `LOADSMITH_IGNORE_UNKNOWN_KEYS` | `--ignore-unknown-keys` | `1`/`true`/`yes`/`on`: warn about [unknown keys](#unknown-keys) and ignore them (`run`, `validate`, `state show`, `state rm`). The flag, when given, wins |
 | Any variable in `{{ env('NAME') }}` | — | Injected into pipeline template resolution |
 
 Either `--no-color` or `NO_COLOR` disables color. The plugin directory has no

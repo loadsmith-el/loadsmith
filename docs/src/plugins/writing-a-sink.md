@@ -15,7 +15,7 @@ pub trait SinkPlugin: Send {
 
     fn capabilities(&self) -> Vec<String> { vec!["object_delivery".into()] }
 
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()>;
+    async fn configure(&mut self, config: PluginConfig) -> Result<()>;
     async fn prepare(&mut self) -> Result<()>;
     async fn deliver(&mut self, path: PathBuf) -> Result<()>; // one file
     async fn finalize(&mut self) -> Result<u64>;              // objects delivered
@@ -25,7 +25,7 @@ pub trait SinkPlugin: Send {
 
 | Method | When called | What to do |
 |---|---|---|
-| `configure(config)` | After protocol negotiation | Deserialize and validate config (e.g. bucket/credentials). Don't transfer yet |
+| `configure(config)` | After protocol negotiation | Parse with `config.parse::<YourConfig>()?` (unknown keys: see [Configuration](writing-a-source.md#configuration)) and validate (e.g. bucket/credentials). Don't transfer yet |
 | `prepare()` | After `start` | Open connections / clients. SDK sends `Ready` when done |
 | `deliver(path)` | Once per finalized file | Ship the file at `path` to the target. **Must be idempotent** |
 | `finalize()` | After all objects are delivered (control EOF) | Flush, close, return the object count |
@@ -59,7 +59,7 @@ async fn main() {
 use std::path::PathBuf;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use loadsmith_plugin_sdk::SinkPlugin;
+use loadsmith_plugin_sdk::{PluginConfig, SinkPlugin};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -76,8 +76,8 @@ impl SinkPlugin for LocalCopyPlugin {
     fn plugin_name(&self) -> &str { "loadsmith-sink-local-copy" }
     fn plugin_version(&self) -> &str { env!("CARGO_PKG_VERSION") }
 
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
-        let cfg: Config = serde_json::from_value(config)?;
+    async fn configure(&mut self, config: PluginConfig) -> Result<()> {
+        let cfg: Config = config.parse()?;
         std::fs::create_dir_all(&cfg.dest)?;
         self.config = Some(cfg);
         Ok(())

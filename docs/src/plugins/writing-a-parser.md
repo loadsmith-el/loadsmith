@@ -97,7 +97,7 @@ pub trait ParserPlugin: Send {
     /// Defaults to ["parse"], which the core requires.
     fn capabilities(&self) -> Vec<String> { vec!["parse".into()] }
 
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()>;
+    async fn configure(&mut self, config: PluginConfig) -> Result<()>;
 
     /// The stream's schema when the config fixes it (e.g. `columns:`).
     fn declared_schema(&self) -> Option<Schema> { None }
@@ -116,7 +116,7 @@ pub trait ParserPlugin: Send {
 |---|---|---|
 | `plugin_name()` | During handshake | Return `"loadsmith-parser-{type}"` |
 | `capabilities()` | During handshake | Keep the default `["parse"]` |
-| `configure(config)` | After `configure` | Parse and validate the options (delimiter, encoding, header, declared columns). `Err` rejects the config (exit `3`) |
+| `configure(config)` | After `configure` | Parse the options with `config.parse::<YourConfig>()?` (unknown keys: see [Configuration](writing-a-source.md#configuration)) and validate them (delimiter, encoding, header, declared columns). `Err` rejects the config (exit `3`) |
 | `declared_schema()` | Once, after `start` | Return the schema the config declares, or `None` to infer it from the first file |
 | `open(path)` | Once per file, in arrival order | Open the file and return its schema. Infer types from a bounded sample (the first N rows), never by reading the whole file |
 | `next_batch()` | Until it returns `None` | Return the next batch of the open file. Stream: hold one batch, not the file |
@@ -161,7 +161,7 @@ pub trait ObjectSourcePlugin: Send {
     /// core-allocated download directory in the config.
     fn capabilities(&self) -> Vec<String> { vec!["object_output".into()] }
 
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()>;
+    async fn configure(&mut self, config: PluginConfig) -> Result<()>;
 
     /// The next complete local file; `None` when there are no more.
     async fn next_object(&mut self) -> Result<Option<PathBuf>>;

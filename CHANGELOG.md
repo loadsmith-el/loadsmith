@@ -118,6 +118,27 @@ release notes in their repositories.
 - `loadsmith state show|rm` resolve only `pipeline:` and `state:`: they never
   start a provider and no longer need the other blocks' templates (database
   credentials) to resolve.
+- **Unknown keys are an error everywhere by default** (exit `3`), each named
+  by path: in the pipeline file's own blocks (`x-generator`,
+  `pipeline.timeouts.stall_secs`) and inside each plugin's `config:`
+  (`tls.verify_mode`), where previously no plugin rejected them and a typo
+  silently ran with a default. `--ignore-unknown-keys` on `run`, `validate`
+  and `state show|rm`, or `LOADSMITH_IGNORE_UNKNOWN_KEYS=1`, logs a warning
+  per unknown key and ignores it instead, so a generated file with extra
+  metadata keys runs unedited; the flag wins over the variable. See
+  [Unknown keys](docs/src/reference/cli.md#unknown-keys).
+- Protocol: `configure` carries an optional `unknown_keys` (`error` |
+  `warn`), the policy the plugin applies to its config. Absent or unknown
+  values read as `error`; older plugins ignore it. Golden fixture
+  `configure_v1.jsonl`.
+- SDK: `configure` receives a `PluginConfig` (it derefs to the JSON value)
+  whose `parse::<T>()` applies the policy. It finds unknown keys at any depth,
+  next to and inside `#[serde(flatten)]` structs included (which serde's
+  `deny_unknown_fields` cannot check), and suggests a near field name (`did
+  you mean`). It rejects with `configure_ack` code `UNKNOWN_CONFIG_KEYS` (a
+  bad value: `INVALID_CONFIG`, with its path), or, under `warn`, the SDK logs
+  one warning per key on fd4. `config::parse` is the same check as a free
+  function.
 
 ### Fixed
 
@@ -131,6 +152,13 @@ release notes in their repositories.
   input ended is now rejected as a protocol violation instead of committing.
 
 ### Changed
+
+- **Breaking (SDK):** every plugin trait's `configure` takes a
+  `PluginConfig` instead of a `serde_json::Value`. It derefs to the value,
+  so `config.get("x")` still works; replace `serde_json::from_value(config)?`
+  with `config.parse()?` (and drop `deny_unknown_fields` from config types:
+  the helper does that job and honours `--ignore-unknown-keys`). The wire
+  protocol is unchanged for existing plugins.
 
 - `plugin install --all` (no package name) skips, with a warning, any package
   whose manifest this loadsmith cannot use (unknown plugin kind, no supported

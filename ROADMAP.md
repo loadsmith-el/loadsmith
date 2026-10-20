@@ -118,10 +118,11 @@ What's shipped and what's queued next. Shipped items are documented in
       Done since: providers wired into the core (`providers:` + `secret()`,
       the `provider` kind rename, masking everywhere, static `validate`) and
       the parser stage (wired and covered; `parser:` + `state:` deferred to
-      1.x). Remaining: the policy's open decisions (remote state, SDK
-      publishing),
-      and the canonical plugins' `cancel()` rolling back once they move to
-      the new SDK.
+      1.x), and the unknown-keys policy (an error by default, warnings with
+      `--ignore-unknown-keys`; SDK `PluginConfig::parse`). Remaining: the
+      policy's open decisions (remote state, SDK publishing), and the
+      canonical plugins' `cancel()` rolling back and config parsing through
+      `PluginConfig::parse` once they move to the new SDK.
 
 - [ ] **`s3` sink** — multipart-upload delivery of staged files to S3. The TLS
       direction is settled (`rustls` + the pure-Rust `rustls-rustcrypto` provider

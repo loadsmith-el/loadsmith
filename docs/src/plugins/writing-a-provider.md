@@ -40,7 +40,7 @@ pub trait ProviderPlugin: Send {
     /// Defaults to ["resolve"], which the core requires.
     fn capabilities(&self) -> Vec<String> { vec!["resolve".into()] }
 
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()>;
+    async fn configure(&mut self, config: PluginConfig) -> Result<()>;
     async fn resolve(&mut self, reference: &str) -> Result<String>;
 
     /// Called when the run is aborted after `start`. Default: nothing.
@@ -53,7 +53,7 @@ pub trait ProviderPlugin: Send {
 | `plugin_name()` | During handshake | Return the binary name, `"loadsmith-provider-{type}"` |
 | `plugin_version()` | During handshake | Return `env!("CARGO_PKG_VERSION")` |
 | `capabilities()` | During handshake | Keep the default `["resolve"]`; a provider without it is rejected (exit `4`) |
-| `configure(config)` | After the core sends `configure` | Parse and validate the instance's `config:` (it may use `env()`/`file()`, never `secret()`); open clients, check paths. Return `Err` to reject it (exit `3`) |
+| `configure(config)` | After the core sends `configure` | Parse the instance's `config:` with `config.parse::<YourConfig>()?` (unknown keys: see [Configuration](writing-a-source.md#configuration)) and validate it (it may use `env()`/`file()`, never `secret()`); open clients, check paths. Return `Err` to reject it (exit `3`) |
 | `resolve(reference)` | Once per distinct reference | Return the value, or an error (see below). The reference syntax is yours to define |
 | `cancel()` | When the core sends `cancel`/`error` after `start` | Release what you hold |
 
@@ -145,11 +145,10 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use loadsmith_plugin_sdk::{ProviderPlugin, ResolveFailure};
+use loadsmith_plugin_sdk::{PluginConfig, ProviderPlugin, ResolveFailure};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Config {
     path: String,
 }
@@ -168,8 +167,8 @@ impl ProviderPlugin for EnvFileProvider {
         env!("CARGO_PKG_VERSION")
     }
 
-    async fn configure(&mut self, config: serde_json::Value) -> Result<()> {
-        let cfg: Config = serde_json::from_value(config).context("invalid env-file config")?;
+    async fn configure(&mut self, config: PluginConfig) -> Result<()> {
+        let cfg: Config = config.parse().context("invalid env-file config")?;
         // The path is not secret; the file's contents are — never echo them.
         let text = std::fs::read_to_string(&cfg.path)
             .with_context(|| format!("cannot read {}", cfg.path))?;

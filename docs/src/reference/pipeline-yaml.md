@@ -56,10 +56,28 @@ state:                    # optional — incremental state (core-owned watermark
                             #   committed batches; 0 ⇒ only at end of run
 ```
 
-The core-owned keys above are **strict**: an unknown key anywhere in this
-schema (a typo such as `confg:` or `heartbeat_secs:`) is a validation error,
-not silently ignored. The *contents* of each `config:` block are free-form as far
-as the core is concerned — the plugin validates them.
+## Strictness: unknown keys
+
+A key Loadsmith does not know is an **error** by default, not silently
+ignored, anywhere in the file:
+
+- **The file's own keys** (everything in the schema above, outside the
+  `config:` blocks): an unknown key, such as a typo (`confg:`,
+  `heartbeat_secs:`) or a key another program added (`x-generator:`), fails
+  `run`, `validate` and `state show|rm` with exit `3`, before anything starts.
+  The message lists every unknown key by path (`pipeline.timeouts.stall_secs`).
+- **Each plugin's `config:`**: the core passes it through, and the plugin
+  rejects a key it does not use, at any depth (`tls.verify_mode`,
+  `tables[2].nmae`), when it is configured; the run exits `3` before any data
+  moves. (Plugins built with an SDK older than this rule apply their own;
+  most ignore unknown keys.)
+
+There is no key to relax this in the file itself. The operator decides when
+running it: with `loadsmith run --ignore-unknown-keys` (or
+`LOADSMITH_IGNORE_UNKNOWN_KEYS=1`) every unknown key, in both places, is
+logged as a warning and ignored, so a generated file with extra metadata runs
+unedited. See [Unknown keys](cli.md#unknown-keys) for the flag, the
+environment variable and their precedence.
 
 ## Field reference
 
@@ -349,6 +367,8 @@ plugins docs:
 This split is deliberate: a plugin's config is **opaque to the core** (passed
 through verbatim after template resolution), so its schema lives where the
 plugin is maintained — change a plugin, change its doc in the same repo. The
+plugin checks it, unknown keys included, under the
+[strictness](#strictness-unknown-keys) rule above. The
 sections above (top-level shape, templates, `state:`) are the engine's contract
 and stay here.
 

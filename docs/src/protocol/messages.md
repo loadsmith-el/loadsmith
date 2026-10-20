@@ -118,13 +118,24 @@ template resolution.
     "password": "s3cr3t",
     "query": "SELECT * FROM orders",
     "batch_size": 2000
-  }
+  },
+  "unknown_keys": "error"
 }
 ```
 
 | Field | Type | Description |
 |---|---|---|
 | `config` | object | Arbitrary JSON — the plugin's configuration |
+| `unknown_keys` | string (optional) | What the plugin does with a key of `config` it does not recognise, at any depth: `"error"` (the default) rejects the config with `configure_ack` `error` (code `UNKNOWN_CONFIG_KEYS`), naming every unknown key path; `"warn"` logs one `warn` event per unknown key on fd4 and ignores it. Absent, or a value the plugin does not know, means `"error"` |
+
+`unknown_keys` is how the operator's choice reaches every plugin: the core
+sends `"warn"` when the run was started with `--ignore-unknown-keys` (or
+`LOADSMITH_IGNORE_UNKNOWN_KEYS=1`), `"error"` otherwise. A plugin built with
+the Rust SDK applies it by parsing its config with `PluginConfig::parse` (see
+[Writing a source](../plugins/writing-a-source.md#configuration)). An older
+plugin ignores the field (tolerant reader) and keeps its own behaviour; a
+plugin in another language should implement the same rule. A core older than
+the field never sends it, which a plugin reads as `"error"`.
 
 ---
 
@@ -150,7 +161,7 @@ Sent by the **plugin** in response to `configure`.
 | Field | Type | Description |
 |---|---|---|
 | `status` | string | `"ok"` or `"error"` |
-| `code` | string (optional) | Machine-readable error code. Present only when `status` is `"error"` |
+| `code` | string (optional) | Machine-readable error code. Present only when `status` is `"error"`. The Rust SDK sends `UNKNOWN_CONFIG_KEYS` (unknown keys under the `error` policy), `INVALID_CONFIG` (a missing field, a value of the wrong type) or `CONFIGURE_FAILED` (any other error from `configure()`) |
 | `message` | string (optional) | Human-readable error message. Present only when `status` is `"error"` |
 
 ---
