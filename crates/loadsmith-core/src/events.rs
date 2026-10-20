@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use loadsmith_config::MaskList;
 use loadsmith_protocol::{LogLevel, Message};
 use loadsmith_transport::{ControlReader, TransportError};
 use tokio::io::AsyncBufRead;
@@ -17,6 +18,10 @@ pub struct EventForward {
     pub checkpoint_tx: Option<UnboundedSender<(u64, serde_json::Value)>>,
     /// `Committed` batch_seq → state supervisor. Destination drain.
     pub committed_tx: Option<UnboundedSender<u64>>,
+    /// Resolved template values to redact from the plugin's log lines and
+    /// from anything else this drain prints. A shared handle: values added
+    /// later are masked too.
+    pub mask: MaskList,
 }
 
 /// Drains the log/progress event channel (fd4) of a plugin, forwarding to
@@ -34,13 +39,16 @@ pub async fn drain_events<R: AsyncBufRead + Unpin>(
 ) {
     loop {
         match reader.recv().await {
-            Ok(Some(Message::Log(log))) => match log.level {
-                LogLevel::Trace => tracing::trace!(target: "plugin", plugin, "{}", log.message),
-                LogLevel::Debug => tracing::debug!(target: "plugin", plugin, "{}", log.message),
-                LogLevel::Info => tracing::info!(target: "plugin", plugin, "{}", log.message),
-                LogLevel::Warn => tracing::warn!(target: "plugin", plugin, "{}", log.message),
-                LogLevel::Error => tracing::error!(target: "plugin", plugin, "{}", log.message),
-            },
+            Ok(Some(Message::Log(log))) => {
+                let message = forward.mask.apply(&log.message);
+                match log.level {
+                    LogLevel::Trace => tracing::trace!(target: "plugin", plugin, "{message}"),
+                    LogLevel::Debug => tracing::debug!(target: "plugin", plugin, "{message}"),
+                    LogLevel::Info => tracing::info!(target: "plugin", plugin, "{message}"),
+                    LogLevel::Warn => tracing::warn!(target: "plugin", plugin, "{message}"),
+                    LogLevel::Error => tracing::error!(target: "plugin", plugin, "{message}"),
+                }
+            }
             Ok(Some(Message::Progress(p))) => {
                 tracing::debug!(
                     plugin,
@@ -71,7 +79,8 @@ pub async fn drain_events<R: AsyncBufRead + Unpin>(
             // Never stop draining over it: a stopped drain lets the pipe fill
             // and blocks the plugin forever.
             Ok(Some(other)) => {
-                tracing::warn!(plugin, "ignoring unexpected message on the event channel: {other:?}");
+                let shown = forward.mask.apply(&format!("{other:?}"));
+                tracing::warn!(plugin, "ignoring unexpected message on the event channel: {shown}");
             }
             Ok(None) => break,
             // Malformed line (bad JSON, bad UTF-8, invalid body for a known
@@ -79,7 +88,8 @@ pub async fn drain_events<R: AsyncBufRead + Unpin>(
             // draining. Unknown message types never get here — the reader
             // skips them (tolerant-reader rule).
             Err(TransportError::Serialize(e)) => {
-                tracing::warn!(plugin, "skipping malformed event line: {e}");
+                let shown = forward.mask.apply(&e.to_string());
+                tracing::warn!(plugin, "skipping malformed event line: {shown}");
             }
             // The pipe itself failed: nothing more can be read from it.
             Err(e) => {

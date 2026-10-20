@@ -74,6 +74,7 @@ pub async fn run_sink_supervisor(
     mut object_rx: UnboundedReceiver<PathBuf>,
     timeouts: Timeouts,
     mut shutdown: Shutdown,
+    mask: loadsmith_config::MaskList,
 ) -> Result<SinkOutcome, CoreError> {
     // Ledger — lives across respawns.
     let mut emitted: Vec<PathBuf> = Vec::new();
@@ -87,15 +88,16 @@ pub async fn run_sink_supervisor(
         let mut sp = spawn_plugin(&binary, None)
             .map_err(|e| CoreError::PluginIncompatible(format!("spawn sink: {e}")))?;
         let event = tokio::fs::File::from_std(sp.event_fd_take());
+        let event_mask = mask.clone();
         let event_task = tokio::spawn(async move {
             drain_events(
                 loadsmith_transport::ControlReader::new(BufReader::new(event)),
                 PluginKind::Sink.as_str(),
-                crate::events::EventForward::default(),
+                crate::events::EventForward { mask: event_mask, ..Default::default() },
             )
             .await;
         });
-        let mut peer = Peer::new(PluginKind::Sink.as_str(), sp);
+        let mut peer = Peer::new(PluginKind::Sink.as_str(), sp).with_mask(mask.clone());
 
         let setup = async {
             let info = run_handshake_and_configure(
@@ -269,7 +271,7 @@ async fn drive_instance(
                             _ => Driven::Recoverable(format!(
                                 "sink reported {:?}: {}",
                                 f.status,
-                                f.message.unwrap_or_default()
+                                peer.mask().apply(&f.message.unwrap_or_default())
                             )),
                         };
                     }

@@ -30,7 +30,7 @@ fn violation(peer: &Peer, expected: &str, got: &Message) -> Failure {
     Failure::by(
         peer.label(),
         error_codes::PROTOCOL_VIOLATION,
-        CoreError::Protocol(format!("{}: expected {expected}, got {got:?}", peer.label())),
+        CoreError::Protocol(peer.mask().apply(&format!("{}: expected {expected}, got {got:?}", peer.label()))),
     )
 }
 
@@ -117,11 +117,11 @@ pub async fn run_handshake_and_configure(
         Message::ConfigureAck(a) => {
             return Err(Failure::of(
                 label,
-                CoreError::PluginRejectedConfig(format!(
+                CoreError::PluginRejectedConfig(peer.mask().apply(&format!(
                     "{plugin_name}: {} — {}",
                     a.code.unwrap_or_default(),
                     a.message.unwrap_or_default()
-                )),
+                ))),
             ))
         }
         other => return Err(violation(peer, "configure_ack", &other)),

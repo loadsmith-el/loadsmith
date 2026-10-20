@@ -3,8 +3,8 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use loadsmith_config::parse_pipeline_yaml;
-use loadsmith_core::{discovery, run_pipeline, RunOpts};
+use loadsmith_config::{parse_pipeline_yaml, MaskList};
+use loadsmith_core::{discovery, run_pipeline, LoadOpts, Mode, RunOpts};
 
 mod download;
 mod exit;
@@ -189,10 +189,13 @@ async fn main() -> ExitCode {
     let color = !cli.no_color && std::env::var_os("NO_COLOR").is_none();
     init_tracing(&cli.log_level, color);
 
-    match run(cli, color).await {
+    // Every value the pipeline loader resolves lands here, so nothing printed
+    // below — the final error line included — can carry one.
+    let mask = MaskList::new();
+    match run(cli, color, mask.clone()).await {
         Ok(()) => ExitCode::from(Exit::Success.code()),
         Err(e) => {
-            eprintln!("error: {e:#}");
+            eprintln!("error: {}", mask.apply(&format!("{e:#}")));
             ExitCode::from(classify(&e).code())
         }
     }
@@ -206,9 +209,9 @@ fn read_pipeline(path: &std::path::Path) -> Result<String> {
     })
 }
 
-async fn run(cli: Cli, color: bool) -> Result<()> {
+async fn run(cli: Cli, color: bool, mask: MaskList) -> Result<()> {
     match cli.command {
-        Commands::Run(args) => cmd_run(args, color).await,
+        Commands::Run(args) => cmd_run(args, color, mask).await,
         Commands::Validate(args) => cmd_validate(args),
         Commands::Plugin(cmd) => match cmd.action {
             PluginAction::List(args) => cmd_plugin_list(args),
@@ -222,14 +225,14 @@ async fn run(cli: Cli, color: bool) -> Result<()> {
     }
 }
 
-async fn cmd_run(args: RunArgs, color: bool) -> Result<()> {
+async fn cmd_run(args: RunArgs, color: bool, mask: MaskList) -> Result<()> {
     let json_stdout = args.output == OutputFormat::Json;
     let summary_file = args.summary_file.clone();
     let started = std::time::SystemTime::now();
     let facts = loadsmith_core::FactsHandle::default();
     let mut ctx = run_summary::RunContext { dry_run: args.dry_run, ..Default::default() };
 
-    let result = execute_run(args, color, !json_stdout, &facts, &mut ctx).await;
+    let result = execute_run(args, color, !json_stdout, &facts, &mut ctx, &mask).await;
     let finished = std::time::SystemTime::now();
     let (summary, outcome) = match result {
         Ok(Some(summary)) => {
@@ -251,6 +254,7 @@ async fn cmd_run(args: RunArgs, color: bool) -> Result<()> {
             facts: &snapshot,
             summary: summary.as_ref(),
             error: outcome.as_ref().err(),
+            mask: &mask,
             exit_code,
             started,
             finished,
@@ -285,13 +289,22 @@ async fn execute_run(
     human_report: bool,
     facts: &loadsmith_core::FactsHandle,
     ctx: &mut run_summary::RunContext,
+    mask: &MaskList,
 ) -> Result<Option<loadsmith_core::Summary>> {
     // Handle SIGINT/SIGTERM explicitly before anything else: in the images the
     // engine is PID 1, where an unhandled SIGTERM is silently ignored.
     let shutdown = loadsmith_core::listen_for_signals()?;
-    let content = read_pipeline(&args.pipeline)?;
+    let plugin_dir = args.plugin_dir.unwrap_or_else(discovery::default_plugin_dir);
 
-    let (config, mask) = parse_pipeline_yaml(&content)?;
+    // Static check first (nothing runs on a malformed file), so even a run
+    // that fails resolving its providers reports the pipeline it was.
+    let doc = loadsmith_core::read_document(&args.pipeline)?;
+    ctx.learn(doc.config());
+    // Full resolution — providers included — before the state lock and
+    // before any data plugin starts. `--dry-run` and
+    // `--print-resolved-config` resolve too: they show what would run.
+    let load = LoadOpts { plugin_dir: plugin_dir.clone(), shutdown: shutdown.clone(), mask: mask.clone() };
+    let config = loadsmith_core::resolve_document(&doc, Mode::Full, &load).await?;
     ctx.learn(&config);
 
     if args.print_resolved_config {
@@ -300,7 +313,6 @@ async fn execute_run(
         return Ok(None);
     }
 
-    let plugin_dir = args.plugin_dir.unwrap_or_else(discovery::default_plugin_dir);
     let opts = RunOpts {
         plugin_dir,
         dry_run: args.dry_run,
@@ -310,6 +322,7 @@ async fn execute_run(
         shutdown,
         human_report,
         facts: facts.clone(),
+        mask: mask.clone(),
     };
 
     Ok(Some(run_pipeline(config, opts).await?))

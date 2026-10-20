@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use loadsmith_config::PipelineConfig;
+use loadsmith_config::{MaskList, PipelineConfig};
 use loadsmith_core::{CoreError, RunFacts, Summary, SummaryStatus};
 use serde::Serialize;
 use serde_json::Value;
@@ -95,6 +95,8 @@ pub struct RunRecord<'a> {
     pub summary: Option<&'a Summary>,
     /// The command's error, if it failed.
     pub error: Option<&'a anyhow::Error>,
+    /// Redacts resolved template values from `cause`.
+    pub mask: &'a MaskList,
     pub exit_code: u8,
     pub started: SystemTime,
     pub finished: SystemTime,
@@ -124,7 +126,8 @@ pub fn build(rec: &RunRecord<'_>) -> RunDocument {
         rec.error
             .filter(|e| e.downcast_ref::<RunOutcome>().is_none())
             .map(|e| format!("{e:#}"))
-    });
+    })
+    .map(|c| rec.mask.apply(&c));
 
     let route = rec
         .ctx
@@ -251,6 +254,7 @@ mod tests {
             facts: &RunFacts::default(),
             summary: None,
             error: Some(&err),
+            mask: &MaskList::new(),
             exit_code: 5,
             started: UNIX_EPOCH,
             finished: UNIX_EPOCH + Duration::from_millis(7),
@@ -264,5 +268,23 @@ mod tests {
         assert_eq!(v["duration_ms"], 7);
         assert_eq!(v["state"]["watermark_before"], Value::Null);
         assert_eq!(v["sink"], Value::Null);
+    }
+
+    #[test]
+    fn the_cause_never_carries_a_resolved_value() {
+        let mask = MaskList::new();
+        mask.add("hunter22");
+        let err = anyhow::Error::new(CoreError::PluginRejectedConfig("bad password hunter22".into()));
+        let doc = build(&RunRecord {
+            ctx: &RunContext::default(),
+            facts: &RunFacts::default(),
+            summary: None,
+            error: Some(&err),
+            mask: &mask,
+            exit_code: 3,
+            started: UNIX_EPOCH,
+            finished: UNIX_EPOCH,
+        });
+        assert_eq!(doc.cause.as_deref(), Some("plugin rejected its config: bad password ***"));
     }
 }

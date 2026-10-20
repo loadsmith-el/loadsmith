@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use loadsmith_arrow::ipc::IpcError;
 use loadsmith_arrow::IpcReader;
-use loadsmith_config::{validate_pipeline, ConfigError, PipelineConfig, Timeouts};
+use loadsmith_config::{validate_pipeline, ConfigError, MaskList, PipelineConfig, Timeouts};
 use loadsmith_protocol::{error_codes, FinishedStatus, Message, PluginKind};
 use loadsmith_transport::ControlReader;
 use tokio::io::BufReader;
@@ -77,6 +77,9 @@ pub struct RunOpts {
     /// Filled in as the run learns about its plugins and state, so the
     /// caller can report them even when the run fails during setup.
     pub facts: FactsHandle,
+    /// Resolved template values (from the pipeline loader) to redact from
+    /// plugin logs, plugin error texts, the abort log and the root cause.
+    pub mask: MaskList,
 }
 
 impl RunOpts {
@@ -90,6 +93,7 @@ impl RunOpts {
             shutdown: Shutdown::never(),
             human_report: true,
             facts: FactsHandle::default(),
+            mask: MaskList::new(),
         }
     }
 }
@@ -103,6 +107,13 @@ impl RunOpts {
 /// (already printed) with the root cause.
 pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summary, CoreError> {
     validate_pipeline(&config)?;
+    if let Some(parser) = &config.parser {
+        return Err(CoreError::Config(ConfigError::Validation(format!(
+            "parser: is not wired into the core yet (parser '{}'); remove the parser: block — \
+             parsing support lands in a later release",
+            parser.plugin_type
+        ))));
+    }
 
     if opts.dry_run {
         if opts.human_report {
@@ -228,11 +239,12 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     // supervisor (when a sink is attached).
     let src_event = tokio::fs::File::from_std(src_sp.event_fd_take());
     let dst_event = tokio::fs::File::from_std(dst_sp.event_fd_take());
+    let (src_mask, dst_mask) = (opts.mask.clone(), opts.mask.clone());
     let src_events = tokio::spawn(async move {
         drain_events(
             ControlReader::new(BufReader::new(src_event)),
             "source",
-            EventForward { checkpoint_tx, ..Default::default() },
+            EventForward { checkpoint_tx, mask: src_mask, ..Default::default() },
         )
         .await;
     });
@@ -240,13 +252,13 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         drain_events(
             ControlReader::new(BufReader::new(dst_event)),
             "destination",
-            EventForward { object_tx, committed_tx, ..Default::default() },
+            EventForward { object_tx, committed_tx, mask: dst_mask, ..Default::default() },
         )
         .await;
     });
 
-    let mut src = Peer::new(PluginKind::Source.as_str(), src_sp);
-    let mut dst = Peer::new(PluginKind::Destination.as_str(), dst_sp);
+    let mut src = Peer::new(PluginKind::Source.as_str(), src_sp).with_mask(opts.mask.clone());
+    let mut dst = Peer::new(PluginKind::Destination.as_str(), dst_sp).with_mask(opts.mask.clone());
 
     // Read the header of the source's Arrow IPC stream (its exact schema) on
     // a blocking thread. It only completes once the source writes it, right
@@ -313,7 +325,7 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         // ObjectReady paths forwarded by the destination's event drain.
         if let (Some(bin), Some(cfg), Some(rx)) = (sink_bin, sink_config, object_rx) {
             sink_task =
-                Some(tokio::spawn(run_sink_supervisor(bin, cfg, rx, timeouts, sink_shutdown)));
+                Some(tokio::spawn(run_sink_supervisor(bin, cfg, rx, timeouts, sink_shutdown, opts.mask.clone())));
         }
 
         // Start source (returns its schema) and destination (signals ready). The
@@ -358,7 +370,7 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     let (src_info, dst_info, source_reader) = match setup {
         Ok(infos) => infos,
         Err(failure) => {
-            tracing::error!("aborting the run: {}", failure.reason());
+            tracing::error!("aborting the run: {}", opts.mask.apply(&failure.reason()));
             sink_trigger.trigger(halt_for(&failure));
             abort_plugins(&mut src, &mut dst, &failure, grace).await;
             let _ = src_events.await;
@@ -421,7 +433,7 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
 
     match &failure {
         Some(failure) => {
-            tracing::error!("aborting the run: {}", failure.reason());
+            tracing::error!("aborting the run: {}", opts.mask.apply(&failure.reason()));
             pump_control.abort.store(true, Ordering::Relaxed);
             sink_trigger.trigger(halt_for(failure));
             abort_plugins(&mut src, &mut dst, failure, grace).await;
@@ -543,7 +555,7 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         batches_written: dst_finished.and_then(|f| f.batches_written).unwrap_or(0),
         objects_delivered,
         duration,
-        root_cause,
+        root_cause: root_cause.map(|c| opts.mask.apply(&c)),
         signal,
     };
 
@@ -578,7 +590,7 @@ async fn open_source_stream(
             res = &mut *handle => break res,
             inbound = src.next_inbound() => match src.process(inbound).await? {
                 Some(Event::Msg(Message::Finished(f))) if f.status != FinishedStatus::Success => {
-                    return Err(Failure::of("source", finished_failure("source", &f)));
+                    return Err(Failure::of("source", finished_failure("source", &f, src.mask())));
                 }
                 // EOF on fd1: the source is exiting, and its fd3 closes with it,
                 // which ends the header read below.
@@ -762,7 +774,7 @@ async fn supervise_data_phase(
                     Err(f) => failure = Some(f),
                     Ok(Some(Event::Msg(Message::Finished(f)))) => {
                         if f.status != FinishedStatus::Success {
-                            failure = Some(Failure::of("source", finished_failure("source", &f)));
+                            failure = Some(Failure::of("source", finished_failure("source", &f, src.mask())));
                         } else if pump_outcome.is_none() {
                             source_end_deadline = finish_limit.map(|d| Instant::now() + d);
                         }
@@ -788,7 +800,7 @@ async fn supervise_data_phase(
                     Err(f) => failure = Some(f),
                     Ok(Some(Event::Msg(Message::Finished(f)))) => {
                         if f.status != FinishedStatus::Success {
-                            failure = Some(Failure::of("destination", finished_failure("destination", &f)));
+                            failure = Some(Failure::of("destination", finished_failure("destination", &f, dst.mask())));
                         } else if !committed && commit.is_none() {
                             // (With the commit in flight, the destination may
                             // already have read the end marker and finished
@@ -895,7 +907,7 @@ async fn source_failure(src: &mut Peer, stream_problem: String) -> Failure {
     }
     match src.finished() {
         Some(f) if f.status != FinishedStatus::Success => {
-            Failure::of("source", finished_failure("source", f))
+            Failure::of("source", finished_failure("source", f, src.mask()))
         }
         None if src.at_eof() => {
             let status = src.exit_status_soon().await;

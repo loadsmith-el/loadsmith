@@ -3,7 +3,9 @@ pub mod error;
 pub mod events;
 pub mod fmt;
 pub mod lifecycle;
+pub mod load;
 pub mod peer;
+pub mod providers;
 pub mod pump;
 pub mod reporter;
 pub mod runner;
@@ -14,6 +16,7 @@ pub mod state;
 pub mod state_supervisor;
 pub mod summary;
 
+pub use load::{load_pipeline, read_document, resolve_document, LoadOpts, Mode};
 pub use runner::{run_pipeline, RunOpts};
 pub use summary::{FactsHandle, PluginFacts, RunFacts, Summary, SummaryStatus};
 pub use error::CoreError;

@@ -14,6 +14,7 @@
 use std::process::ExitStatus;
 use std::time::Duration;
 
+use loadsmith_config::MaskList;
 use loadsmith_protocol::{error_codes, Cancel, Finished, Message, ProtocolError, Resend};
 use loadsmith_transport::{ControlReader, ControlWriter, TransportError};
 use tokio::io::BufReader;
@@ -103,6 +104,9 @@ pub struct Peer {
     /// Replay the last control message on an inbound `resend` (the default).
     /// Off, `process` yields [`Event::ResendRequested`] instead.
     pub replay_on_resend: bool,
+    /// Resolved template values to redact from the texts this plugin sends
+    /// (`configure_ack`/`finished` messages, unexpected messages).
+    mask: MaskList,
 }
 
 impl Peer {
@@ -140,11 +144,23 @@ impl Peer {
             finished: None,
             exit: None,
             replay_on_resend: true,
+            mask: MaskList::new(),
         }
     }
 
     pub fn label(&self) -> &'static str {
         self.label
+    }
+
+    /// Redacts `mask`'s values from the texts this plugin sends.
+    pub fn with_mask(mut self, mask: MaskList) -> Self {
+        self.mask = mask;
+        self
+    }
+
+    /// The mask applied to this plugin's texts.
+    pub fn mask(&self) -> &MaskList {
+        &self.mask
     }
 
     /// The plugin's `finished`, once received.
@@ -273,7 +289,7 @@ impl Peer {
                     ));
                 }
                 Some(Event::Msg(Message::Finished(f))) => {
-                    return Err(Failure::of(self.label, finished_failure(self.label, &f)));
+                    return Err(Failure::of(self.label, finished_failure(self.label, &f, &self.mask)));
                 }
                 Some(Event::Msg(Message::Progress(_) | Message::Log(_) | Message::Pong)) => {}
                 Some(Event::ResendRequested) => {}
@@ -388,9 +404,10 @@ pub fn describe_exit(status: Option<ExitStatus>) -> String {
     }
 }
 
-/// The error for a plugin that sent a non-success `finished`.
-pub fn finished_failure(label: &str, f: &Finished) -> CoreError {
-    CoreError::PluginFailed(format!(
+/// The error for a plugin that sent a non-success `finished`; `mask` redacts
+/// resolved values from the plugin's text.
+pub fn finished_failure(label: &str, f: &Finished, mask: &MaskList) -> CoreError {
+    CoreError::PluginFailed(mask.apply(&format!(
         "{label} reported {}: {}{}",
         match f.status {
             loadsmith_protocol::FinishedStatus::Success => "success",
@@ -399,5 +416,5 @@ pub fn finished_failure(label: &str, f: &Finished) -> CoreError {
         },
         f.code.as_deref().map(|c| format!("{c}: ")).unwrap_or_default(),
         f.message.as_deref().unwrap_or("(no message)")
-    ))
+    )))
 }
