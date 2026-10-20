@@ -18,7 +18,9 @@ docker run --rm ghcr.io/loadsmith-el/loadsmith:latest --version
 ## Build from source
 
 Building needs a Rust toolchain (stable, 2021 edition — install via
-[rustup.rs](https://rustup.rs)) with `cargo` in `PATH`.
+[rustup.rs](https://rustup.rs)) with `cargo` in `PATH`. The repository pins the
+exact version CI and releases use in `rust-toolchain.toml`; rustup picks it up
+automatically.
 
 ```bash
 git clone https://github.com/loadsmith-el/loadsmith

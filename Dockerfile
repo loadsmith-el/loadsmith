@@ -6,7 +6,7 @@
 # `--plugin-dir`).
 #
 # The build compiles entirely inside Docker (never copies host-built ELF) in
-# rust:1-alpine, whose host target is *-unknown-linux-musl: the binary is fully
+# rust:<pinned>-alpine (same version as rust-toolchain.toml), whose host target is *-unknown-linux-musl: the binary is fully
 # static, so the same build runs on every runtime below. cargo-chef caches the
 # dependency compilation layer.
 #
@@ -21,7 +21,7 @@
 # native binary via `ci/runtime.Dockerfile` — keep its stages in sync with the
 # runtime stages below.
 
-FROM rust:1-alpine AS chef
+FROM rust:1.99.0-alpine AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 

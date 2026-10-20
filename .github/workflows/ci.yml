@@ -1,0 +1,43 @@
+name: CI
+
+# The gate every change to main must pass: build, test and lint the whole
+# workspace with the pinned toolchain (rust-toolchain.toml) and the committed
+# Cargo.lock (--locked). Release builds run the same tests (release.yml).
+#
+# `cargo fmt --check` is deliberately not part of the gate yet: the tree has
+# never been rustfmt-formatted, and reformatting it is a separate, mechanical
+# change. Add it here in the same commit that runs `cargo fmt`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component clippy
+          rustc --version && cargo clippy --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

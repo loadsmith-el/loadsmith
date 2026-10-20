@@ -230,10 +230,14 @@ use another plugin index. See the
 
 ## Testing
 
-The fastest unit feedback is the workspace test suite:
+The fastest unit feedback is the workspace test suite. CI
+([`ci.yml`](.github/workflows/ci.yml)) gates every push and PR to `main` on the
+same commands, with the toolchain pinned in `rust-toolchain.toml`:
 
 ```bash
-cargo test --workspace
+cargo build --locked
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 But the **best way to validate a real pipeline end-to-end** is

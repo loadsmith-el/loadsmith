@@ -13,7 +13,8 @@ at once.
 
 [`release.yml`](https://github.com/loadsmith-el/loadsmith/blob/main/.github/workflows/release.yml)
 compiles `loadsmith` natively on one runner per architecture (no QEMU), inside
-`rust:1-alpine`. Its host target is `*-unknown-linux-musl`, so a plain
+`rust:<version>-alpine`, pinned to the same Rust version as
+`rust-toolchain.toml` (and running the workspace tests in that image first). Its host target is `*-unknown-linux-musl`, so a plain
 `cargo build --release` produces a fully static binary: no libc, no dynamic
 loader, nothing to match on the target system. The four image flavors wrap that
 same binary, and the canonical plugins are built the same way.

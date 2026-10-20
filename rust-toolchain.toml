@@ -1,0 +1,10 @@
+# The Rust toolchain CI and releases build with. Keep in sync with the
+# `rust:<version>-alpine` image pinned in .github/workflows/release.yml and the
+# Dockerfile. Bump deliberately (one commit: this file + those two), never
+# implicitly — a new clippy can add lints that fail `-D warnings`.
+#
+# No `components` here on purpose: inside the pinned rust image (run as a
+# non-root user in release.yml) rustup must not need to download anything.
+# CI adds clippy explicitly.
+[toolchain]
+channel = "1.99.0"

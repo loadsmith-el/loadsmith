@@ -29,6 +29,8 @@ env:
   IMAGE: ghcr.io/loadsmith-el/loadsmith
   FLAVORS: static static-debug slim bundled
   PLUGIN_INDEX: https://raw.githubusercontent.com/loadsmith-el/loadsmith-canonical-plugins/main/index.json
+  # Same Rust version as rust-toolchain.toml (and the Dockerfile). Bump together.
+  RUST_IMAGE: rust:1.99.0-alpine
 
 jobs:
   meta:
@@ -39,7 +41,7 @@ jobs:
       sha_short: ${{ steps.m.outputs.sha_short }}
       plugins: ${{ steps.p.outputs.plugins }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: m
         run: |
           tag="${GITHUB_REF_NAME}"          # vX.Y.Z or vX.Y.Z-<pre>
@@ -78,17 +80,24 @@ jobs:
           - { runner: ubuntu-24.04-arm, arch: arm64 }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      # Compile inside rust:1-alpine (host target *-unknown-linux-musl): the
-      # binary is fully static, so it runs on every image flavor, on any Linux
-      # host, and in the lab's `--loadsmith <binary>` wrap — no glibc floor.
-      # Native arch per runner — no QEMU.
+      # Compile inside the pinned rust image (RUST_IMAGE; host target
+      # *-unknown-linux-musl): the binary is fully static, so it runs on every
+      # image flavor, on any Linux host, and in the lab's `--loadsmith <binary>`
+      # wrap — no glibc floor. Native arch per runner — no QEMU.
+      # The workspace tests run first, in the same image on the same arch as
+      # the binary we ship: nothing is published from a tree that fails them.
+      - name: Test (musl, native ${{ matrix.arch }})
+        run: |
+          docker run --rm -u "$(id -u):$(id -g)" -e CARGO_HOME=/tmp/cargo \
+            -v "$PWD":/src -w /src "$RUST_IMAGE" \
+            cargo test --workspace --locked
       - name: Build core (static musl, native ${{ matrix.arch }})
         run: |
           docker run --rm -u "$(id -u):$(id -g)" -e CARGO_HOME=/tmp/cargo \
-            -v "$PWD":/src -w /src rust:1-alpine \
-            cargo build --release --bin loadsmith
+            -v "$PWD":/src -w /src "$RUST_IMAGE" \
+            cargo build --release --locked --bin loadsmith
       - name: Check the binary is fully static
         run: |
           file target/release/loadsmith
@@ -101,7 +110,7 @@ jobs:
           tarball="loadsmith-${{ needs.meta.outputs.version }}-linux-${{ matrix.arch }}.tar.gz"
           tar -czf "$tarball" -C target/release loadsmith
           sha256sum "$tarball" > "${tarball}.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.arch }}
           path: |
@@ -121,9 +130,9 @@ jobs:
           done
           ls -la ctx/plugins
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -145,7 +154,7 @@ jobs:
             mkdir -p "/tmp/digests/$f"
             touch "/tmp/digests/$f/${digest#sha256:}"   # artifact filenames can't contain ':'
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: digests-${{ matrix.arch }}
           path: /tmp/digests/
@@ -158,20 +167,20 @@ jobs:
       contents: write          # create the GitHub Release
       packages: write          # push the multi-arch manifests
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: dist-*
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: /tmp/digests
           pattern: digests-*
           merge-multiple: true
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
