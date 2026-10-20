@@ -421,4 +421,6 @@ Cancelled:
 
 Unknown fields in any message must be ignored. New optional fields may be added within the same protocol version.
 
-Adding new mandatory message types, or changing the semantics of existing messages, requires incrementing the protocol version.
+Readers are **tolerant**: a well-formed message whose `type` is unknown is logged and skipped on every channel. A malformed line (not JSON, not UTF-8, missing `type`, or a known `type` with an invalid body) is fatal on the control channel (fd0/fd1) and logged and skipped on the event channel (fd4), which must never stop being drained. See `docs/src/protocol/reference.md` ("Compatibility rule: tolerant reader").
+
+New informational message types (ones a receiver may safely ignore) may be added within the same protocol version. Adding new mandatory message types, or changing the semantics of existing messages, requires incrementing the protocol version.

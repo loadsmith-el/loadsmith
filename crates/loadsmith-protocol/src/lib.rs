@@ -56,6 +56,14 @@ pub enum Message {
     Cancel(Cancel),
     Error(ProtocolError),
     Finished(Finished),
+
+    // Forward compatibility
+    /// A message whose `type` this build does not know (sent by a newer peer).
+    /// Only produced by deserialization: it carries nothing and cannot be
+    /// serialized. `ControlReader` never returns it — under the tolerant-reader
+    /// rule (see the protocol reference) unknown types are logged and skipped.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 // ── Handshake ─────────────────────────────────────────────────────────────────
@@ -364,6 +372,25 @@ mod tests {
     fn roundtrip(msg: &Message) -> Message {
         let json = serde_json::to_string(msg).expect("serialize");
         serde_json::from_str(&json).expect("deserialize")
+    }
+
+    #[test]
+    fn unknown_type_deserializes_to_unknown() {
+        let msg: Message =
+            serde_json::from_str(r#"{"type":"from_the_future","x":1}"#).expect("deserialize");
+        assert!(matches!(msg, Message::Unknown));
+    }
+
+    #[test]
+    fn unknown_cannot_be_serialized() {
+        assert!(serde_json::to_string(&Message::Unknown).is_err());
+    }
+
+    #[test]
+    fn known_type_with_bad_fields_is_still_an_error() {
+        // `other` only catches unknown tags; a known tag with a malformed body
+        // stays a protocol violation.
+        assert!(serde_json::from_str::<Message>(r#"{"type":"checkpoint"}"#).is_err());
     }
 
     #[test]

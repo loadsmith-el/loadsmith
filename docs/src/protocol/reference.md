@@ -40,6 +40,38 @@ handshake phase and governs the set of valid message types and their fields.
 Future versions may add new message types or new optional fields to existing
 messages, always in a backward-compatible manner.
 
+## Compatibility rule: tolerant reader
+
+Both sides — the core and every plugin — read the JSONL channels (fd0, fd1,
+fd4) as **tolerant readers**. This is what makes "add a message type or an
+optional field" a compatible change within protocol version 1:
+
+| What arrives | Control channel (fd0 / fd1) | Event channel (fd4) |
+|---|---|---|
+| Blank line | skipped | skipped |
+| Unknown **field** on a known message | ignored | ignored |
+| Well-formed JSON object with an unknown **`type`** | logged (`warn`) and skipped | logged (`warn`) and skipped |
+| A known message that is out of place for this channel/phase | protocol error where the lifecycle expects a specific reply; otherwise logged and ignored | logged (`warn`) and ignored |
+| Malformed line: not JSON, not UTF-8, no `type`, or a known `type` with an invalid body | **fatal** — protocol error, the run fails | logged (`warn`) and skipped; draining continues |
+
+Why the two channels differ on malformed input: the control channel carries the
+lifecycle, so a garbled line there means the peer is broken and continuing would
+only produce a confusing failure later. The event channel carries logs and
+progress; it **must never stop being drained** — a core that stopped reading
+fd4 would let the pipe fill and block the plugin forever — so a bad event line
+costs only that line.
+
+Consequences for evolving the protocol within version 1:
+
+- New **optional** fields and new **informational** message types (ones a peer
+  may safely ignore) are compatible additions.
+- A new message type the receiver **must** act on, a new required field, or a
+  change to the meaning of an existing message requires a new protocol version
+  (negotiated in the handshake).
+
+`ControlReader` in `loadsmith-transport` implements this rule, so plugins built
+on the SDK get it for free.
+
 ## Full lifecycle sequence
 
 The complete sequence for a source + destination run:

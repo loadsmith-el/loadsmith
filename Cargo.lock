@@ -1243,9 +1243,11 @@ dependencies = [
  "loadsmith-arrow",
  "loadsmith-protocol",
  "rustix 0.38.44",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

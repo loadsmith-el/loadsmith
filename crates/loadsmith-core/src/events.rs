@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use loadsmith_protocol::{LogLevel, Message};
-use loadsmith_transport::ControlReader;
+use loadsmith_transport::{ControlReader, TransportError};
 use tokio::io::AsyncBufRead;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -67,8 +67,66 @@ pub async fn drain_events<R: AsyncBufRead + Unpin>(
                     let _ = tx.send(c.batch_seq);
                 }
             }
-            Ok(Some(_)) | Ok(None) => break,
-            Err(_) => break,
+            // A message type that is valid elsewhere but meaningless on fd4.
+            // Never stop draining over it: a stopped drain lets the pipe fill
+            // and blocks the plugin forever.
+            Ok(Some(other)) => {
+                tracing::warn!(plugin, "ignoring unexpected message on the event channel: {other:?}");
+            }
+            Ok(None) => break,
+            // Malformed line (bad JSON, bad UTF-8, invalid body for a known
+            // type): the reader has already consumed it, so warn and keep
+            // draining. Unknown message types never get here — the reader
+            // skips them (tolerant-reader rule).
+            Err(TransportError::Serialize(e)) => {
+                tracing::warn!(plugin, "skipping malformed event line: {e}");
+            }
+            // The pipe itself failed: nothing more can be read from it.
+            Err(e) => {
+                tracing::warn!(plugin, "event channel read failed, stopping drain: {e}");
+                break;
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::BufReader;
+
+    /// Regression: the drain used to `break` on the first unknown or malformed
+    /// line, after which fd4 filled up and the plugin blocked forever.
+    #[tokio::test]
+    async fn drain_survives_unknown_and_malformed_lines() {
+        let mut input = String::new();
+        input.push_str("{\"type\":\"from_the_future\",\"x\":1}\n");
+        input.push_str("this is not json\n");
+        input.push_str("{\"type\":\"checkpoint\"}\n"); // known type, invalid body
+        input.push_str("{\"type\":\"ping\"}\n"); // valid, but not an fd4 event
+        for i in 0..1000 {
+            input.push_str(&format!("{{\"type\":\"object_ready\",\"path\":\"/tmp/o{i}\"}}\n"));
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let forward = EventForward { object_tx: Some(tx), ..Default::default() };
+        drain_events(ControlReader::new(BufReader::new(input.as_bytes())), "test", forward).await;
+
+        let mut got = 0;
+        while let Ok(p) = rx.try_recv() {
+            assert_eq!(p, PathBuf::from(format!("/tmp/o{got}")));
+            got += 1;
+        }
+        assert_eq!(got, 1000);
+    }
+
+    #[tokio::test]
+    async fn drain_survives_invalid_utf8() {
+        let mut input: Vec<u8> = b"{\"type\":\"log\",\"level\":\"info\",\"message\":\"".to_vec();
+        input.extend_from_slice(&[0xff, 0xfe]);
+        input.extend_from_slice(b"\"}\n{\"type\":\"object_ready\",\"path\":\"/tmp/after\"}\n");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let forward = EventForward { object_tx: Some(tx), ..Default::default() };
+        drain_events(ControlReader::new(BufReader::new(&input[..])), "test", forward).await;
+        assert_eq!(rx.try_recv().unwrap(), PathBuf::from("/tmp/after"));
     }
 }

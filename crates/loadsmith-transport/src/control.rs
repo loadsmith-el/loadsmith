@@ -30,29 +30,58 @@ impl<W: AsyncWrite + Unpin> ControlWriter<W> {
 
 pub struct ControlReader<R> {
     inner: R,
-    buf: String,
+    buf: Vec<u8>,
 }
 
 impl<R: AsyncBufRead + Unpin> ControlReader<R> {
     pub fn new(reader: R) -> Self {
-        Self { inner: reader, buf: String::new() }
+        Self { inner: reader, buf: Vec::new() }
     }
 
-    /// Returns `Ok(None)` on clean EOF.
+    /// Reads the next message. Returns `Ok(None)` on clean EOF.
+    ///
+    /// Implements the protocol's **tolerant-reader** rule:
+    /// - blank lines are skipped;
+    /// - a well-formed JSON object whose `type` this build does not know is
+    ///   logged (`warn`) and skipped — a newer peer may send message types an
+    ///   older one has never heard of;
+    /// - a line that is not valid JSON (or not valid UTF-8), lacks a `type`, or
+    ///   carries a known `type` with an invalid body is returned as
+    ///   [`TransportError::Serialize`]. The line is consumed either way, so a
+    ///   caller that chooses to tolerate the error (the core's fd4 event drain
+    ///   does) can simply call `recv` again.
     pub async fn recv(&mut self) -> Result<Option<Message>, TransportError> {
-        self.buf.clear();
-        let n = self.inner.read_line(&mut self.buf).await?;
-        if n == 0 {
-            return Ok(None);
+        loop {
+            self.buf.clear();
+            let n = self.inner.read_until(b'\n', &mut self.buf).await?;
+            if n == 0 {
+                return Ok(None);
+            }
+            let line = self.buf.trim_ascii();
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_slice::<Message>(line)? {
+                Message::Unknown => {
+                    tracing::warn!(
+                        message_type = unknown_type_name(line).as_deref().unwrap_or("?"),
+                        "skipping protocol message of unknown type (sent by a newer peer?)"
+                    );
+                }
+                msg => return Ok(Some(msg)),
+            }
         }
-        let trimmed = self.buf.trim();
-        if trimmed.is_empty() {
-            // Skip blank lines, try again
-            return Box::pin(self.recv()).await;
-        }
-        let msg = serde_json::from_str(trimmed)?;
-        Ok(Some(msg))
     }
+}
+
+/// The `type` of an already-parsed line, for the unknown-type warning.
+fn unknown_type_name(line: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Tag {
+        #[serde(rename = "type")]
+        ty: String,
+    }
+    serde_json::from_slice::<Tag>(line).ok().map(|t| t.ty)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -111,5 +140,46 @@ mod tests {
         let mut reader = ControlReader::new(BufReader::new(server_read));
         assert!(reader.recv().await.unwrap().is_some());
         assert!(reader.recv().await.unwrap().is_none());
+    }
+
+    fn reader_over(bytes: &'static [u8]) -> ControlReader<BufReader<&'static [u8]>> {
+        ControlReader::new(BufReader::new(bytes))
+    }
+
+    #[tokio::test]
+    async fn unknown_message_type_is_skipped() {
+        let mut reader = reader_over(
+            b"{\"type\":\"from_the_future\",\"payload\":{\"a\":1}}\n\n{\"type\":\"ping\"}\n",
+        );
+        assert!(matches!(reader.recv().await.unwrap().unwrap(), Message::Ping));
+        assert!(reader.recv().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn unknown_fields_on_known_type_are_ignored() {
+        let mut reader = reader_over(b"{\"type\":\"cancel\",\"reason\":\"x\",\"new_field\":true}\n");
+        assert!(matches!(reader.recv().await.unwrap().unwrap(), Message::Cancel(_)));
+    }
+
+    #[tokio::test]
+    async fn malformed_line_errors_but_is_consumed() {
+        let mut reader = reader_over(b"not json\n{\"type\":\"ping\"}\n");
+        assert!(matches!(reader.recv().await, Err(TransportError::Serialize(_))));
+        // The bad line was consumed: the next call yields the next message.
+        assert!(matches!(reader.recv().await.unwrap().unwrap(), Message::Ping));
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_is_a_parse_error_not_io() {
+        let mut reader = reader_over(b"{\"type\":\"log\",\"level\":\"info\",\"message\":\"\xff\"}\n");
+        assert!(matches!(reader.recv().await, Err(TransportError::Serialize(_))));
+        assert!(reader.recv().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_type_and_bad_known_body_are_errors() {
+        let mut reader = reader_over(b"{\"no_type\":1}\n{\"type\":\"checkpoint\"}\n");
+        assert!(matches!(reader.recv().await, Err(TransportError::Serialize(_))));
+        assert!(matches!(reader.recv().await, Err(TransportError::Serialize(_))));
     }
 }
