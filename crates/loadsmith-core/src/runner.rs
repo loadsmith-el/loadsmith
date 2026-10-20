@@ -651,7 +651,10 @@ async fn supervise_data_phase(
                     Ok(Some(Event::Msg(Message::Finished(f)))) => {
                         if f.status != FinishedStatus::Success {
                             failure = Some(Failure::of("destination", finished_failure("destination", &f)));
-                        } else if !committed {
+                        } else if !committed && commit.is_none() {
+                            // (With the commit in flight, the destination may
+                            // already have read the end marker and finished
+                            // before the commit task reports back.)
                             failure = Some(Failure::by(
                                 "destination",
                                 error_codes::PROTOCOL_VIOLATION,
