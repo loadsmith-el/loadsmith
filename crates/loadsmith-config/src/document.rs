@@ -7,7 +7,7 @@
 //!    validation on the *unresolved* tree, the syntax of every template, and
 //!    the `secret()` rules: each names a declared provider instance and none
 //!    sits in a block that must resolve without providers (`pipeline:`,
-//!    `state:`, `providers:`). This is all `loadsmith validate` checks by
+//!    `state:`, `providers:`, `telemetry:`). This is all `loadsmith validate` checks by
 //!    default.
 //! 2. [`Document::resolve_subtrees`] — `env()`/`file()` in chosen top-level
 //!    blocks only (`state show`/`state rm` need just `pipeline:` + `state:`;
@@ -27,8 +27,9 @@ use crate::validate::validate_pipeline;
 
 /// Top-level blocks where `secret()` is not allowed: they are resolved
 /// without providers (`pipeline:` and `state:` by the state commands,
-/// `providers:` before the providers start).
-pub const SECRET_FREE_BLOCKS: &[&str] = &["pipeline", "state", "providers"];
+/// `providers:` before the providers start, `telemetry:` so that the
+/// providers run inside the traced run).
+pub const SECRET_FREE_BLOCKS: &[&str] = &["pipeline", "state", "providers", "telemetry"];
 
 /// A statically checked pipeline file.
 #[derive(Debug, Clone)]
@@ -68,8 +69,8 @@ impl Document {
             let block = at.split(['.', '[']).next().unwrap_or_default();
             if SECRET_FREE_BLOCKS.contains(&block) {
                 return Err(ConfigError::Validation(format!(
-                    "{at}: {call} is not allowed in the {block}: block (pipeline:, state: and \
-                     providers: resolve without providers; use env() or file() there)"
+                    "{at}: {call} is not allowed in the {block}: block (pipeline:, state:, providers: and \
+                     telemetry: resolve without providers; use env() or file() there)"
                 )));
             }
             if !config.providers.contains_key(&call.instance) {
@@ -235,6 +236,10 @@ destination:
                 format!("{WITH_PROVIDERS}state:\n  backend: local\n  path: \"{{{{ secret('creds', 'p') }}}}\"\n"),
             ),
             ("providers", WITH_PROVIDERS.replace("/secrets", "\"{{ secret('sm', 'dir') }}\"")),
+            (
+                "telemetry",
+                format!("{WITH_PROVIDERS}telemetry:\n  headers: {{ authorization: \"{{{{ secret('creds', 't') }}}}\" }}\n"),
+            ),
         ] {
             let err = Document::parse(&yaml).expect_err(block).to_string();
             assert!(err.contains(&format!("the {block}: block")), "{block}: {err}");

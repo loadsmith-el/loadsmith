@@ -32,6 +32,97 @@ pub struct PipelineConfig {
     pub sink: Option<PluginRef>,
     #[serde(default)]
     pub state: Option<StateConfig>,
+    /// OpenTelemetry export (traces, metrics, logs over OTLP). Every field is
+    /// optional; CLI flags override it and it overrides the standard `OTEL_*`
+    /// variables. Resolved before the providers start, so it may use
+    /// `env()`/`file()` but never `secret()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<TelemetryConfig>,
+}
+
+/// The `telemetry:` block. Absent fields fall back to the standard `OTEL_*`
+/// environment variables, then to the defaults; see
+/// `docs/src/architecture/telemetry.md`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TelemetryConfig {
+    /// Default: on exactly when an endpoint is resolved. `false` always wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// The OTLP endpoint (base URL; `/v1/<signal>` is appended for
+    /// `http-protobuf`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<OtlpProtocol>,
+    /// Extra request headers (gRPC metadata), merged over
+    /// `OTEL_EXPORTER_OTLP_HEADERS`. Their values are always masked.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// Per-export timeout. Default 10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
+    /// The signals to export. Default: all three.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signals: Option<Vec<TelemetrySignal>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<SamplingConfig>,
+    /// How often metrics are exported. Default 15; a final export always
+    /// happens at the end of the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_interval_seconds: Option<u64>,
+    /// Minimum level exported as OTLP logs (stderr is unaffected). Default
+    /// `info`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_level: Option<loadsmith_protocol::LogLevel>,
+    /// Resource attributes, merged over `OTEL_RESOURCE_ATTRIBUTES` /
+    /// `OTEL_SERVICE_NAME`. Scalar values only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resource: BTreeMap<String, serde_yaml::Value>,
+}
+
+/// OTLP transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OtlpProtocol {
+    #[serde(rename = "grpc")]
+    Grpc,
+    #[serde(rename = "http-protobuf", alias = "http/protobuf")]
+    HttpProtobuf,
+}
+
+impl OtlpProtocol {
+    /// The spelling in the pipeline file and on the command line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OtlpProtocol::Grpc => "grpc",
+            OtlpProtocol::HttpProtobuf => "http-protobuf",
+        }
+    }
+
+    /// Parses the pipeline-file spelling, and `OTEL_EXPORTER_OTLP_PROTOCOL`'s
+    /// (`http/protobuf`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "grpc" => Some(OtlpProtocol::Grpc),
+            "http-protobuf" | "http/protobuf" => Some(OtlpProtocol::HttpProtobuf),
+            _ => None,
+        }
+    }
+}
+
+/// One telemetry signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetrySignal {
+    Traces,
+    Metrics,
+    Logs,
+}
+
+/// `telemetry.sampling`: a parent-based trace-id ratio sampler.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SamplingConfig {
+    /// Fraction of runs traced, `0.0`–`1.0`.
+    pub ratio: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

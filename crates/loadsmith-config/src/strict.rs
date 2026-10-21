@@ -88,6 +88,21 @@ state: { backend: local, path: /tmp/s, on_schema_chnage: continue }
     }
 
     #[test]
+    fn the_telemetry_block_is_checked_like_the_rest() {
+        let yaml = "pipeline: { name: p }\nsource: { type: a }\ndestination: { type: b }\n\
+                    telemetry:\n  endpoint: http://c:4318\n  protocol: grpc\n  headers: { authorization: x }\n  \
+                    timeout_seconds: 3\n  signals: [traces, logs]\n  sampling: { ratio: 0.5, rate: 1 }\n  \
+                    log_level: warn\n  resource: { deployment.environment.name: prod, n: 1 }\n  endpont: typo\n";
+        let (config, unknown) = deserialize_envelope(raw(yaml), UnknownKeys::Warn).unwrap();
+        assert_eq!(unknown, ["telemetry.sampling.rate", "telemetry.endpont"]);
+        let t = config.telemetry.unwrap();
+        assert_eq!(t.protocol, Some(crate::OtlpProtocol::Grpc));
+        assert_eq!(t.signals.unwrap(), [crate::TelemetrySignal::Traces, crate::TelemetrySignal::Logs]);
+        assert_eq!(t.log_level, Some(loadsmith_protocol::LogLevel::Warn));
+        assert!(deserialize_envelope(raw(yaml), UnknownKeys::Error).is_err());
+    }
+
+    #[test]
     fn plugin_config_contents_are_not_checked_here() {
         let yaml = "pipeline: { name: p }\nsource: { type: a, config: { whatever: { deep: 1 } } }\n\
                     destination: { type: b }\n";
