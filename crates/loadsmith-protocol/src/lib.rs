@@ -7,6 +7,7 @@ pub mod telemetry;
 pub use telemetry::{
     Attributes, HistogramValue, MetricKind, MetricPoint, MetricsBatch, SpanData, SpanEvent, SpanKind, SpanLink,
     SpanStatus, StatusCode, TelemetryContext, Temporality, TraceParent, TELEMETRY_VERSION,
+    encode_hex, decode_hex,
 };
 
 // ── Top-level message enum ────────────────────────────────────────────────────

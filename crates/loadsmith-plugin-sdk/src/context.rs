@@ -1,10 +1,28 @@
-use loadsmith_protocol::{Checkpoint, Committed, LogLevel, Message, ObjectParsed, ObjectReady, Progress};
+use loadsmith_protocol::{Checkpoint, Committed, LogEvent, LogLevel, Message, ObjectParsed, ObjectReady, Progress};
 use loadsmith_transport::EventWriter;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+use crate::telemetry;
+
 /// Helper passed to plugins for sending logs and progress to fd4.
+///
+/// It is also the way out for the plugin's telemetry: every send first
+/// writes the spans and logs recorded since the previous one (see
+/// [`telemetry`](crate::telemetry)), and the aggregated metrics when their
+/// flush interval has passed.
 pub struct EventSender<W> {
     writer: EventWriter<W>,
+}
+
+impl EventSender<tokio::fs::File> {
+    /// The event channel of a plugin process: fd4, which the core wires up.
+    pub(crate) fn fd4() -> Self {
+        use std::os::unix::io::FromRawFd;
+        // SAFETY: the core always opens fd4 for a plugin; the SDK takes it
+        // exactly once per process.
+        let event_fd = unsafe { std::fs::File::from_raw_fd(4) };
+        Self::new(tokio::fs::File::from_std(event_fd))
+    }
 }
 
 impl<W: AsyncWrite + Unpin> EventSender<W> {
@@ -12,10 +30,46 @@ impl<W: AsyncWrite + Unpin> EventSender<W> {
         Self { writer: EventWriter::new(writer) }
     }
 
+    /// Writes one message after the telemetry recorded so far. Errors writing
+    /// to the event channel are non-fatal — the pipeline continues; the
+    /// observation is just lost.
+    async fn send(&mut self, msg: &Message) {
+        self.write_telemetry(false).await;
+        let _ = self.writer.send(msg).await;
+    }
+
+    async fn write_telemetry(&mut self, force_metrics: bool) {
+        for msg in telemetry::GLOBAL.take_pending() {
+            let _ = self.writer.send(&msg).await;
+        }
+        if let Some(metrics) = telemetry::GLOBAL.take_metrics(force_metrics) {
+            let _ = self.writer.send(&metrics).await;
+        }
+    }
+
+    /// Writes the spans and logs recorded so far, and the metrics if their
+    /// flush interval has passed. The SDK calls it between units of work; a
+    /// plugin with a long quiet phase may call it too.
+    pub async fn flush_telemetry(&mut self) {
+        self.write_telemetry(false).await;
+    }
+
+    /// The last write of the process: everything recorded, metrics
+    /// included, then a flush.
+    pub(crate) async fn close(&mut self) {
+        self.write_telemetry(true).await;
+    }
+
+    /// A log line. With telemetry on it carries the trace context of the
+    /// current `tracing` span.
     pub async fn log(&mut self, level: LogLevel, message: impl Into<String>) {
-        // Errors writing to the event channel are non-fatal — the pipeline
-        // continues; the observation is just lost.
-        let _ = self.writer.log(level, message).await;
+        let mut log = LogEvent::new(level, message);
+        if let Some((trace_id, span_id)) = telemetry::current_context() {
+            log.trace_id = Some(trace_id);
+            log.span_id = Some(span_id);
+            log.time_unix_nano = Some(telemetry::unix_nanos());
+        }
+        self.send(&Message::Log(log)).await;
     }
 
     pub async fn info(&mut self, message: impl Into<String>) {
@@ -37,7 +91,7 @@ impl<W: AsyncWrite + Unpin> EventSender<W> {
             rows_written: None,
             batches_written: None,
         });
-        let _ = self.writer.send(&msg).await;
+        self.send(&msg).await;
     }
 
     pub async fn progress_destination(&mut self, rows_written: u64, batches_written: u64) {
@@ -47,7 +101,7 @@ impl<W: AsyncWrite + Unpin> EventSender<W> {
             rows_written: Some(rows_written),
             batches_written: Some(batches_written),
         });
-        let _ = self.writer.send(&msg).await;
+        self.send(&msg).await;
     }
 
     /// Announce that a staged file is finalized and ready for delivery. Sent on
@@ -55,7 +109,7 @@ impl<W: AsyncWrite + Unpin> EventSender<W> {
     /// event drain forwards it to the sink supervisor.
     pub async fn object_ready(&mut self, path: impl Into<String>) {
         let msg = Message::ObjectReady(ObjectReady { path: path.into() });
-        let _ = self.writer.send(&msg).await;
+        self.send(&msg).await;
     }
 
     /// Parser → core: a file was fully parsed into `batches` Arrow batches
@@ -63,7 +117,7 @@ impl<W: AsyncWrite + Unpin> EventSender<W> {
     /// batch (`0` when it produced none). Informational.
     pub async fn object_parsed(&mut self, path: impl Into<String>, rows: u64, batches: u64, last_batch_seq: u64) {
         let msg = Message::ObjectParsed(ObjectParsed { path: path.into(), rows, batches, last_batch_seq });
-        let _ = self.writer.send(&msg).await;
+        self.send(&msg).await;
     }
 
     /// Source → core: the high watermark of the cursor column produced through
@@ -71,13 +125,13 @@ impl<W: AsyncWrite + Unpin> EventSender<W> {
     /// forwards it to the state supervisor.
     pub async fn checkpoint(&mut self, batch_seq: u64, cursor_value: serde_json::Value) {
         let msg = Message::Checkpoint(Checkpoint { cursor_value, batch_seq });
-        let _ = self.writer.send(&msg).await;
+        self.send(&msg).await;
     }
 
     /// Destination → core: everything through `batch_seq` is durably committed.
     pub async fn committed(&mut self, batch_seq: u64) {
         let msg = Message::Committed(Committed { batch_seq });
-        let _ = self.writer.send(&msg).await;
+        self.send(&msg).await;
     }
 }
 

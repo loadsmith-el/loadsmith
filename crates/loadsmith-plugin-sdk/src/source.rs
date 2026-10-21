@@ -8,6 +8,10 @@ use loadsmith_protocol::{Finished, Message, PluginKind};
 use tokio::io::AsyncWrite;
 
 use crate::context::EventSender;
+use crate::telemetry::{self, phase_span};
+use std::time::Instant;
+use tracing::Instrument;
+
 use crate::config::PluginConfig;
 use crate::control::{answer_configure, conclude, handshake, recv_configure, recv_start, Control, Flow};
 
@@ -64,22 +68,23 @@ pub trait SourcePlugin: Send {
 /// Exit code: `0` after success or a `cancel`, `1` after a failure, an
 /// `error` from the core, or a lost core.
 pub async fn run_source<P: SourcePlugin + 'static>(mut plugin: P) -> ! {
+    telemetry::install();
+    // fd0 = stdin (control in), fd1 = stdout (control out), fd4 = event out
     let mut ctl = Control::stdio();
+    let mut events = EventSender::fd4();
     let mut started = false;
-    let result = drive_source(&mut plugin, &mut ctl, &mut started).await;
+    let result = drive_source(&mut plugin, &mut ctl, &mut events, &mut started).await;
     let code = conclude(&mut ctl, result, started, || plugin.cancel()).await;
+    events.close().await;
     std::process::exit(code);
 }
 
-async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin>(
+async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Unpin>(
     plugin: &mut P,
     ctl: &mut Control<W>,
+    events: &mut EventSender<E>,
     started: &mut bool,
 ) -> Result<(), Flow> {
-    // fd0 = stdin (control in), fd1 = stdout (control out), fd4 = event out
-    let event_fd = unsafe { std::fs::File::from_raw_fd(4) };
-    let mut events = EventSender::new(tokio::fs::File::from_std(event_fd));
-
     // ── Handshake + capabilities ─────────────────────────────────────────
     handshake(
         ctl,
@@ -92,16 +97,23 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin>(
 
     // ── Configure ────────────────────────────────────────────────────────
     let (config, warnings) = recv_configure(ctl).await?;
-    let outcome = plugin.configure(config).await;
-    answer_configure(ctl, &mut events, &warnings, outcome).await?;
+    let span = phase_span!("configure");
+    let outcome = plugin.configure(config).instrument(span.clone()).await;
+    telemetry::outcome(&span, &outcome);
+    drop(span);
+    answer_configure(ctl, events, &warnings, outcome).await?;
 
     // ── Start ─────────────────────────────────────────────────────────────
     let params = recv_start(ctl).await?;
     *started = true;
-    plugin.resume_from(params.resume.map(|r| r.cursor_value)).await;
+    let span = phase_span!("start");
+    plugin.resume_from(params.resume.map(|r| r.cursor_value)).instrument(span.clone()).await;
 
     // ── Schema ────────────────────────────────────────────────────────────
-    let schema = plugin.schema().await.map_err(|e| Flow::fatal("SCHEMA_FAILED", e))?;
+    let schema = plugin.schema().instrument(span.clone()).await;
+    telemetry::outcome(&span, &schema);
+    drop(span);
+    let schema = schema.map_err(|e| Flow::fatal("SCHEMA_FAILED", e))?;
     // The exact protocol form of the Arrow schema (types, units, time zones,
     // precision, nullability, children). The IPC header written next carries
     // the same schema and is what the core treats as authoritative.
@@ -122,8 +134,10 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin>(
         // sources buffer their whole result before the first batch). Only a
         // stopping message drops the in-flight `next_batch` future; `ping` and
         // `resend` are handled without touching it.
+        let span = telemetry::batch_span(batches_total + 1, "read");
+        let began = Instant::now();
         let next = {
-            let batch = plugin.next_batch();
+            let batch = plugin.next_batch().instrument(span.clone());
             tokio::pin!(batch);
             loop {
                 tokio::select! {
@@ -143,6 +157,9 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin>(
         };
         match next? {
             Ok(Some(batch)) => {
+                let bytes = batch.get_array_memory_size() as u64;
+                telemetry::batch_done(&span, "read", batch.num_rows() as u64, bytes, began.elapsed());
+                drop(span);
                 rows_total += batch.num_rows() as u64;
                 batches_total += 1;
                 ipc_writer
@@ -158,6 +175,8 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin>(
             }
             Ok(None) => break,
             Err(e) => {
+                telemetry::fail(&span, &e);
+                drop(span);
                 events.error_msg(format!("batch error: {e:#}")).await;
                 return Err(Flow::fatal("BATCH_FAILED", e));
             }
@@ -167,10 +186,12 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin>(
     // The end-of-stream marker tells the core the stream is complete. It is
     // written only after the last batch succeeded; a source that dies before
     // this point leaves a stream the core recognises as truncated.
-    ipc_writer
-        .finish()
-        .map_err(|e| Flow::fatal("IPC_WRITE_FAILED", anyhow::anyhow!("IPC finish: {e}")))?;
+    let span = phase_span!("finish");
+    let finished = span.in_scope(|| ipc_writer.finish());
+    drop(span);
+    finished.map_err(|e| Flow::fatal("IPC_WRITE_FAILED", anyhow::anyhow!("IPC finish: {e}")))?;
 
+    events.close().await;
     ctl.send(Message::Finished(Finished::success_source(rows_total, batches_total))).await?;
     Ok(())
 }

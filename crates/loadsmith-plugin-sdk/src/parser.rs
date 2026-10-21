@@ -30,6 +30,10 @@ use loadsmith_protocol::{capabilities, Finished, Message, PluginKind};
 use tokio::io::AsyncWrite;
 
 use crate::context::EventSender;
+use crate::telemetry::{self, phase_span};
+use std::time::Instant;
+use tracing::Instrument;
+
 use crate::config::PluginConfig;
 use crate::control::{answer_configure, conclude, handshake, recv_configure, recv_start, unexpected, Control, Flow, Inbound};
 
@@ -87,15 +91,16 @@ pub trait ParserPlugin: Send {
 /// Exit code: `0` after success or a `cancel`, `1` after a failure, an
 /// `error` from the core, or a lost core.
 pub async fn run_parser<P: ParserPlugin + 'static>(mut plugin: P) -> ! {
+    telemetry::install();
     let mut ctl = Control::stdio();
     let mut started = false;
     // fd4 = event out; fd3 = the Arrow IPC stream, opened once the schema is
     // known.
-    let event_fd = unsafe { std::fs::File::from_raw_fd(4) };
-    let mut events = EventSender::new(tokio::fs::File::from_std(event_fd));
+    let mut events = EventSender::fd4();
     let data = || Ok(unsafe { std::fs::File::from_raw_fd(3) });
     let result = drive_parser(&mut plugin, &mut ctl, &mut events, &mut started, data).await;
     let code = conclude(&mut ctl, result, started, || plugin.cancel()).await;
+    events.close().await;
     std::process::exit(code);
 }
 
@@ -251,7 +256,10 @@ where
 
     // ── Configure ────────────────────────────────────────────────────────
     let (config, warnings) = recv_configure(ctl).await?;
-    let outcome = plugin.configure(config).await;
+    let span = phase_span!("configure");
+    let outcome = plugin.configure(config).instrument(span.clone()).await;
+    telemetry::outcome(&span, &outcome);
+    drop(span);
     answer_configure(ctl, events, &warnings, outcome).await?;
 
     // ── Start ─────────────────────────────────────────────────────────────
@@ -278,9 +286,11 @@ where
             continue;
         };
 
-        let schema = with_control(ctl, &mut inbox, plugin.open(&path))
-            .await?
-            .map_err(|e| Flow::fatal("OPEN_FAILED", e.context(format!("open {}", path.display()))))?;
+        let object = telemetry::object_span("loadsmith.parse", &path.to_string_lossy());
+        let schema = with_control(ctl, &mut inbox, plugin.open(&path).instrument(object.clone())).await?;
+        telemetry::outcome(&object, &schema);
+        let schema =
+            schema.map_err(|e| Flow::fatal("OPEN_FAILED", e.context(format!("open {}", path.display()))))?;
         match &stream {
             Some(s) => s.check(&schema, &path)?,
             None => stream = Some(Stream::open(ctl, &mut data, schema).await?),
@@ -289,8 +299,13 @@ where
 
         let (mut rows, mut batches) = (0u64, 0u64);
         loop {
-            match with_control(ctl, &mut inbox, plugin.next_batch()).await? {
+            let span = object.in_scope(|| telemetry::batch_span(batches_total + batches + 1, "read"));
+            let began = Instant::now();
+            match with_control(ctl, &mut inbox, plugin.next_batch().instrument(span.clone())).await? {
                 Ok(Some(batch)) => {
+                    let bytes = batch.get_array_memory_size() as u64;
+                    telemetry::batch_done(&span, "read", batch.num_rows() as u64, bytes, began.elapsed());
+                    drop(span);
                     let batch = out.conform(batch, &path)?;
                     rows += batch.num_rows() as u64;
                     batches += 1;
@@ -301,11 +316,16 @@ where
                 }
                 Ok(None) => break,
                 Err(e) => {
+                    telemetry::fail(&span, &e);
+                    telemetry::fail(&object, &e);
+                    drop((span, object));
                     events.error_msg(format!("parse error in {}: {e:#}", path.display())).await;
                     return Err(Flow::fatal("PARSE_FAILED", e.context(format!("parse {}", path.display()))));
                 }
             }
         }
+        object.record("loadsmith.object.rows", rows);
+        drop(object);
         rows_total += rows;
         batches_total += batches;
         let last_batch_seq = if batches > 0 { batches_total } else { 0 };
@@ -322,6 +342,7 @@ where
     out.writer
         .finish()
         .map_err(|e| Flow::fatal("IPC_WRITE_FAILED", anyhow::anyhow!("IPC finish: {e}")))?;
+    events.close().await;
     ctl.send(Message::Finished(Finished::success_source(rows_total, batches_total))).await?;
     Ok(())
 }

@@ -123,7 +123,7 @@ pub fn encode_hex(bytes: &[u8]) -> String {
 
 /// Bytes of a hex string (either case); `None` if it is not hex.
 pub fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()

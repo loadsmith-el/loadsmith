@@ -9,6 +9,9 @@ tokio              = { workspace = true }
 async-trait        = { workspace = true }
 anyhow             = { workspace = true }
 tracing            = { workspace = true }
+# The telemetry layer (spans + log events → fd4). Registry only: no fmt,
+# no env-filter.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 serde_json         = { workspace = true }
 serde              = { workspace = true }
 loadsmith-protocol = { path = "../loadsmith-protocol" }

@@ -8,6 +8,10 @@ use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 
 use crate::context::EventSender;
+use crate::telemetry::{self, phase_span};
+use std::time::Instant;
+use tracing::Instrument;
+
 use crate::config::PluginConfig;
 use crate::control::{answer_configure, conclude, handshake, recv_configure, recv_start, Control, Flow};
 
@@ -76,10 +80,13 @@ pub trait DestinationPlugin: Send {
 /// Exit code: `0` after success or a `cancel`, `1` after a failure, an
 /// `error` from the core, or a lost core.
 pub async fn run_destination<P: DestinationPlugin + 'static>(mut plugin: P) -> ! {
+    telemetry::install();
     let mut ctl = Control::stdio();
+    let mut events = EventSender::fd4();
     let mut started = false;
-    let result = drive_destination(&mut plugin, &mut ctl, &mut started).await;
+    let result = drive_destination(&mut plugin, &mut ctl, &mut events, &mut started).await;
     let code = conclude(&mut ctl, result, started, || plugin.cancel()).await;
+    events.close().await;
     std::process::exit(code);
 }
 
@@ -121,14 +128,12 @@ fn spawn_fd3_reader() -> mpsc::Receiver<DataEvent> {
     rx
 }
 
-async fn drive_destination<P: DestinationPlugin, W: AsyncWrite + Unpin>(
+async fn drive_destination<P: DestinationPlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Unpin>(
     plugin: &mut P,
     ctl: &mut Control<W>,
+    events: &mut EventSender<E>,
     started: &mut bool,
 ) -> Result<(), Flow> {
-    let event_fd = unsafe { std::fs::File::from_raw_fd(4) };
-    let mut events = EventSender::new(tokio::fs::File::from_std(event_fd));
-
     // ── Handshake + capabilities ─────────────────────────────────────────
     handshake(
         ctl,
@@ -141,13 +146,20 @@ async fn drive_destination<P: DestinationPlugin, W: AsyncWrite + Unpin>(
 
     // ── Configure ────────────────────────────────────────────────────────
     let (config, warnings) = recv_configure(ctl).await?;
-    let outcome = plugin.configure(config).await;
-    answer_configure(ctl, &mut events, &warnings, outcome).await?;
+    let span = phase_span!("configure");
+    let outcome = plugin.configure(config).instrument(span.clone()).await;
+    telemetry::outcome(&span, &outcome);
+    drop(span);
+    answer_configure(ctl, events, &warnings, outcome).await?;
 
     // ── Start + Prepare ───────────────────────────────────────────────────
     recv_start(ctl).await?;
     *started = true;
-    plugin.prepare().await.map_err(|e| Flow::fatal("PREPARE_FAILED", e))?;
+    let span = phase_span!("start");
+    let prepared = plugin.prepare().instrument(span.clone()).await;
+    telemetry::outcome(&span, &prepared);
+    drop(span);
+    prepared.map_err(|e| Flow::fatal("PREPARE_FAILED", e))?;
     ctl.send(Message::Ready).await?;
 
     // ── Data loop (Arrow IPC on fd3) ──────────────────────────────────────
@@ -175,10 +187,17 @@ async fn drive_destination<P: DestinationPlugin, W: AsyncWrite + Unpin>(
         match event {
             DataEvent::Batch(batch) => {
                 batches_total += 1;
-                if let Err(e) = plugin.write_batch(batch).await {
+                let (rows, bytes) = (batch.num_rows() as u64, batch.get_array_memory_size() as u64);
+                let span = telemetry::batch_span(batches_total, "written");
+                let began = Instant::now();
+                if let Err(e) = plugin.write_batch(batch).instrument(span.clone()).await {
+                    telemetry::fail(&span, &e);
+                    drop(span);
                     events.error_msg(format!("write_batch error: {e:#}")).await;
                     return Err(Flow::fatal("WRITE_FAILED", e));
                 }
+                telemetry::batch_done(&span, "written", rows, bytes, began.elapsed());
+                drop(span);
                 // Announce any files finalized by this batch (e.g. a chunk that
                 // rolled over) so the sink can start delivering mid-pump.
                 for path in plugin.take_ready_objects() {
@@ -208,7 +227,11 @@ async fn drive_destination<P: DestinationPlugin, W: AsyncWrite + Unpin>(
         }
     }
 
-    let rows_written = plugin.finalize().await.map_err(|e| Flow::fatal("FINALIZE_FAILED", e))?;
+    let span = phase_span!("finish");
+    let finalized = plugin.finalize().instrument(span.clone()).await;
+    telemetry::outcome(&span, &finalized);
+    drop(span);
+    let rows_written = finalized.map_err(|e| Flow::fatal("FINALIZE_FAILED", e))?;
     // Announce the final files (single-file mode closes its only file here, and
     // chunked mode closes the last partial chunk). These events must reach fd4
     // before the process exits so the sink delivers every object.
@@ -222,6 +245,7 @@ async fn drive_destination<P: DestinationPlugin, W: AsyncWrite + Unpin>(
         events.committed(batches_total).await;
     }
     events.progress_destination(rows_written, batches_total).await;
+    events.close().await;
 
     ctl.send(Message::Finished(Finished::success_destination(rows_written, batches_total)))
         .await?;

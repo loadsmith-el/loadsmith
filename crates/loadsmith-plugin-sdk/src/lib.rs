@@ -5,6 +5,7 @@ pub mod provider;
 pub mod parser;
 pub mod object_source;
 pub mod context;
+pub mod telemetry;
 pub mod config;
 mod control;
 

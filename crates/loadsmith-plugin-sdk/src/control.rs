@@ -239,7 +239,7 @@ pub(crate) async fn handshake<W: AsyncWrite + Unpin>(
         plugin_name: name.to_string(),
         plugin_version: version.to_string(),
         kind,
-        telemetry: None,
+        telemetry: Some(loadsmith_protocol::TELEMETRY_VERSION),
     }))
     .await?;
 
@@ -271,6 +271,7 @@ pub(crate) async fn recv_configure<W: AsyncWrite + Unpin>(
 ) -> Result<(PluginConfig, ConfigWarnings), Flow> {
     match ctl.recv().await? {
         Message::Configure(c) => {
+            crate::telemetry::GLOBAL.start(c.telemetry.as_ref());
             let policy = c.unknown_keys();
             let config = PluginConfig::new(c.config, policy);
             let warnings = config.warnings();

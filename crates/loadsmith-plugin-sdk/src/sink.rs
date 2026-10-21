@@ -1,4 +1,3 @@
-use std::os::unix::io::FromRawFd;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -7,6 +6,9 @@ use loadsmith_protocol::{Finished, Message, ObjectDelivered, PluginKind};
 use tokio::io::AsyncWrite;
 
 use crate::context::EventSender;
+use crate::telemetry::{self, phase_span};
+use tracing::Instrument;
+
 use crate::config::PluginConfig;
 use crate::control::{answer_configure, conclude, handshake, recv_configure, recv_start, unexpected, Control, Flow};
 
@@ -55,21 +57,22 @@ pub trait SinkPlugin: Send {
 /// Exit code: `0` after success or a `cancel`, `1` after a failure or an
 /// `error` from the core.
 pub async fn run_sink<P: SinkPlugin + 'static>(mut plugin: P) -> ! {
+    telemetry::install();
     let mut ctl = Control::stdio();
+    let mut events = EventSender::fd4();
     let mut started = false;
-    let result = drive_sink(&mut plugin, &mut ctl, &mut started).await;
+    let result = drive_sink(&mut plugin, &mut ctl, &mut events, &mut started).await;
     let code = conclude(&mut ctl, result, started, || plugin.cancel()).await;
+    events.close().await;
     std::process::exit(code);
 }
 
-async fn drive_sink<P: SinkPlugin, W: AsyncWrite + Unpin>(
+async fn drive_sink<P: SinkPlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Unpin>(
     plugin: &mut P,
     ctl: &mut Control<W>,
+    events: &mut EventSender<E>,
     started: &mut bool,
 ) -> Result<(), Flow> {
-    let event_fd = unsafe { std::fs::File::from_raw_fd(4) };
-    let mut events = EventSender::new(tokio::fs::File::from_std(event_fd));
-
     // ── Handshake + capabilities ─────────────────────────────────────────
     handshake(
         ctl,
@@ -82,13 +85,20 @@ async fn drive_sink<P: SinkPlugin, W: AsyncWrite + Unpin>(
 
     // ── Configure ────────────────────────────────────────────────────────
     let (config, warnings) = recv_configure(ctl).await?;
-    let outcome = plugin.configure(config).await;
-    answer_configure(ctl, &mut events, &warnings, outcome).await?;
+    let span = phase_span!("configure");
+    let outcome = plugin.configure(config).instrument(span.clone()).await;
+    telemetry::outcome(&span, &outcome);
+    drop(span);
+    answer_configure(ctl, events, &warnings, outcome).await?;
 
     // ── Start + Prepare ───────────────────────────────────────────────────
     recv_start(ctl).await?;
     *started = true;
-    plugin.prepare().await.map_err(|e| Flow::fatal("PREPARE_FAILED", e))?;
+    let span = phase_span!("start");
+    let prepared = plugin.prepare().instrument(span.clone()).await;
+    telemetry::outcome(&span, &prepared);
+    drop(span);
+    prepared.map_err(|e| Flow::fatal("PREPARE_FAILED", e))?;
     ctl.send(Message::Ready).await?;
 
     // ── Delivery loop (DeliverObject on the control plane) ─────────────────
@@ -100,17 +110,27 @@ async fn drive_sink<P: SinkPlugin, W: AsyncWrite + Unpin>(
         match msg {
             Message::DeliverObject(d) => {
                 let path = PathBuf::from(&d.path);
-                if let Err(e) = plugin.deliver(path).await {
+                let span = telemetry::object_span("loadsmith.deliver", &d.path);
+                if let Err(e) = plugin.deliver(path).instrument(span.clone()).await {
+                    telemetry::fail(&span, &e);
+                    drop(span);
                     events.error_msg(format!("deliver error for {}: {e:#}", d.path)).await;
                     return Err(Flow::fatal("DELIVER_FAILED", e));
                 }
+                drop(span);
+                events.flush_telemetry().await;
                 ctl.send(Message::ObjectDelivered(ObjectDelivered { path: d.path })).await?;
             }
             other => return Err(unexpected("deliver_object", &other)),
         }
     }
 
-    let count = plugin.finalize().await.map_err(|e| Flow::fatal("FINALIZE_FAILED", e))?;
+    let span = phase_span!("finish");
+    let finalized = plugin.finalize().instrument(span.clone()).await;
+    telemetry::outcome(&span, &finalized);
+    drop(span);
+    let count = finalized.map_err(|e| Flow::fatal("FINALIZE_FAILED", e))?;
+    events.close().await;
     // Reuse the Finished shape to carry the object count back to the core
     // (rows_written/batches_written both = objects delivered) — no new field.
     ctl.send(Message::Finished(Finished::success_destination(count, count))).await?;

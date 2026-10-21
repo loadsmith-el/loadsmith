@@ -13,7 +13,6 @@
 //! never logs a resolved value.
 
 use std::collections::VecDeque;
-use std::os::unix::io::FromRawFd;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -21,6 +20,9 @@ use loadsmith_protocol::{capabilities, Finished, Message, PluginKind, Resolve, R
 use tokio::io::AsyncWrite;
 
 use crate::context::EventSender;
+use crate::telemetry::{self, phase_span};
+use tracing::Instrument;
+
 use crate::config::PluginConfig;
 use crate::control::{answer_configure, conclude, handshake, recv_configure, recv_start, unexpected, Control, Flow, Inbound};
 
@@ -90,13 +92,14 @@ pub trait ProviderPlugin: Send {
 /// Exit code: `0` after success or a `cancel`, `1` after a failure, an
 /// `error` from the core, or a lost core.
 pub async fn run_provider<P: ProviderPlugin + 'static>(mut plugin: P) -> ! {
+    telemetry::install();
     let mut ctl = Control::stdio();
     let mut started = false;
     // fd4 = event out (logs). The core always wires and drains it.
-    let event_fd = unsafe { std::fs::File::from_raw_fd(4) };
-    let mut events = EventSender::new(tokio::fs::File::from_std(event_fd));
+    let mut events = EventSender::fd4();
     let result = drive_provider(&mut plugin, &mut ctl, &mut events, &mut started).await;
     let code = conclude(&mut ctl, result, started, || plugin.cancel()).await;
+    events.close().await;
     std::process::exit(code);
 }
 
@@ -117,7 +120,10 @@ where
 
     // ── Configure ────────────────────────────────────────────────────────
     let (config, warnings) = recv_configure(ctl).await?;
-    let outcome = plugin.configure(config).await;
+    let span = phase_span!("configure");
+    let outcome = plugin.configure(config).instrument(span.clone()).await;
+    telemetry::outcome(&span, &outcome);
+    drop(span);
     answer_configure(ctl, events, &warnings, outcome).await?;
 
     // ── Start ─────────────────────────────────────────────────────────────
@@ -148,8 +154,15 @@ where
             continue;
         };
 
+        // The reference names what to resolve (never the value): safe as an
+        // attribute.
+        let span = tracing::info_span!(
+            "loadsmith.resolve",
+            loadsmith.provider.ref = %request.reference,
+            error = tracing::field::Empty,
+        );
         let outcome = {
-            let work = plugin.resolve(&request.reference);
+            let work = plugin.resolve(&request.reference).instrument(span.clone());
             tokio::pin!(work);
             loop {
                 tokio::select! {
@@ -168,6 +181,10 @@ where
             }
         }?;
 
+        if let Err(e) = &outcome {
+            telemetry::fail(&span, e);
+        }
+        drop(span);
         let reply = match outcome {
             Ok(value) => {
                 resolved += 1;
@@ -187,6 +204,7 @@ where
     }
 
     events.info(format!("resolved {resolved} reference(s), {failed} failed")).await;
+    events.close().await;
     ctl.send(Message::Finished(Finished::success())).await?;
     Ok(())
 }

@@ -12,7 +12,6 @@
 //! causes a partial load. `cancel`/`error` from the core stop it at any
 //! point, also in the middle of `next_object`.
 
-use std::os::unix::io::FromRawFd;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -21,6 +20,9 @@ use loadsmith_protocol::{capabilities, Finished, Message, PluginKind};
 use tokio::io::AsyncWrite;
 
 use crate::context::EventSender;
+use crate::telemetry::{self, phase_span};
+use tracing::Instrument;
+
 use crate::config::PluginConfig;
 use crate::control::{answer_configure, conclude, handshake, recv_configure, recv_start, Control, Flow};
 
@@ -59,12 +61,13 @@ pub trait ObjectSourcePlugin: Send {
 /// Exit code: `0` after success or a `cancel`, `1` after a failure, an
 /// `error` from the core, or a lost core.
 pub async fn run_object_source<P: ObjectSourcePlugin + 'static>(mut plugin: P) -> ! {
+    telemetry::install();
     let mut ctl = Control::stdio();
     let mut started = false;
-    let event_fd = unsafe { std::fs::File::from_raw_fd(4) };
-    let mut events = EventSender::new(tokio::fs::File::from_std(event_fd));
+    let mut events = EventSender::fd4();
     let result = drive_object_source(&mut plugin, &mut ctl, &mut events, &mut started).await;
     let code = conclude(&mut ctl, result, started, || plugin.cancel()).await;
+    events.close().await;
     std::process::exit(code);
 }
 
@@ -85,7 +88,10 @@ where
 
     // ── Configure ────────────────────────────────────────────────────────
     let (config, warnings) = recv_configure(ctl).await?;
-    let outcome = plugin.configure(config).await;
+    let span = phase_span!("configure");
+    let outcome = plugin.configure(config).instrument(span.clone()).await;
+    telemetry::outcome(&span, &outcome);
+    drop(span);
     answer_configure(ctl, events, &warnings, outcome).await?;
 
     // ── Start ─────────────────────────────────────────────────────────────
@@ -98,8 +104,13 @@ where
     loop {
         // Wait for the next file *and* the core at the same time, so a
         // `cancel` stops a source in the middle of a long download.
+        let span = tracing::info_span!(
+            "loadsmith.object",
+            loadsmith.object.path = tracing::field::Empty,
+            error = tracing::field::Empty,
+        );
         let next = {
-            let work = plugin.next_object();
+            let work = plugin.next_object().instrument(span.clone());
             tokio::pin!(work);
             loop {
                 tokio::select! {
@@ -117,11 +128,15 @@ where
         };
         match next? {
             Ok(Some(path)) => {
+                span.record("loadsmith.object.path", path.to_string_lossy().as_ref());
+                drop(span);
                 objects += 1;
                 events.object_ready(path.to_string_lossy().into_owned()).await;
             }
             Ok(None) => break,
             Err(e) => {
+                telemetry::fail(&span, &e);
+                drop(span);
                 events.error_msg(format!("object error: {e:#}")).await;
                 return Err(Flow::fatal("OBJECT_FAILED", e));
             }
@@ -129,6 +144,7 @@ where
     }
 
     events.info(format!("{objects} object(s) ready")).await;
+    events.close().await;
     ctl.send(Message::Finished(Finished::success())).await?;
     Ok(())
 }
