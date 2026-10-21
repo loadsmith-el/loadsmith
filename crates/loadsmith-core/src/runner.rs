@@ -527,8 +527,12 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     let pump_control = Arc::new(PumpControl::default());
     let mut pump_join = {
         let control = Arc::clone(&pump_control);
+        // The pump's progress lines belong to the run's trace.
+        let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
-            pump(source_reader, out_write, control, move |rows, batches| reporter.progress(rows, batches))
+            span.in_scope(|| {
+                pump(source_reader, out_write, control, move |rows, batches| reporter.progress(rows, batches))
+            })
         })
     };
 
@@ -536,14 +540,18 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     // operator knows the pipeline is alive during long transfers. 0 disables it.
     let heartbeat_secs = config.pipeline.heartbeat_seconds;
     let heartbeat = (heartbeat_secs > 0).then(|| {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(heartbeat_secs));
-            interval.tick().await; // skip the immediate first tick
-            loop {
-                interval.tick().await;
-                tracing::info!("pipeline still running…");
+        tokio::spawn(
+            async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(heartbeat_secs));
+                interval.tick().await; // skip the immediate first tick
+                loop {
+                    interval.tick().await;
+                    tracing::info!("pipeline still running…");
+                }
             }
-        })
+            .in_current_span(),
+        )
+
     });
 
     // The producer is the parser (fed by the raw source) or the source.
