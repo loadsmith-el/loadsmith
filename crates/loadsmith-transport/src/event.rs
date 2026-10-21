@@ -26,7 +26,7 @@ impl<W: AsyncWrite + Unpin> EventWriter<W> {
         level: LogLevel,
         message: impl Into<String>,
     ) -> Result<(), TransportError> {
-        self.send(&Message::Log(LogEvent { level, message: message.into() })).await
+        self.send(&Message::Log(LogEvent::new(level, message))).await
     }
 
     pub async fn info(&mut self, message: impl Into<String>) -> Result<(), TransportError> {

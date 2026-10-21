@@ -164,10 +164,10 @@ impl FakeSource {
 
 /// Writes one `log` event straight to fd4, as a careless plugin would.
 fn leak_log(message: &str) {
-    let line = serde_json::to_string(&Message::Log(loadsmith_protocol::LogEvent {
-        level: loadsmith_protocol::LogLevel::Error,
-        message: message.to_string(),
-    }))
+    let line = serde_json::to_string(&Message::Log(loadsmith_protocol::LogEvent::new(
+        loadsmith_protocol::LogLevel::Error,
+        message,
+    )))
     .unwrap();
     // The SDK owns fd4; borrow it without closing it.
     let mut fd4 = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(4) });
@@ -610,6 +610,7 @@ fn raw_source(scenario: &str) -> ! {
         plugin_name: format!("raw-{scenario}"),
         plugin_version: "0.0.0".into(),
         kind: PluginKind::Source,
+        telemetry: None,
     });
     match scenario {
         "garbled1" => {
@@ -701,6 +702,7 @@ fn eager_parser() -> ! {
         plugin_name: "eager-parser".into(),
         plugin_version: "0.0.0".into(),
         kind: PluginKind::Parser,
+        telemetry: None,
     }));
     assert!(matches!(raw.recv(true), Message::SetProtocolVersion(_)));
     assert!(matches!(raw.recv(true), Message::CapabilitiesRequest));

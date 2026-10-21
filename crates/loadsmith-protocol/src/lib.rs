@@ -3,6 +3,12 @@ use serde::{Deserialize, Serialize};
 mod schema;
 pub use schema::{Field, FieldType, IntervalUnit, TimeUnit};
 
+pub mod telemetry;
+pub use telemetry::{
+    Attributes, HistogramValue, MetricKind, MetricPoint, MetricsBatch, SpanData, SpanEvent, SpanKind, SpanLink,
+    SpanStatus, StatusCode, TelemetryContext, Temporality, TraceParent, TELEMETRY_VERSION,
+};
+
 // ── Top-level message enum ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +72,13 @@ pub enum Message {
 
     // Observability
     Log(LogEvent),
+    /// Plugin → core (event plane, fd4): one finished span, sent only when
+    /// `configure.telemetry.enabled`. The core re-emits it under the run's
+    /// trace (it is the only exporter).
+    Span(SpanData),
+    /// Plugin → core (event plane, fd4): delta-aggregated metric points,
+    /// sent only when `configure.telemetry.enabled`.
+    Metrics(MetricsBatch),
 
     // Healthcheck
     Ping,
@@ -104,6 +117,11 @@ pub struct HandshakeAck {
     pub plugin_name: String,
     pub plugin_version: String,
     pub kind: PluginKind,
+    /// The telemetry protocol revision the plugin speaks
+    /// ([`TELEMETRY_VERSION`]). Optional and additive: absent means the
+    /// plugin sends no `span`/`metrics` and gets no `configure.telemetry`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,12 +147,22 @@ pub struct Configure {
     /// never becomes less strict than asked. Older plugins ignore the field.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_unknown_keys")]
     pub unknown_keys: Option<UnknownKeys>,
+    /// Telemetry for this run: sent only to a plugin that advertised
+    /// `handshake_ack.telemetry`. Optional and tolerant: absent, or a value
+    /// this build cannot read, means telemetry is off for the plugin.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_telemetry")]
+    pub telemetry: Option<TelemetryContext>,
 }
 
 impl Configure {
     /// A `configure` with the default policy (unknown keys are an error).
     pub fn new(config: serde_json::Value) -> Self {
-        Self { config, unknown_keys: None }
+        Self { config, unknown_keys: None, telemetry: None }
+    }
+
+    /// Whether the plugin should record telemetry for this run.
+    pub fn telemetry_enabled(&self) -> bool {
+        self.telemetry.as_ref().is_some_and(|t| t.enabled)
     }
 
     /// The policy the plugin must apply: `unknown_keys`, or the default.
@@ -169,6 +197,13 @@ impl UnknownKeys {
 /// Tolerant reader for `configure.unknown_keys`: a value this build does not
 /// know (or of the wrong type) reads as absent, i.e. the strict default.
 fn lenient_unknown_keys<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<UnknownKeys>, D::Error> {
+    let raw = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(raw).ok())
+}
+
+/// Tolerant reader for `configure.telemetry`: unreadable reads as absent
+/// (telemetry off), never as a failed `configure`.
+fn lenient_telemetry<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<TelemetryContext>, D::Error> {
     let raw = serde_json::Value::deserialize(d)?;
     Ok(serde_json::from_value(raw).ok())
 }
@@ -338,10 +373,37 @@ impl Resolved {
 
 // ── Log event ─────────────────────────────────────────────────────────────────
 
+/// Body of `log`. Only `level` and `message` are required; the rest is
+/// optional and additive (telemetry): a plugin sends `trace_id`/`span_id`
+/// for a line logged inside one of its spans, `time_unix_nano` for when it
+/// happened, and `attributes` for its structured fields. The core masks all
+/// of it like the message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEvent {
     pub level: LogLevel,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_unix_nano: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub attributes: Attributes,
+}
+
+impl LogEvent {
+    /// A plain log line: no trace context, no attributes.
+    pub fn new(level: LogLevel, message: impl Into<String>) -> Self {
+        Self {
+            level,
+            message: message.into(),
+            trace_id: None,
+            span_id: None,
+            time_unix_nano: None,
+            attributes: Attributes::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -639,6 +701,7 @@ mod tests {
             plugin_name: "loadsmith-source-postgres".into(),
             plugin_version: "0.1.0".into(),
             kind: PluginKind::Source,
+            telemetry: None,
         });
         if let Message::HandshakeAck(ack) = roundtrip(&msg) {
             assert_eq!(ack.protocol_supported_versions, vec![1]);
@@ -869,6 +932,7 @@ mod tests {
             plugin_name: "loadsmith-sink-local-copy".into(),
             plugin_version: "0.1.0".into(),
             kind: PluginKind::Sink,
+            telemetry: None,
         });
         if let Message::HandshakeAck(ack) = roundtrip(&msg) {
             assert_eq!(ack.kind, PluginKind::Sink);
@@ -920,12 +984,58 @@ mod tests {
 
     #[test]
     fn log_event_roundtrip() {
-        let msg = Message::Log(LogEvent { level: LogLevel::Info, message: "conectado".into() });
+        let msg = Message::Log(LogEvent::new(LogLevel::Info, "conectado"));
         if let Message::Log(l) = roundtrip(&msg) {
             assert_eq!(l.level, LogLevel::Info);
         } else {
             panic!("wrong variant");
         }
+        // Without telemetry fields the line is exactly the v1 form.
+        assert_eq!(serde_json::to_string(&msg).unwrap(), r#"{"type":"log","level":"info","message":"conectado"}"#);
+    }
+
+    #[test]
+    fn log_event_telemetry_fields_roundtrip() {
+        let mut log = LogEvent::new(LogLevel::Warn, "slow");
+        log.trace_id = Some("0af7651916cd43dd8448eb211c80319c".into());
+        log.span_id = Some("b7ad6b7169203331".into());
+        log.time_unix_nano = Some(42);
+        log.attributes.insert("db.namespace".into(), serde_json::json!("public"));
+        let Message::Log(back) = roundtrip(&Message::Log(log)) else { panic!("wrong variant") };
+        assert_eq!(back.span_id.as_deref(), Some("b7ad6b7169203331"));
+        assert_eq!(back.time_unix_nano, Some(42));
+        assert_eq!(back.attributes["db.namespace"], "public");
+    }
+
+    #[test]
+    fn handshake_ack_telemetry_is_optional() {
+        let old = r#"{"type":"handshake_ack","protocol_supported_versions":[1],"plugin_name":"p","plugin_version":"1","kind":"source"}"#;
+        let Message::HandshakeAck(ack) = serde_json::from_str::<Message>(old).unwrap() else { panic!() };
+        assert_eq!(ack.telemetry, None);
+        assert_eq!(serde_json::to_string(&Message::HandshakeAck(ack.clone())).unwrap(), old);
+        let new = Message::HandshakeAck(HandshakeAck { telemetry: Some(TELEMETRY_VERSION), ..ack });
+        assert!(serde_json::to_string(&new).unwrap().ends_with(r#""kind":"source","telemetry":1}"#));
+    }
+
+    #[test]
+    fn configure_telemetry_is_optional_and_tolerant() {
+        let parse = |line: &str| match serde_json::from_str::<Message>(line).unwrap() {
+            Message::Configure(c) => c,
+            other => panic!("wrong variant: {other:?}"),
+        };
+        let c = parse(r#"{"type":"configure","config":{}}"#);
+        assert!(c.telemetry.is_none() && !c.telemetry_enabled());
+        let c = parse(
+            r#"{"type":"configure","config":{},"telemetry":{"enabled":true,"traceparent":"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01","log_level":"debug","x":1}}"#,
+        );
+        let t = c.telemetry.clone().unwrap();
+        assert!(c.telemetry_enabled());
+        assert_eq!(t.log_level, LogLevel::Debug);
+        assert!(TraceParent::parse(t.traceparent.as_deref().unwrap()).is_some());
+        // A shape this build cannot read is "telemetry off", not a failed configure.
+        assert!(parse(r#"{"type":"configure","config":{},"telemetry":"yes"}"#).telemetry.is_none());
+        let odd = r#"{"type":"configure","config":{},"telemetry":{"enabled":true,"log_level":"chatty"}}"#;
+        assert!(parse(odd).telemetry.is_none());
     }
 
     #[test]

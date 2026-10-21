@@ -239,6 +239,7 @@ pub(crate) async fn handshake<W: AsyncWrite + Unpin>(
         plugin_name: name.to_string(),
         plugin_version: version.to_string(),
         kind,
+        telemetry: None,
     }))
     .await?;
 

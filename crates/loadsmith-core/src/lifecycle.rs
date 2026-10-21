@@ -123,7 +123,7 @@ pub async fn run_handshake_and_configure_with(
     // Send configuration
     let config = config(&supports)?;
     tracing::debug!(plugin = %label, "→ configure");
-    peer.send(Message::Configure(Configure { config, unknown_keys: Some(unknown_keys) })).await?;
+    peer.send(Message::Configure(Configure { config, unknown_keys: Some(unknown_keys), telemetry: None })).await?;
 
     let configure_limit = Timeouts::limit(timeouts.configure_seconds);
     match peer.recv_expect("configure_ack", configure_limit, shutdown).await? {
