@@ -303,7 +303,7 @@ where
             let began = Instant::now();
             match with_control(ctl, &mut inbox, plugin.next_batch().instrument(span.clone())).await? {
                 Ok(Some(batch)) => {
-                    let bytes = batch.get_array_memory_size() as u64;
+                    let bytes = loadsmith_arrow::batch_bytes(&batch);
                     telemetry::batch_done(&span, "read", batch.num_rows() as u64, bytes, began.elapsed());
                     drop(span);
                     let batch = out.conform(batch, &path)?;

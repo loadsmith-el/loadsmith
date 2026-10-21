@@ -111,7 +111,7 @@ where
         match reader.read_batch() {
             Ok(Some(batch)) => {
                 let rows = batch.num_rows() as u64;
-                let bytes = if telemetry::enabled() { batch.get_array_memory_size() as u64 } else { 0 };
+                let bytes = if telemetry::enabled() { loadsmith_arrow::batch_bytes(&batch) } else { 0 };
                 stats.rows += rows;
                 stats.batches += 1;
                 control.batches.store(stats.batches, Ordering::Relaxed);

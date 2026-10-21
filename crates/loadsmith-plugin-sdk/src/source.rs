@@ -157,7 +157,7 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Un
         };
         match next? {
             Ok(Some(batch)) => {
-                let bytes = batch.get_array_memory_size() as u64;
+                let bytes = loadsmith_arrow::batch_bytes(&batch);
                 telemetry::batch_done(&span, "read", batch.num_rows() as u64, bytes, began.elapsed());
                 drop(span);
                 rows_total += batch.num_rows() as u64;

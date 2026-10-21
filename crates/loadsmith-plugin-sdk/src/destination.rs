@@ -187,7 +187,7 @@ async fn drive_destination<P: DestinationPlugin, W: AsyncWrite + Unpin, E: Async
         match event {
             DataEvent::Batch(batch) => {
                 batches_total += 1;
-                let (rows, bytes) = (batch.num_rows() as u64, batch.get_array_memory_size() as u64);
+                let (rows, bytes) = (batch.num_rows() as u64, loadsmith_arrow::batch_bytes(&batch));
                 let span = telemetry::batch_span(batches_total, "written");
                 let began = Instant::now();
                 if let Err(e) = plugin.write_batch(batch).instrument(span.clone()).await {
