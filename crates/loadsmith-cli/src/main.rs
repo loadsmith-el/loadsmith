@@ -5,6 +5,8 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use loadsmith_config::MaskList;
 use loadsmith_core::{discovery, run_pipeline, LoadOpts, Mode, RunOpts};
+use tracing::Instrument;
+
 
 mod download;
 mod exit;
@@ -68,6 +70,73 @@ struct RunArgs {
 
     #[command(flatten)]
     strictness: Strictness,
+
+    #[command(flatten)]
+    telemetry: TelemetryArgs,
+}
+
+/// OpenTelemetry export, over the `telemetry:` block and the `OTEL_*`
+/// variables.
+#[derive(Args, Clone, Debug, Default)]
+struct TelemetryArgs {
+    /// OTLP endpoint for traces, metrics and logs; turns telemetry on.
+    /// Overrides telemetry.endpoint and OTEL_EXPORTER_OTLP_ENDPOINT
+    #[arg(long, value_name = "URL")]
+    otel_endpoint: Option<String>,
+
+    /// OTLP transport: grpc or http-protobuf (the default). Overrides
+    /// telemetry.protocol and OTEL_EXPORTER_OTLP_PROTOCOL
+    #[arg(long, value_name = "PROTOCOL", value_parser = ["grpc", "http-protobuf", "http/protobuf"])]
+    otel_protocol: Option<String>,
+
+    /// An export header (gRPC metadata) as KEY=VALUE; repeatable. Wins over
+    /// telemetry.headers and OTEL_EXPORTER_OTLP_HEADERS. Values are masked
+    #[arg(long = "otel-header", value_name = "KEY=VALUE")]
+    otel_headers: Vec<String>,
+
+    /// No telemetry for this run, whatever the file and the environment say
+    #[arg(long)]
+    no_telemetry: bool,
+}
+
+impl TelemetryArgs {
+    fn flags(&self) -> Result<loadsmith_core::telemetry::TelemetryFlags, UsageError> {
+        let headers = self
+            .otel_headers
+            .iter()
+            .map(|h| match h.split_once('=') {
+                Some((k, v)) if !k.trim().is_empty() => Ok((k.trim().to_string(), v.to_string())),
+                _ => Err(UsageError(format!("--otel-header {h:?}: expected KEY=VALUE"))),
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(loadsmith_core::telemetry::TelemetryFlags {
+            endpoint: self.otel_endpoint.clone(),
+            protocol: self.otel_protocol.as_deref().and_then(loadsmith_config::OtlpProtocol::parse),
+            headers,
+            disabled: self.no_telemetry,
+        })
+    }
+}
+
+/// The run's telemetry settings: the flags over the `telemetry:` block over
+/// the environment.
+fn telemetry_settings(
+    args: &TelemetryArgs,
+    block: Option<&loadsmith_config::TelemetryConfig>,
+) -> Result<Option<loadsmith_core::telemetry::TelemetrySettings>> {
+    let flags = args.flags()?;
+    let settings = loadsmith_core::telemetry::resolve(&flags, block, &|k| std::env::var(k).ok())
+        .map_err(loadsmith_core::CoreError::Config)?;
+    Ok(settings)
+}
+
+/// What the end of a run reports to the run's telemetry.
+struct RunTelemetry {
+    span: tracing::Span,
+    /// The flush bound at exit: the export timeout, or the cancel grace
+    /// when that is shorter and the run was interrupted.
+    flush: std::time::Duration,
+    grace: std::time::Duration,
 }
 
 /// The environment variable that turns `--ignore-unknown-keys` on.
@@ -138,6 +207,11 @@ struct ValidateArgs {
 
     #[command(flatten)]
     strictness: Strictness,
+
+    /// Checked like `run` does (static: the flags and the environment;
+    /// with --resolve also the resolved telemetry: block); nothing is exported
+    #[command(flatten)]
+    telemetry: TelemetryArgs,
 }
 
 #[derive(Args)]
@@ -281,8 +355,9 @@ async fn cmd_run(args: RunArgs, color: bool, mask: MaskList) -> Result<()> {
     let started = std::time::SystemTime::now();
     let facts = loadsmith_core::FactsHandle::default();
     let mut ctx = run_summary::RunContext { dry_run: args.dry_run, ..Default::default() };
+    let mut telemetry: Option<RunTelemetry> = None;
 
-    let result = execute_run(args, color, !json_stdout, &facts, &mut ctx, &mask).await;
+    let result = execute_run(args, color, !json_stdout, &facts, &mut ctx, &mask, &mut telemetry).await;
     let finished = std::time::SystemTime::now();
     let (summary, outcome) = match result {
         Ok(Some(summary)) => {
@@ -292,12 +367,37 @@ async fn cmd_run(args: RunArgs, color: bool, mask: MaskList) -> Result<()> {
         Ok(None) => (None, Ok(())),
         Err(e) => (None, Err(e)),
     };
+    let exit_code = match &outcome {
+        Ok(()) => Exit::Success.code(),
+        Err(e) => classify(e).code(),
+    };
+
+    // Close the run's trace and flush every signal (bounded) before the
+    // summary goes out: the summary carries the trace id.
+    if let Some(run) = telemetry.take() {
+        let interrupted = summary.as_ref().is_some_and(|s| s.signal.is_some())
+            || outcome.as_ref().err().is_some_and(|e| {
+                e.chain().any(|c| matches!(c.downcast_ref(), Some(loadsmith_core::CoreError::Interrupted(_))))
+            });
+        let label = match (&outcome, interrupted) {
+            (Ok(()), _) => "success",
+            (Err(_), true) => "cancelled",
+            (Err(_), false) => "error",
+        };
+        ctx.trace_id = loadsmith_core::telemetry::trace_id(&run.span);
+        run.span.record("loadsmith.run.outcome", label);
+        run.span.record("loadsmith.run.exit_code", i64::from(exit_code));
+        if let Err(e) = &outcome {
+            run.span.record("error", mask.apply(&format!("{e:#}")));
+        }
+        let elapsed = finished.duration_since(started).unwrap_or_default();
+        loadsmith_core::telemetry::record_run(label, elapsed);
+        drop(run.span);
+        let bound = if interrupted { run.flush.min(run.grace) } else { run.flush };
+        loadsmith_core::telemetry::shutdown(bound).await;
+    }
 
     if json_stdout || summary_file.is_some() {
-        let exit_code = match &outcome {
-            Ok(()) => Exit::Success.code(),
-            Err(e) => classify(e).code(),
-        };
         let snapshot = facts.snapshot();
         let doc = run_summary::build(&run_summary::RunRecord {
             ctx: &ctx,
@@ -340,6 +440,7 @@ async fn execute_run(
     facts: &loadsmith_core::FactsHandle,
     ctx: &mut run_summary::RunContext,
     mask: &MaskList,
+    telemetry: &mut Option<RunTelemetry>,
 ) -> Result<Option<loadsmith_core::Summary>> {
     // Handle SIGINT/SIGTERM explicitly before anything else: in the images the
     // engine is PID 1, where an unhandled SIGTERM is silently ignored.
@@ -351,33 +452,74 @@ async fn execute_run(
     // that fails resolving its providers reports the pipeline it was.
     let doc = loadsmith_core::read_document(&args.pipeline, unknown_keys)?;
     ctx.learn(doc.config());
-    // Full resolution — providers included — before the state lock and
-    // before any data plugin starts. `--dry-run` and
-    // `--print-resolved-config` resolve too: they show what would run.
-    let load = LoadOpts { plugin_dir: plugin_dir.clone(), shutdown: shutdown.clone(), mask: mask.clone(), unknown_keys };
-    let config = loadsmith_core::resolve_document(&doc, Mode::Full, &load).await?;
-    ctx.learn(&config);
 
-    if args.print_resolved_config {
-        let yaml = serde_yaml::to_string(&config)?;
-        println!("{}", mask.apply(&yaml));
-        return Ok(None);
-    }
-
-    let opts = RunOpts {
-        plugin_dir,
-        dry_run: args.dry_run,
-        print_resolved_config: args.print_resolved_config,
-        color,
+    // Telemetry first (its block resolves without providers), so that the
+    // providers run inside the traced run.
+    let early = doc.resolve_subtrees(&["pipeline", "telemetry"], mask).map_err(loadsmith_core::CoreError::Config)?;
+    let settings = telemetry_settings(&args.telemetry, early.telemetry.as_ref())?;
+    let run_id = loadsmith_core::state::new_run_id();
+    let identity = loadsmith_core::telemetry::RunIdentity {
+        pipeline: early.pipeline.name.clone(),
+        run_id: run_id.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        shutdown,
-        human_report,
-        facts: facts.clone(),
-        mask: mask.clone(),
-        unknown_keys,
+    };
+    if let Some(s) = &settings {
+        // Header values are secrets wherever they came from.
+        for value in s.headers.values() {
+            mask.add(value.clone());
+        }
+    }
+    let span = match settings.clone() {
+        Some(s) if !args.print_resolved_config => {
+            let flush = s.timeout;
+            loadsmith_core::telemetry::install(s, &identity, mask);
+            let span = loadsmith_core::telemetry::run_span(&identity);
+            *telemetry = Some(RunTelemetry {
+                span: span.clone(),
+                flush,
+                grace: std::time::Duration::from_secs(early.pipeline.timeouts.cancel_grace_seconds),
+            });
+            span
+        }
+        _ => tracing::Span::none(),
     };
 
-    Ok(Some(run_pipeline(config, opts).await?))
+    async {
+        // Full resolution — providers included — before the state lock and
+        // before any data plugin starts. `--dry-run` and
+        // `--print-resolved-config` resolve too: they show what would run.
+        let load = LoadOpts { plugin_dir: plugin_dir.clone(), shutdown: shutdown.clone(), mask: mask.clone(), unknown_keys };
+        let mut config = loadsmith_core::resolve_document(&doc, Mode::Full, &load).await?;
+        ctx.learn(&config);
+
+        if args.print_resolved_config {
+            // The effective telemetry (flags, file and environment merged).
+            if let Some(s) = &settings {
+                config.telemetry = Some(s.as_config());
+            }
+            let yaml = serde_yaml::to_string(&config)?;
+            println!("{}", mask.apply(&yaml));
+            return Ok(None);
+        }
+
+        let opts = RunOpts {
+            plugin_dir,
+            dry_run: args.dry_run,
+            print_resolved_config: args.print_resolved_config,
+            color,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            shutdown,
+            human_report,
+            facts: facts.clone(),
+            mask: mask.clone(),
+            unknown_keys,
+            run_id,
+        };
+
+        Ok(Some(run_pipeline(config, opts).await?))
+    }
+    .instrument(span)
+    .await
 }
 
 /// A pipeline that ran but failed (a plugin error, a failed delivery…) must
@@ -400,6 +542,9 @@ async fn cmd_validate(args: ValidateArgs, mask: MaskList) -> Result<()> {
     let unknown_keys = args.strictness.policy()?;
     let doc = loadsmith_core::read_document(&args.pipeline, unknown_keys)?;
     if !args.resolve {
+        // The telemetry flags and environment; the block's values may hold
+        // env()/file() templates, which only --resolve evaluates.
+        telemetry_settings(&args.telemetry, None)?;
         println!(
             "Pipeline '{}' is valid (static check; --resolve also resolves env()/file() and \
              runs the providers).",
@@ -412,6 +557,7 @@ async fn cmd_validate(args: ValidateArgs, mask: MaskList) -> Result<()> {
     let plugin_dir = args.plugin_dir.unwrap_or_else(discovery::default_plugin_dir);
     let load = LoadOpts { plugin_dir, shutdown: loadsmith_core::listen_for_signals()?, mask, unknown_keys };
     let config = loadsmith_core::resolve_document(&doc, Mode::Full, &load).await?;
+    telemetry_settings(&args.telemetry, config.telemetry.as_ref())?;
     let secrets = doc.secrets().len();
     println!(
         "Pipeline '{}' is valid (fully resolved; {secrets} secret() reference{} resolved).",
@@ -631,11 +777,17 @@ fn cmd_plugin_uninstall(args: PluginUninstallArgs) -> Result<()> {
     Ok(())
 }
 
+/// stderr logs (`--log-level`), plus the OpenTelemetry layers, dormant
+/// until a run installs telemetry. Only events reach stderr: the engine's
+/// spans exist for telemetry and never decorate the log lines.
 fn init_tracing(level: &str, color: bool) {
-    use tracing_subscriber::EnvFilter;
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(level))
+    use tracing_subscriber::filter::{filter_fn, FilterExt};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::{EnvFilter, Layer};
+    let stderr = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)
         .with_ansi(color)
-        .init();
+        .with_filter(EnvFilter::new(level).and(filter_fn(|meta| meta.is_event())));
+    tracing_subscriber::registry().with(loadsmith_core::telemetry::layers()).with(stderr).init();
 }

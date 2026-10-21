@@ -41,7 +41,11 @@ fn main() {
         ("ignore_unknown_keys_flag_warns_and_succeeds", ignore_unknown_keys_flag_warns_and_succeeds),
         ("ignore_unknown_keys_env_var_warns_and_succeeds", ignore_unknown_keys_env_var_warns_and_succeeds),
         ("ignore_unknown_keys_flag_wins_over_env_var", ignore_unknown_keys_flag_wins_over_env_var),
+        ("telemetry_exporter_down_never_fails_the_run", telemetry_exporter_down_never_fails_the_run),
+        ("telemetry_flags_are_checked", telemetry_flags_are_checked),
+        ("print_resolved_config_shows_effective_telemetry", print_resolved_config_shows_effective_telemetry),
     ];
+
     let filter: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -101,6 +105,10 @@ impl Env {
         cmd.args(args).arg("--no-color").stdout(Stdio::piped()).stderr(Stdio::piped());
         // Strict by default, whatever the developer's shell exports.
         cmd.env_remove("LOADSMITH_IGNORE_UNKNOWN_KEYS");
+        // No telemetry unless a test asks for it.
+        for (key, _) in std::env::vars().filter(|(k, _)| k.starts_with("OTEL_")) {
+            cmd.env_remove(key);
+        }
         cmd
     }
 
@@ -741,4 +749,67 @@ fn ignore_unknown_keys_flag_wins_over_env_var() {
     let (code, out) = exit_code(env.run(&pipeline).env(IGNORE_ENV, "bogus"));
     assert_eq!(code, 2, "an unreadable variable is a usage error: {out}");
     assert!(out.contains(IGNORE_ENV), "{out}");
+}
+
+// ── Telemetry ─────────────────────────────────────────────────────────────────
+
+/// Nothing listens on port 1: every export fails at once.
+const DEAD_ENDPOINT: &str = "http://127.0.0.1:1";
+
+fn telemetry_exporter_down_never_fails_the_run() {
+    let env = Env::new("otel-down");
+    let pipeline = env.basic(json!({}), "");
+    for protocol in ["http-protobuf", "grpc"] {
+        let (code, doc, stderr) = json_run(
+            env.run(&pipeline).args(["--output", "json", "--otel-endpoint", DEAD_ENDPOINT, "--otel-protocol", protocol]),
+        );
+        assert_eq!(code, 0, "{protocol}: {stderr}");
+        assert_eq!(doc["status"], "success");
+        assert_eq!(stderr.matches("telemetry export failed").count(), 1, "{protocol}: warned once:\n{stderr}");
+        let trace = doc["trace_id"].as_str().expect("the summary names the run's trace");
+        assert!(trace.len() == 32 && trace.chars().all(|c| c.is_ascii_hexdigit()), "{trace}");
+    }
+    // Off: no trace_id, no warning.
+    let (code, doc, stderr) = json_run(env.run(&pipeline).args(["--output", "json"]));
+    assert_eq!(code, 0, "{stderr}");
+    assert!(doc.get("trace_id").is_none() && !stderr.contains("telemetry"), "{doc}\n{stderr}");
+    // `--no-telemetry` wins over the endpoint, wherever it comes from.
+    let (_, doc, _) = json_run(
+        env.run(&pipeline).args(["--output", "json", "--no-telemetry"]).env("OTEL_EXPORTER_OTLP_ENDPOINT", DEAD_ENDPOINT),
+    );
+    assert!(doc.get("trace_id").is_none(), "{doc}");
+}
+
+fn telemetry_flags_are_checked() {
+    let env = Env::new("otel-flags");
+    let pipeline = env.basic(json!({}), "");
+    let (code, out) = exit_code(env.run(&pipeline).args(["--otel-header", "no-equals-sign"]));
+    assert_eq!(code, 2, "{out}");
+    let (code, out) = exit_code(env.run(&pipeline).args(["--otel-endpoint", "ftp://collector"]));
+    assert_eq!(code, 3, "{out}");
+    let (code, out) = exit_code(env.run(&pipeline).env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json").env("OTEL_EXPORTER_OTLP_ENDPOINT", DEAD_ENDPOINT));
+    assert_eq!(code, 3, "{out}");
+    let bad_block = env.write_named("typo.yaml", &std::fs::read_to_string(&pipeline).unwrap().replace("pipeline:\n", "telemetry:\n  endpont: http://typo\npipeline:\n"));
+    let (code, out) = exit_code(&mut env.run(&bad_block));
+    assert_eq!(code, 3, "unknown keys in telemetry: are strict: {out}");
+    assert!(out.contains("telemetry.endpont"), "{out}");
+    let (code, out) = exit_code(env.command(&["validate"]).arg(&pipeline).args(["--otel-endpoint", "ftp://x"]));
+    assert_eq!(code, 3, "validate checks the flags: {out}");
+    let (code, out) = exit_code(env.command(&["validate"]).arg(&pipeline).args(["--otel-endpoint", DEAD_ENDPOINT]));
+    assert_eq!(code, 0, "{out}");
+}
+
+fn print_resolved_config_shows_effective_telemetry() {
+    let env = Env::new("otel-print");
+    let pipeline = env.basic(json!({}), "telemetry:\n  protocol: grpc\n  headers: { x-team: data }\n");
+    let (code, out) = exit_code(
+        env.run(&pipeline)
+            .args(["--print-resolved-config", "--otel-endpoint", "http://collector:4317"])
+            .args(["--otel-header", "authorization=Bearer tok-123456"])
+            .env("OTEL_SERVICE_NAME", "etl"),
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("endpoint: http://collector:4317") && out.contains("protocol: grpc"), "{out}");
+    assert!(out.contains("service.name: etl"), "{out}");
+    assert!(!out.contains("tok-123456") && !out.contains("data"), "header values are masked: {out}");
 }

@@ -27,6 +27,8 @@ pub struct RunContext {
     pub has_state: bool,
     pub has_sink: bool,
     pub dry_run: bool,
+    /// The run's trace id, when its traces were exported.
+    pub trace_id: Option<String>,
 }
 
 impl RunContext {
@@ -65,6 +67,9 @@ pub struct RunDocument {
     pub finished_at: String,
     pub state: Option<StateInfo>,
     pub sink: Option<SinkInfo>,
+    /// The OpenTelemetry trace of the run (only when traces were exported).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -184,7 +189,9 @@ pub fn build(rec: &RunRecord<'_>) -> RunDocument {
         sink: rec.ctx.has_sink.then(|| SinkInfo {
             objects_delivered: summary.and_then(|s| s.objects_delivered),
         }),
+        trace_id: rec.ctx.trace_id.clone(),
     }
+
 }
 
 /// Writes `doc` (pretty-printed) to `path` atomically: a temporary sibling
