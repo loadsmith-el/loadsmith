@@ -9,6 +9,8 @@ use loadsmith_protocol::{
 use crate::error::CoreError;
 use crate::peer::{Failure, Peer};
 use crate::shutdown::Shutdown;
+use tracing::Instrument;
+
 
 /// Protocol versions this core can speak. The handshake picks the highest
 /// version also advertised by the plugin; `loadsmith plugin install` checks a
@@ -62,87 +64,105 @@ pub async fn run_handshake_and_configure_with(
     let label = peer.label();
     let handshake_limit = Timeouts::limit(timeouts.handshake_seconds);
 
-    tracing::debug!(plugin = %label, "→ handshake");
-    peer.send(Message::Handshake).await?;
+    let handshake_span = tracing::info_span!(target: "loadsmith::lifecycle", parent: peer.scope().span(), "handshake");
+    let (plugin_name, plugin_version, chosen, supports, telemetry) = async {
+        tracing::debug!(plugin = %label, "→ handshake");
+        peer.send(Message::Handshake).await?;
 
-    let ack = peer.recv_expect("handshake_ack", handshake_limit, shutdown).await?;
-    let (plugin_name, plugin_version, plugin_versions, kind) = match ack {
-        Message::HandshakeAck(a) => {
-            (a.plugin_name, a.plugin_version, a.protocol_supported_versions, a.kind)
-        }
-        other => return Err(violation(peer, "handshake_ack", &other)),
-    };
-    tracing::debug!(
-        plugin = %label,
-        name = %plugin_name,
-        version = %plugin_version,
-        supported = ?plugin_versions,
-        "← handshake_ack"
-    );
+        let ack = peer.recv_expect("handshake_ack", handshake_limit, shutdown).await?;
+        let (plugin_name, plugin_version, plugin_versions, kind, telemetry) = match ack {
+            Message::HandshakeAck(a) => {
+                (a.plugin_name, a.plugin_version, a.protocol_supported_versions, a.kind, a.telemetry)
+            }
+            other => return Err(violation(peer, "handshake_ack", &other)),
+        };
+        peer.scope().identify(&plugin_name, &plugin_version);
+        tracing::debug!(
+            plugin = %label,
+            name = %plugin_name,
+            version = %plugin_version,
+            supported = ?plugin_versions,
+            "← handshake_ack"
+        );
 
-    if kind != expected_kind {
-        return Err(Failure::by(
-            label,
-            error_codes::WRONG_PLUGIN_KIND,
-            CoreError::PluginIncompatible(format!(
-                "{plugin_name}: expected plugin kind {expected_kind}, got {kind}"
-            )),
-        ));
-    }
-
-    // Choose the highest mutually supported version
-    let chosen = SUPPORTED_VERSIONS
-        .iter()
-        .rev()
-        .find(|v| plugin_versions.contains(v))
-        .copied()
-        .ok_or_else(|| {
-            Failure::by(
+        if kind != expected_kind {
+            return Err(Failure::by(
                 label,
-                error_codes::UNSUPPORTED_PROTOCOL_VERSION,
+                error_codes::WRONG_PLUGIN_KIND,
                 CoreError::PluginIncompatible(format!(
-                    "{plugin_name}: no compatible protocol version: core supports \
-                     {SUPPORTED_VERSIONS:?}, plugin supports {plugin_versions:?}"
+                    "{plugin_name}: expected plugin kind {expected_kind}, got {kind}"
                 )),
-            )
-        })?;
-    tracing::debug!(plugin = %label, protocol_version = chosen, "→ set_protocol_version");
-    peer.send(Message::SetProtocolVersion(SetProtocolVersion { protocol_version: chosen }))
-        .await?;
-
-    // Capabilities exchange
-    peer.send(Message::CapabilitiesRequest).await?;
-    let supports = match peer.recv_expect("capabilities_response", handshake_limit, shutdown).await? {
-        Message::CapabilitiesResponse(c) => {
-            tracing::debug!(plugin = %label, supports = ?c.supports, "← capabilities");
-            c.supports
+            ));
         }
-        other => return Err(violation(peer, "capabilities_response", &other)),
-    };
+
+        // Choose the highest mutually supported version
+        let chosen = SUPPORTED_VERSIONS
+            .iter()
+            .rev()
+            .find(|v| plugin_versions.contains(v))
+            .copied()
+            .ok_or_else(|| {
+                Failure::by(
+                    label,
+                    error_codes::UNSUPPORTED_PROTOCOL_VERSION,
+                    CoreError::PluginIncompatible(format!(
+                        "{plugin_name}: no compatible protocol version: core supports \
+                         {SUPPORTED_VERSIONS:?}, plugin supports {plugin_versions:?}"
+                    )),
+                )
+            })?;
+        tracing::debug!(plugin = %label, protocol_version = chosen, "→ set_protocol_version");
+        peer.send(Message::SetProtocolVersion(SetProtocolVersion { protocol_version: chosen }))
+            .await?;
+
+        // Capabilities exchange
+        peer.send(Message::CapabilitiesRequest).await?;
+        let supports = match peer.recv_expect("capabilities_response", handshake_limit, shutdown).await? {
+            Message::CapabilitiesResponse(c) => {
+                tracing::debug!(plugin = %label, supports = ?c.supports, "← capabilities");
+                c.supports
+            }
+            other => return Err(violation(peer, "capabilities_response", &other)),
+        };
+        Ok::<_, Failure>((plugin_name, plugin_version, chosen, supports, telemetry))
+    }
+    .instrument(handshake_span)
+    .await?;
 
     // Send configuration
-    let config = config(&supports)?;
-    tracing::debug!(plugin = %label, "→ configure");
-    peer.send(Message::Configure(Configure { config, unknown_keys: Some(unknown_keys), telemetry: None })).await?;
+    let configure_span = tracing::info_span!(target: "loadsmith::lifecycle", parent: peer.scope().span(), "configure");
+    async {
+        let config = config(&supports)?;
+        // Telemetry context only for a plugin that speaks the telemetry
+        // messages (older plugins never see the field).
+        let telemetry = telemetry
+            .filter(|v| *v >= loadsmith_protocol::TELEMETRY_VERSION)
+            .and_then(|_| peer.scope().configure_context());
+        tracing::debug!(plugin = %label, "→ configure");
+        peer.send(Message::Configure(Configure { config, unknown_keys: Some(unknown_keys), telemetry })).await?;
 
-    let configure_limit = Timeouts::limit(timeouts.configure_seconds);
-    match peer.recv_expect("configure_ack", configure_limit, shutdown).await? {
-        Message::ConfigureAck(a) if a.status == loadsmith_protocol::ConfigureStatus::Ok => {
-            tracing::debug!(plugin = %label, "← configure_ack ok");
-            tracing::info!(plugin = %label, name = %plugin_name, version = %plugin_version, "configured");
+        let configure_limit = Timeouts::limit(timeouts.configure_seconds);
+        match peer.recv_expect("configure_ack", configure_limit, shutdown).await? {
+            Message::ConfigureAck(a) if a.status == loadsmith_protocol::ConfigureStatus::Ok => {
+                tracing::debug!(plugin = %label, "← configure_ack ok");
+                tracing::info!(plugin = %label, name = %plugin_name, version = %plugin_version, "configured");
+            }
+            Message::ConfigureAck(a) => {
+                return Err(Failure::of(
+                    label,
+                    CoreError::PluginRejectedConfig(peer.mask().apply(&format!(
+                        "{plugin_name}: {} — {}",
+                        a.code.unwrap_or_default(),
+                        a.message.unwrap_or_default()
+                    ))),
+                ))
+            }
+            other => return Err(violation(peer, "configure_ack", &other)),
         }
-        Message::ConfigureAck(a) => {
-            return Err(Failure::of(
-                label,
-                CoreError::PluginRejectedConfig(peer.mask().apply(&format!(
-                    "{plugin_name}: {} — {}",
-                    a.code.unwrap_or_default(),
-                    a.message.unwrap_or_default()
-                ))),
-            ))
-        }
-        other => return Err(violation(peer, "configure_ack", &other)),
+        Ok::<_, Failure>(())
     }
+    .instrument(configure_span)
+    .await?;
 
     Ok(PluginHandshake {
         name: plugin_name,

@@ -23,11 +23,31 @@ loadsmith-transport = { path = "../loadsmith-transport" }
 loadsmith-config    = { path = "../loadsmith-config" }
 loadsmith-arrow     = { path = "../loadsmith-arrow" }
 arrow-schema        = { workspace = true }
+loadsmith-tls       = { path = "../loadsmith-tls" }
+
+# OpenTelemetry: the core is the only exporter (OTLP over http/protobuf and
+# gRPC). No default features anywhere: no internal-logs (exporter errors are
+# reported once by the core), and TLS through rustls with the pure-Rust
+# crypto provider (multi-arch rule: no ring / aws-lc).
+opentelemetry         = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk     = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
+opentelemetry-otlp    = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs", "http-proto", "reqwest-blocking-client", "grpc-tonic", "tls-provider-agnostic"] }
+opentelemetry-http    = { version = "0.33.1", default-features = false, features = ["reqwest-blocking"] }
+tracing-opentelemetry = { version = "0.34.0", default-features = false }
+reqwest               = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider"] }
+tonic                 = { version = "0.14", default-features = false, features = ["tls-webpki-roots"] }
+rustls                = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+webpki-roots          = "0.26"
+async-trait           = { workspace = true }
+http                  = "1"
 
 [dev-dependencies]
 arrow-array          = { workspace = true }
 async-trait          = { workspace = true }
 loadsmith-plugin-sdk = { path = "../loadsmith-plugin-sdk" }
+opentelemetry_sdk    = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs", "testing"] }
+opentelemetry        = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
+tracing-subscriber   = { workspace = true }
 
 # End-to-end abort tests: the test binary doubles as the fake plugins, so it
 # needs its own `main` (see tests/abort.rs).
@@ -48,4 +68,10 @@ harness = false
 # End-to-end unknown-keys policy tests (pipeline file and plugin configs).
 [[test]]
 name    = "unknown_keys"
+harness = false
+
+# End-to-end telemetry tests: fake plugins on the current SDK, in-memory
+# exporters.
+[[test]]
+name    = "telemetry"
 harness = false

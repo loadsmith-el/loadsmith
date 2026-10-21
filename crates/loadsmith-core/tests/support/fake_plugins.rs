@@ -160,6 +160,13 @@ impl FakeSource {
     fn leaks(&self) -> bool {
         self.config.get("leak").and_then(|v| v.as_bool()) == Some(true)
     }
+
+    /// `telemetry_probe: true`: journal whether telemetry is on, and record
+    /// a span, a log line (with the password in a span attribute, to prove
+    /// the core masks it) and a metric per batch.
+    fn probes_telemetry(&self) -> bool {
+        self.config.get("telemetry_probe").and_then(|v| v.as_bool()) == Some(true)
+    }
 }
 
 /// Writes one `log` event straight to fd4, as a careless plugin would.
@@ -250,6 +257,9 @@ impl SourcePlugin for FakeSource {
         if self.leaks() {
             leak_log(&format!("configured with {}", self.config));
         }
+        if self.probes_telemetry() {
+            note(&self.journal, &format!("telemetry={}", loadsmith_plugin_sdk::telemetry::enabled()));
+        }
         Ok(())
     }
     async fn schema(&mut self) -> Result<Schema> {
@@ -281,6 +291,16 @@ impl SourcePlugin for FakeSource {
         }
         self.produced += 1;
         note(&self.journal, &format!("batch {}", self.produced));
+        if self.probes_telemetry() {
+            // A plugin's own instrumentation, the way a real one would.
+            let secret = self.config.get("password").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let _query = tracing::info_span!("fake.query", otel.kind = "client", db.query.text = %format!("SELECT {secret}"))
+                .entered();
+            tracing::info!(batch = self.produced, "fake source produced a batch");
+            loadsmith_plugin_sdk::telemetry::counter("fake.queries")
+                .with_unit("{query}")
+                .add(1u64, &[loadsmith_plugin_sdk::telemetry::kv("db.namespace", "fake")]);
+        }
         let rows = opt_u64(&self.config, "rows").unwrap_or(10);
         Ok(Some(if self.wide() { wide_batch(self.produced, rows) } else { batch(self.produced, rows) }))
     }

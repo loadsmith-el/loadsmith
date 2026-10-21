@@ -38,6 +38,7 @@ use loadsmith_transport::ControlReader;
 use tokio::io::BufReader;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::Instant;
+use tracing::Instrument;
 
 use crate::{
     discovery::find_plugin_binary,
@@ -100,6 +101,8 @@ pub struct RunOpts {
     /// `configure`). `Error` unless the operator ran with
     /// `--ignore-unknown-keys`.
     pub unknown_keys: UnknownKeys,
+    /// This run's id: in the persisted state and on the run's telemetry.
+    pub run_id: String,
 }
 
 impl RunOpts {
@@ -115,6 +118,7 @@ impl RunOpts {
             facts: FactsHandle::default(),
             mask: MaskList::new(),
             unknown_keys: UnknownKeys::Error,
+            run_id: new_run_id(),
         }
     }
 }
@@ -155,12 +159,14 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     let (mut state_backend, mut state_guard, prior_state) = match &config.state {
         Some(cfg) => {
             let backend = open_backend(cfg)?;
-            let mut guard = backend.lock(&config.pipeline.name)?;
+            let mut guard = tracing::info_span!(target: "loadsmith::state", "lock.acquire", loadsmith.state.backend = %cfg.backend)
+                .in_scope(|| backend.lock(&config.pipeline.name))?;
             // Renew from the moment of acquisition: plugin spawn, handshake and
             // a slow first query all happen before the state supervisor exists,
             // and must not let the lease expire.
             guard.start_renewal();
-            let prior = backend.load(&config.pipeline.name)?;
+            let prior = tracing::info_span!(target: "loadsmith::state", "state.load", loadsmith.state.backend = %cfg.backend)
+                .in_scope(|| backend.load(&config.pipeline.name))?;
             (Some(backend), Some(guard), prior)
         }
         None => (None, None, None),
@@ -277,38 +283,11 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     // a plugin blocked writing progress to a full fd4 would stall the pump.
     // The destination's drain also forwards ObjectReady paths to the sink
     // supervisor (when a sink is attached); a raw source's drain forwards its
-    // files to the parser feed.
+    // files to the parser feed. Each drain also re-emits its plugin's
+    // telemetry through the plugin's scope.
     let src_event = tokio::fs::File::from_std(src_sp.event_fd_take());
     let dst_event = tokio::fs::File::from_std(dst_sp.event_fd_take());
-    let (src_mask, dst_mask) = (opts.mask.clone(), opts.mask.clone());
-    let src_events = tokio::spawn(async move {
-        drain_events(
-            ControlReader::new(BufReader::new(src_event)),
-            "source",
-            EventForward { object_tx: file_tx, checkpoint_tx, mask: src_mask, ..Default::default() },
-        )
-        .await;
-    });
-    let prs_events = prs_sp.as_mut().map(|sp| {
-        let event = tokio::fs::File::from_std(sp.event_fd_take());
-        let mask = opts.mask.clone();
-        tokio::spawn(async move {
-            drain_events(
-                ControlReader::new(BufReader::new(event)),
-                "parser",
-                EventForward { mask, ..Default::default() },
-            )
-            .await;
-        })
-    });
-    let dst_events = tokio::spawn(async move {
-        drain_events(
-            ControlReader::new(BufReader::new(dst_event)),
-            "destination",
-            EventForward { object_tx, committed_tx, mask: dst_mask, ..Default::default() },
-        )
-        .await;
-    });
+    let prs_event = prs_sp.as_mut().map(|sp| tokio::fs::File::from_std(sp.event_fd_take()));
 
     let mut src = Peer::new(PluginKind::Source.as_str(), src_sp).with_mask(opts.mask.clone());
     let mut prs = prs_sp.map(|sp| {
@@ -319,6 +298,37 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         peer
     });
     let mut dst = Peer::new(PluginKind::Destination.as_str(), dst_sp).with_mask(opts.mask.clone());
+
+    let (src_mask, dst_mask) = (opts.mask.clone(), opts.mask.clone());
+    let (src_scope, dst_scope) = (Some(src.scope().clone()), Some(dst.scope().clone()));
+    let src_events = tokio::spawn(async move {
+        drain_events(
+            ControlReader::new(BufReader::new(src_event)),
+            "source",
+            EventForward { object_tx: file_tx, checkpoint_tx, mask: src_mask, scope: src_scope, ..Default::default() },
+        )
+        .await;
+    });
+    let prs_events = prs_event.map(|event| {
+        let mask = opts.mask.clone();
+        let scope = prs.as_ref().map(|p| p.scope().clone());
+        tokio::spawn(async move {
+            drain_events(
+                ControlReader::new(BufReader::new(event)),
+                "parser",
+                EventForward { mask, scope, ..Default::default() },
+            )
+            .await;
+        })
+    });
+    let dst_events = tokio::spawn(async move {
+        drain_events(
+            ControlReader::new(BufReader::new(dst_event)),
+            "destination",
+            EventForward { object_tx, committed_tx, mask: dst_mask, scope: dst_scope, ..Default::default() },
+        )
+        .await;
+    });
     // With a parser, the source is a raw source: its files reach the parser
     // through the feed, and the parser is the producer.
     let mut feed: Option<Feed> = file_rx.map(|rx| Feed::new(rx, &timeouts));
@@ -421,8 +431,10 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         // files the instant the destination starts finalizing them. It consumes the
         // ObjectReady paths forwarded by the destination's event drain.
         if let (Some(bin), Some(cfg), Some(rx)) = (sink_bin, sink_config, object_rx) {
-            sink_task =
-                Some(tokio::spawn(run_sink_supervisor(bin, cfg, opts.unknown_keys, rx, timeouts, sink_shutdown, opts.mask.clone())));
+            sink_task = Some(tokio::spawn(
+                run_sink_supervisor(bin, cfg, opts.unknown_keys, rx, timeouts, sink_shutdown, opts.mask.clone())
+                    .in_current_span(),
+            ));
         }
 
         // Start the producer. A plain source answers `start` with its schema.
@@ -465,10 +477,11 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
             let run = StateRun {
                 pipeline: config.pipeline.name.clone(),
                 schema_hash,
-                run_id: new_run_id(),
+                run_id: opts.run_id.clone(),
                 checkpoint_interval: config.state.as_ref().map(|c| c.checkpoint_interval).unwrap_or(0),
             };
-            state_task = Some(tokio::spawn(run_state_supervisor(backend, guard, run, ck_rx, cm_rx)));
+            state_task = Some(tokio::spawn(run_state_supervisor(backend, guard, run, ck_rx, cm_rx).in_current_span()));
+
         }
 
         start_and_await_ready(&mut dst, &timeouts, &mut shutdown).await?;

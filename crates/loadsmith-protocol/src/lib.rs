@@ -76,7 +76,7 @@ pub enum Message {
     /// Plugin → core (event plane, fd4): one finished span, sent only when
     /// `configure.telemetry.enabled`. The core re-emits it under the run's
     /// trace (it is the only exporter).
-    Span(SpanData),
+    Span(Box<SpanData>),
     /// Plugin → core (event plane, fd4): delta-aggregated metric points,
     /// sent only when `configure.telemetry.enabled`.
     Metrics(MetricsBatch),

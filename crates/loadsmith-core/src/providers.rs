@@ -32,11 +32,13 @@ use loadsmith_config::{ConfigError, MaskList, ProviderRef, SecretRef, SecretValu
 use loadsmith_protocol::{capabilities, error_codes, FinishedStatus, Message, PluginKind, Resolve, UnknownKeys};
 use loadsmith_transport::ControlReader;
 use tokio::io::BufReader;
+use tracing::Instrument;
 
 use crate::{
     discovery::find_plugin_binary,
     error::CoreError,
-    events::{emit_log, hold_events},
+    events::{hold_events, release_held},
+
     lifecycle::{run_handshake_and_configure, start_and_await_ready},
     peer::{describe_exit, finished_failure, Event, Failure, Peer},
     shutdown::{Halt, Shutdown, ShutdownTrigger},
@@ -87,8 +89,29 @@ pub fn jobs_for(
 
 /// Runs every job and returns the resolved values. `timeouts` are the
 /// pipeline's (handshake, configure, start, cancel grace); each instance's
-/// own budget bounds its whole conversation.
+/// own budget bounds its whole conversation. Traced as `provider.resolve`.
 pub async fn resolve_providers(
+    jobs: Vec<ProviderJob>,
+    plugin_dir: &Path,
+    timeouts: &Timeouts,
+    mask: &MaskList,
+    shutdown: &Shutdown,
+) -> Result<SecretValues, CoreError> {
+    let span = tracing::info_span!(
+        target: "loadsmith::providers",
+        "provider.resolve",
+        loadsmith.provider.instances = jobs.len(),
+        loadsmith.provider.references = jobs.iter().map(|j| j.references.len()).sum::<usize>(),
+        error = tracing::field::Empty,
+    );
+    let result = resolve_all(jobs, plugin_dir, timeouts, mask, shutdown).instrument(span.clone()).await;
+    if let Err(e) = &result {
+        span.record("error", mask.apply(&e.to_string()));
+    }
+    result
+}
+
+async fn resolve_all(
     jobs: Vec<ProviderJob>,
     plugin_dir: &Path,
     timeouts: &Timeouts,
@@ -132,7 +155,10 @@ pub async fn resolve_providers(
 
     let mut set = tokio::task::JoinSet::new();
     for (job, bin) in jobs.into_iter().zip(bins) {
-        set.spawn(session(job, bin, *timeouts, mask.clone(), local.clone(), Arc::clone(&trigger)));
+        // Each provider process's span hangs under `provider.resolve`.
+        set.spawn(
+            session(job, bin, *timeouts, mask.clone(), local.clone(), Arc::clone(&trigger)).in_current_span(),
+        );
     }
 
     let mut values = SecretValues::new();
@@ -206,6 +232,7 @@ async fn session(
     let event = tokio::fs::File::from_std(sp.event_fd_take());
     let drain = tokio::spawn(hold_events(ControlReader::new(BufReader::new(event))));
     let mut peer = Peer::new(label, sp).with_mask(mask.clone());
+    let scope = peer.scope().clone();
 
     let limit = job.provider.timeout();
     let conversation = converse(&mut peer, config, job.unknown_keys, &job.references, &timeouts, &mut shutdown, &mask);
@@ -243,10 +270,8 @@ async fn session(
         }
     };
     // The provider is gone and every value it sent is in the mask.
-    if let Ok(logs) = drain.await {
-        for log in &logs {
-            emit_log(label, log, &mask);
-        }
+    if let Ok(held) = drain.await {
+        release_held(label, held, &mask, &scope);
     }
     release_held_stderr(held_stderr, &mask).await;
     outcome

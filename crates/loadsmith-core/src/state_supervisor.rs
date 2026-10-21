@@ -21,6 +21,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::error::CoreError;
 use crate::state::{LockGuard, StateBackend, StateDoc};
+use crate::telemetry;
 
 /// Identity + policy for the run whose state is being tracked.
 pub struct StateRun {
@@ -54,10 +55,15 @@ pub async fn run_state_supervisor(
     // The lease is renewed by the guard's own background task, started at
     // acquisition (`LockGuard::start_renewal`) — not here, so it also covers
     // the time before this supervisor exists (spawn, handshake, first query).
+    let mut latest_checkpoint: u64 = 0;
     while ckpt_open || commit_open {
         tokio::select! {
             ckpt = checkpoint_rx.recv(), if ckpt_open => match ckpt {
-                Some((seq, value)) => { watermark_at.insert(seq, value); }
+                Some((seq, value)) => {
+                    latest_checkpoint = latest_checkpoint.max(seq);
+                    watermark_at.insert(seq, value);
+                    telemetry::record_checkpoint_lag(latest_checkpoint.saturating_sub(last_persisted_seq));
+                }
                 None => ckpt_open = false,
             },
             commit = committed_rx.recv(), if commit_open => match commit {
@@ -70,9 +76,11 @@ pub async fn run_state_supervisor(
         if run.checkpoint_interval > 0 {
             if let Some((seq, value)) = safe_watermark(&watermark_at, durable_through) {
                 if seq >= last_persisted_seq + run.checkpoint_interval {
-                    persist(&*backend, &run, &value)?;
+                    let span = tracing::info_span!(target: "loadsmith::state", "checkpoint", loadsmith.batch.seq = seq);
+                    span.in_scope(|| persist(&*backend, &run, &value))?;
                     last_persisted_seq = seq;
                     persisted = Some(value);
+                    telemetry::record_checkpoint_lag(latest_checkpoint.saturating_sub(last_persisted_seq));
                 }
             }
         }
@@ -81,10 +89,13 @@ pub async fn run_state_supervisor(
     // Final flush: persist the latest safe watermark if it advanced.
     if let Some((seq, value)) = safe_watermark(&watermark_at, durable_through) {
         if seq > last_persisted_seq {
-            persist(&*backend, &run, &value)?;
+            let span = tracing::info_span!(target: "loadsmith::state", "state.commit", loadsmith.batch.seq = seq);
+            span.in_scope(|| persist(&*backend, &run, &value))?;
+            last_persisted_seq = seq;
             persisted = Some(value);
         }
     }
+    telemetry::record_checkpoint_lag(latest_checkpoint.saturating_sub(last_persisted_seq));
 
     drop(guard); // release the pipeline state lock
     Ok(persisted)
@@ -106,7 +117,10 @@ fn persist(backend: &dyn StateBackend, run: &StateRun, value: &Value) -> Result<
         run.schema_hash.clone(),
         run.run_id.clone(),
     );
+    let began = std::time::Instant::now();
     backend.store(&doc)?;
+    telemetry::record_state_commit(began.elapsed());
+
     tracing::debug!(pipeline = %run.pipeline, "persisted incremental watermark");
     Ok(())
 }

@@ -16,6 +16,7 @@ pub mod spawner;
 pub mod state;
 pub mod state_supervisor;
 pub mod summary;
+pub mod telemetry;
 
 pub use load::{load_pipeline, read_document, resolve_document, LoadOpts, Mode};
 pub use runner::{run_pipeline, RunOpts};

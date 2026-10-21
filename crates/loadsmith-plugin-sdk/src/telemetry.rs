@@ -630,7 +630,7 @@ where
             events: open.events,
             links: Vec::new(),
         };
-        self.rec.push(Message::Span(data), &self.rec.dropped_spans);
+        self.rec.push(Message::Span(Box::new(data)), &self.rec.dropped_spans);
     }
 }
 
@@ -903,7 +903,7 @@ pub(crate) mod tests {
     }
 
     fn spans(msgs: &[Message]) -> Vec<&SpanData> {
-        msgs.iter().filter_map(|m| if let Message::Span(s) = m { Some(s) } else { None }).collect()
+        msgs.iter().filter_map(|m| if let Message::Span(s) = m { Some(&**s) } else { None }).collect()
     }
 
     fn logs(msgs: &[Message]) -> Vec<&LogEvent> {

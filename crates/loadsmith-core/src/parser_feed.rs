@@ -93,7 +93,17 @@ impl Feed {
                     return Ok(());
                 }
                 tracing::debug!(path = %path.display(), "→ parser: parse_object");
+                // Handing a file to the parser (queued: the span is short;
+                // the parser's own `loadsmith.parse` span covers the work).
+                let _feed = tracing::info_span!(
+                    target: "loadsmith::parser_feed",
+                    parent: parser.scope().span(),
+                    "parser.feed",
+                    loadsmith.object.path = %path.display(),
+                )
+                .entered();
                 let msg = Message::ParseObject(ParseObject { path: path.to_string_lossy().into_owned() });
+
                 // Queued, never blocks. It fails only once the parser's
                 // stdin is gone, which the parser's fd1 reports.
                 if let Err(e) = parser.send(msg).await {

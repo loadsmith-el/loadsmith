@@ -34,6 +34,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::{
     error::CoreError,
     events::drain_events,
+    telemetry,
+
     lifecycle::{run_handshake_and_configure, start_and_await_ready},
     peer::{Event, Peer},
     shutdown::{Halt, Shutdown},
@@ -89,16 +91,21 @@ pub async fn run_sink_supervisor(
         let mut sp = spawn_plugin(&binary, None, StderrRoute::Forward(mask.clone()))
             .map_err(|e| CoreError::PluginIncompatible(format!("spawn sink: {e}")))?;
         let event = tokio::fs::File::from_std(sp.event_fd_take());
+        let mut peer = Peer::new(PluginKind::Sink.as_str(), sp).with_mask(mask.clone());
+        if restarts > 0 {
+            peer.scope().respawned(restarts);
+            peer.scope().event("respawn", vec![opentelemetry::KeyValue::new("loadsmith.plugin.respawns", i64::from(restarts))]);
+        }
         let event_mask = mask.clone();
+        let event_scope = Some(peer.scope().clone());
         let event_task = tokio::spawn(async move {
             drain_events(
                 loadsmith_transport::ControlReader::new(BufReader::new(event)),
                 PluginKind::Sink.as_str(),
-                crate::events::EventForward { mask: event_mask, ..Default::default() },
+                crate::events::EventForward { mask: event_mask, scope: event_scope, ..Default::default() },
             )
             .await;
         });
-        let mut peer = Peer::new(PluginKind::Sink.as_str(), sp).with_mask(mask.clone());
 
         let setup = async {
             let info = run_handshake_and_configure(
@@ -133,10 +140,12 @@ pub async fn run_sink_supervisor(
             emitted.iter().filter(|p| !delivered.contains(*p)).cloned().collect();
         if restarts > 0 && !pending.is_empty() {
             tracing::warn!(count = pending.len(), "resuming sink — re-sending unacked objects");
+            peer.scope().event("retry", vec![opentelemetry::KeyValue::new("loadsmith.objects", pending.len() as i64)]);
         }
         let mut send_failed = false;
+        let mut deliveries = Deliveries::default();
         for p in &pending {
-            if let Err(e) = send_deliver(&mut peer, p).await {
+            if let Err(e) = send_deliver(&mut peer, p, &mut deliveries).await {
                 tracing::warn!("re-send failed: {e}");
                 send_failed = true;
                 break;
@@ -154,9 +163,11 @@ pub async fn run_sink_supervisor(
                 &mut delivered,
                 &mut input_closed,
                 &mut shutdown,
+                &mut deliveries,
             )
             .await
         };
+        deliveries.abandon();
 
         // Tear the instance down regardless of outcome.
         match &outcome {
@@ -202,6 +213,7 @@ pub async fn run_sink_supervisor(
                     )));
                 }
                 tracing::warn!(restarts, reason, "sink stopped — respawning");
+                telemetry::record_respawn(PluginKind::Sink.as_str());
                 // Loop respawns and resumes from the ledger.
             }
         }
@@ -222,6 +234,7 @@ async fn drive_instance(
     delivered: &mut HashSet<PathBuf>,
     input_closed: &mut bool,
     shutdown: &mut Shutdown,
+    deliveries: &mut Deliveries,
 ) -> Driven {
     let mut input_open = true;
     let mut awaiting_pong = false;
@@ -245,7 +258,7 @@ async fn drive_instance(
                         if !delivered.contains(&path) && !emitted.contains(&path) {
                             emitted.push(path.clone());
                             if input_open {
-                                if let Err(e) = send_deliver(peer, &path).await {
+                                if let Err(e) = send_deliver(peer, &path, deliveries).await {
                                     return Driven::Recoverable(format!("deliver send failed: {e}"));
                                 }
                             }
@@ -264,7 +277,9 @@ async fn drive_instance(
                 };
                 match event {
                     Event::Msg(Message::ObjectDelivered(d)) => {
-                        delivered.insert(PathBuf::from(d.path));
+                        let path = PathBuf::from(d.path);
+                        deliveries.done(&path);
+                        delivered.insert(path);
                     }
                     Event::Msg(Message::Pong) => {
                         awaiting_pong = false;
@@ -285,7 +300,7 @@ async fn drive_instance(
                                 emitted.iter().filter(|p| !delivered.contains(*p)).cloned().collect();
                             tracing::debug!(count = pending.len(), "sink asked for a resend");
                             for p in &pending {
-                                if let Err(e) = send_deliver(peer, p).await {
+                                if let Err(e) = send_deliver(peer, p, deliveries).await {
                                     return Driven::Recoverable(format!("re-send failed: {e}"));
                                 }
                             }
@@ -310,7 +325,41 @@ async fn drive_instance(
     }
 }
 
-async fn send_deliver(peer: &mut Peer, path: &Path) -> Result<(), CoreError> {
+async fn send_deliver(peer: &mut Peer, path: &Path, deliveries: &mut Deliveries) -> Result<(), CoreError> {
+    deliveries.start(peer, path);
     peer.send(Message::DeliverObject(DeliverObject { path: path.to_string_lossy().into_owned() }))
         .await
+}
+
+/// The `sink.deliver` spans in flight: from `deliver_object` to the sink's
+/// `object_delivered`, under the sink process's span.
+#[derive(Default)]
+struct Deliveries(std::collections::HashMap<PathBuf, tracing::Span>);
+
+impl Deliveries {
+    fn start(&mut self, peer: &Peer, path: &Path) {
+        if !telemetry::traces_enabled() {
+            return;
+        }
+        let span = tracing::info_span!(
+            target: "loadsmith::sink",
+            parent: peer.scope().span(),
+            "sink.deliver",
+            loadsmith.object.path = %path.display(),
+            error = tracing::field::Empty,
+        );
+        self.0.insert(path.to_path_buf(), span);
+    }
+
+    fn done(&mut self, path: &Path) {
+        self.0.remove(path);
+    }
+
+    /// The instance is gone: what it did not acknowledge failed (it is
+    /// re-sent to the next instance, under a new span).
+    fn abandon(&mut self) {
+        for (_, span) in self.0.drain() {
+            span.record("error", "not acknowledged by the sink");
+        }
+    }
 }

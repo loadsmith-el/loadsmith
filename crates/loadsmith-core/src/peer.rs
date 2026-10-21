@@ -25,6 +25,7 @@ use tokio::time::Instant;
 use crate::error::CoreError;
 use crate::shutdown::{Halt, Shutdown};
 use crate::spawner::SpawnedPlugin;
+use crate::telemetry::PluginScope;
 
 /// One line (or the end) of a plugin's fd1.
 #[derive(Debug)]
@@ -116,12 +117,24 @@ pub struct Peer {
     /// Resolved template values to redact from the texts this plugin sends
     /// (`configure_ack`/`finished` messages, unexpected messages).
     mask: MaskList,
+    /// The plugin process's place in the run's trace.
+    scope: PluginScope,
+}
+
+/// The plugin kind behind a peer label (`source`, `provider 'vault'`, …).
+fn kind_of(label: &'static str) -> &'static str {
+    loadsmith_protocol::PluginKind::ALL
+        .into_iter()
+        .map(|k| k.as_str())
+        .find(|k| label.starts_with(k))
+        .unwrap_or(label)
 }
 
 impl Peer {
     /// Wraps a spawned plugin whose event fd (fd4) was already taken.
     pub fn new(label: &'static str, plugin: SpawnedPlugin) -> Self {
         let SpawnedPlugin { child, control_in, control_out, .. } = plugin;
+        let scope = PluginScope::new(kind_of(label), label, child.id());
         let (tx, rx) = mpsc::unbounded_channel();
         let reader_task = tokio::spawn(async move {
             let mut reader = ControlReader::new(BufReader::new(control_out));
@@ -154,7 +167,14 @@ impl Peer {
             exit: None,
             replay_on_resend: true,
             mask: MaskList::new(),
+            scope,
         }
+    }
+
+    /// The plugin process's telemetry scope (its span; what its fd4 drain
+    /// forwards spans, metrics and logs through).
+    pub fn scope(&self) -> &PluginScope {
+        &self.scope
     }
 
     pub fn label(&self) -> &'static str {
@@ -254,6 +274,7 @@ impl Peer {
                     Message::Resend(_) if self.replay_on_resend => {
                         if let Some(last) = self.last_sent.clone() {
                             tracing::debug!(plugin = self.label, "plugin asked for a resend");
+                            self.scope.event("resend", vec![opentelemetry::KeyValue::new("loadsmith.requested_by", "plugin")]);
                             // A failed write surfaces as EOF on fd1 soon after.
                             let _ = self.send_raw(&last).await;
                         }
@@ -280,6 +301,9 @@ impl Peer {
                     ));
                 }
                 tracing::warn!(plugin = self.label, "malformed control line, asking for a resend: {reason}");
+                self.scope.event("resend", vec![opentelemetry::KeyValue::new("loadsmith.requested_by", "core")]);
+
+
                 let _ = self.send_raw(&Message::Resend(Resend { reason: Some(reason) })).await;
                 Ok(None)
             }
@@ -362,6 +386,14 @@ impl Peer {
             None => Message::Cancel(Cancel { reason: reason.into() }),
         };
         tracing::debug!(plugin = self.label, ?msg, "→ abort");
+        let reason_attr = opentelemetry::KeyValue::new("loadsmith.reason", reason.to_string());
+        match code {
+            Some(code) => {
+                self.scope.failed(reason);
+                self.scope.event("error", vec![reason_attr, opentelemetry::KeyValue::new("loadsmith.code", code.to_string())]);
+            }
+            None => self.scope.event("cancel", vec![reason_attr]),
+        }
         if let Err(e) = self.send(msg).await {
             tracing::debug!(plugin = self.label, "could not deliver the abort: {e}");
         }

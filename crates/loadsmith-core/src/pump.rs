@@ -21,6 +21,9 @@ use std::sync::Arc;
 
 use loadsmith_arrow::{IpcReader, IpcWriter};
 
+use crate::telemetry;
+
+
 /// Totals observed by the pump as data flowed through it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PumpStats {
@@ -107,14 +110,20 @@ where
     loop {
         match reader.read_batch() {
             Ok(Some(batch)) => {
-                stats.rows += batch.num_rows() as u64;
+                let rows = batch.num_rows() as u64;
+                let bytes = if telemetry::enabled() { batch.get_array_memory_size() as u64 } else { 0 };
+                stats.rows += rows;
                 stats.batches += 1;
                 control.batches.store(stats.batches, Ordering::Relaxed);
+                telemetry::record_batch("read", rows, bytes);
                 if !control.abort.load(Ordering::Relaxed) {
                     if let Some(w) = writer.as_mut() {
-                        if let Err(e) = w.write_batch(&batch) {
-                            write_error = Some(format!("write batch: {e}"));
-                            writer = None;
+                        match w.write_batch(&batch) {
+                            Ok(()) => telemetry::record_batch("written", rows, bytes),
+                            Err(e) => {
+                                write_error = Some(format!("write batch: {e}"));
+                                writer = None;
+                            }
                         }
                     }
                 }
