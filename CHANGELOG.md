@@ -9,6 +9,8 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+## [1.0.0-rc.1] - 2026-10-21
+
 ### Added
 
 - **OpenTelemetry.** Traces, metrics and logs of every run, exported over
@@ -347,5 +349,6 @@ release notes in their repositories.
 - The hermetic `Dockerfile` gains the same targets.
 - Container Images documentation page.
 
-[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.0-rc.1...HEAD
+[1.0.0-rc.1]: https://github.com/loadsmith-el/loadsmith/compare/v0.2.0...v1.0.0-rc.1
 [0.2.0]: https://github.com/loadsmith-el/loadsmith/compare/v0.1.1...v0.2.0
