@@ -28,7 +28,8 @@ Sent by the **plugin** in response to `handshake`.
   "plugin_name": "loadsmith-source-postgres",
   "plugin_version": "0.2.1",
   "protocol_supported_versions": [1],
-  "kind": "source"
+  "kind": "source",
+  "telemetry": 1
 }
 ```
 
@@ -38,6 +39,7 @@ Sent by the **plugin** in response to `handshake`.
 | `plugin_version` | string | Semver version string |
 | `protocol_supported_versions` | array of integers | Protocol versions this plugin understands |
 | `kind` | string | One of: `"source"`, `"destination"`, `"sink"`, `"parser"`, `"provider"`. A raw source is a `"source"`. The same spelling names the binary: `loadsmith-<kind>-<type>` |
+| `telemetry` | integer (optional) | The [telemetry](#telemetry-on-the-event-channel) revision the plugin speaks (`1`). Absent: the plugin gets no `configure.telemetry` and sends no `span`/`metrics`. The Rust SDK always sends `1` |
 
 ---
 
@@ -119,7 +121,13 @@ template resolution.
     "query": "SELECT * FROM orders",
     "batch_size": 2000
   },
-  "unknown_keys": "error"
+  "unknown_keys": "error",
+  "telemetry": {
+    "enabled": true,
+    "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+    "log_level": "info",
+    "metrics_interval_ms": 15000
+  }
 }
 ```
 
@@ -127,6 +135,7 @@ template resolution.
 |---|---|---|
 | `config` | object | Arbitrary JSON — the plugin's configuration |
 | `unknown_keys` | string (optional) | What the plugin does with a key of `config` it does not recognise, at any depth: `"error"` (the default) rejects the config with `configure_ack` `error` (code `UNKNOWN_CONFIG_KEYS`), naming every unknown key path; `"warn"` logs one `warn` event per unknown key on fd4 and ignores it. Absent, or a value the plugin does not know, means `"error"` |
+| `telemetry` | object (optional) | Sent only to a plugin that advertised `handshake_ack.telemetry`, and only when the run exports telemetry. `enabled` (bool); `traceparent` (optional, W3C: the core's span for this plugin process — the parent of the plugin's top-level spans; flag `00` = not sampled: record no spans); `tracestate` (optional, W3C, verbatim); `log_level` (minimum level of the `log` lines to send with trace context, default `info`); `metrics_interval_ms` (optional, how often to flush `metrics`). Absent, `enabled: false`, or a shape the plugin cannot read ⇒ the plugin records nothing (never a failed `configure`). See [telemetry](#telemetry-on-the-event-channel) |
 
 `unknown_keys` is how the operator's choice reaches every plugin: the core
 sends `"warn"` when the run was started with `--ignore-unknown-keys` (or
@@ -350,19 +359,90 @@ Structured log event from a plugin.
 
 ```json
 {"type": "log", "level": "info", "message": "cursor opened, fetching batches"}
+{"type": "log", "level": "warn", "message": "slow query", "trace_id": "0af7651916cd43dd8448eb211c80319c",
+ "span_id": "00f067aa0ba902b7", "time_unix_nano": 1792612760627164860, "attributes": {"db.namespace": "public"}}
 ```
 
 | Field | Type | Values |
 |---|---|---|
 | `level` | string | `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"` |
 | `message` | string | Human-readable message |
+| `trace_id` | string (optional) | Telemetry: 32 hex digits, the run's trace |
+| `span_id` | string (optional) | Telemetry: 16 hex digits, the plugin span (or the core's span for the plugin) the line belongs to |
+| `time_unix_nano` | integer (optional) | When it happened |
+| `attributes` | object (optional) | Structured fields (strings, booleans, numbers, arrays of one of those) |
 
 The core logs `message` with every resolved `env()`/`file()`/`secret()` value
 masked (`***`). A provider's log lines are held until its conversation is over
 and masked then, so a value it logs before the core read its `resolved` is
-masked too.
+masked too. With telemetry on, the core also exports the line as an OTLP log
+record (masked, with its trace context; without one, the plugin process's
+span's).
 
 ---
+
+### Telemetry on the event channel
+
+Part of protocol v1, additive: only a plugin that advertised
+`handshake_ack.telemetry` and received `configure.telemetry.enabled: true`
+sends these; a core that predates them skips them as unknown types. The core
+is the only exporter: it re-emits them under the run's trace, masked. Design:
+[Telemetry](../architecture/telemetry.md). Bound the volume: spans per
+query, batch, request or file — never per row.
+
+#### `span`
+
+One finished span, sent when it closes.
+
+```json
+{"type": "span", "trace_id": "0af7651916cd43dd8448eb211c80319c", "span_id": "53995c3f42cd8ad8",
+ "parent_span_id": "b7ad6b7169203331", "name": "SELECT orders", "kind": "client",
+ "start_unix_nano": 1792612760600000000, "end_unix_nano": 1792612760627164860,
+ "status": {"code": "error", "message": "connection reset"},
+ "attributes": {"db.system.name": "postgresql", "db.namespace": "shop", "db.response.returned_rows": 2000},
+ "events": [{"name": "retry", "time_unix_nano": 1792612760610000000, "attributes": {"attempt": 2}}],
+ "links": [{"trace_id": "…", "span_id": "…", "attributes": {}}]}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `trace_id` | string | 32 lower-case hex digits: the trace of `configure.telemetry.traceparent` |
+| `span_id` | string | 16 hex digits, unique in the trace; kept by the core (children and log lines refer to it) |
+| `parent_span_id` | string (optional) | The parent: another span of this plugin, or the `traceparent` span. Absent: the core parents it on the plugin process's span |
+| `name` | string | Span name (semantic-convention style: `SELECT orders`, `GET`, `loadsmith.batch`) |
+| `kind` | string (optional) | `internal` (default), `client`, `server`, `producer`, `consumer`; unknown ⇒ `internal` |
+| `start_unix_nano`, `end_unix_nano` | integer | Timestamps (ns since the Unix epoch) |
+| `status` | object (optional) | `code`: `unset` (default), `ok`, `error` (unknown ⇒ `unset`); `message` with `error` |
+| `attributes` | object (optional) | Attribute values: string, boolean, integer, float, or an array of one of those; anything else is dropped |
+| `events` | array (optional) | `{name, time_unix_nano, attributes?}` |
+| `links` | array (optional) | `{trace_id, span_id, attributes?}` |
+
+#### `metrics`
+
+Data points aggregated in the plugin since the previous `metrics` (delta
+temporality), sent periodically (`configure.telemetry.metrics_interval_ms`) and
+once more before the plugin exits.
+
+```json
+{"type": "metrics", "points": [
+  {"name": "loadsmith.plugin.rows", "unit": "{row}", "kind": "counter", "temporality": "delta",
+   "attributes": {"direction": "read"}, "value": 4000},
+  {"name": "db.client.operation.duration", "unit": "s", "kind": "histogram", "temporality": "delta",
+   "attributes": {"db.namespace": "shop"},
+   "histogram": {"count": 2, "sum": 0.31, "min": 0.12, "max": 0.19,
+                 "bucket_counts": [0, 0, 0, 0, 0, 0, 2, 0], "explicit_bounds": [0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25]}}]}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | string | Instrument name (`loadsmith.plugin.*`, or a semantic-convention name) |
+| `unit`, `description` | string (optional) | UCUM unit (`s`, `By`, `{row}`) and text |
+| `kind` | string | `counter`, `up_down_counter`, `histogram`, `gauge`; unknown ⇒ the point is skipped |
+| `temporality` | string (optional) | `delta` (default, the only one defined); anything else ⇒ skipped |
+| `attributes` | object (optional) | As for spans. The core adds `loadsmith.plugin.name`, `.kind`, `.version` |
+| `value` | number | Counter / up-down counter: the sum over the interval; gauge: the last value |
+| `histogram` | object | `count`, `sum`, `min`, `max`, `bucket_counts` (one more than `explicit_bounds`; bucket *i* holds `bounds[i-1] < v ≤ bounds[i]`), `explicit_bounds` |
+
 
 ### `object_ready`
 

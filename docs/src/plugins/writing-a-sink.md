@@ -117,7 +117,21 @@ and release it, so `loadsmith plugin install` can fetch it. A canonical plugin i
 also picked up by the `-bundled` image, which runs `loadsmith plugin install --all`
 against the canonical index.
 
+## Telemetry
+
+When the run has telemetry on, `run_sink` records spans `configure`, `start`
+(`prepare()`), one `loadsmith.deliver` per `deliver()`
+(`loadsmith.object.path`) and `finish` (`finalize()`); a failing step marks
+its span `error`. The core adds its own `sink.deliver` span (from
+`deliver_object` to `object_delivered`), and `respawn`/`retry` events when it
+restarts a crashed sink. Add spans for the remote calls with `tracing`
+(an HTTP API: one `client` span per request with `http.request.method`,
+`url.full` without secrets, `http.response.status_code`, and a `retry` event
+per retry). The API, the rules and the conventions table are in
+[Writing a source → Telemetry](writing-a-source.md#telemetry).
+
 ## End-to-end testing
+
 
 A sink is exercised by attaching it to a file-output destination. Add a
 loadsmith-lab case whose pipeline stages Parquet and delivers it:

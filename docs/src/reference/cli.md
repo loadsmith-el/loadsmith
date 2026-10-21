@@ -24,6 +24,7 @@ loadsmith run pipeline.yaml --log-level debug
 loadsmith run pipeline.yaml --no-color
 loadsmith run pipeline.yaml --output json                # one JSON run summary on stdout
 loadsmith run pipeline.yaml --summary-file run.json     # human report on stdout, JSON in a file
+loadsmith run pipeline.yaml --otel-endpoint http://otel-collector:4318   # export traces, metrics, logs
 ```
 
 **Arguments:**
@@ -42,6 +43,10 @@ loadsmith run pipeline.yaml --summary-file run.json     # human report on stdout
 | `--output <human\|json>` | `human` | What stdout carries: the human report, or one JSON [run summary](#machine-readable-run-summary) instead |
 | `--summary-file <path>` | — | Also write the JSON [run summary](#machine-readable-run-summary) to this file, whatever `--output` says |
 | `--ignore-unknown-keys[=<bool>]` | off | Warn about [unknown keys](#unknown-keys) and ignore them instead of failing (exit `3`). Also `LOADSMITH_IGNORE_UNKNOWN_KEYS=1`; the flag wins |
+| `--otel-endpoint <url>` | — | [Telemetry](#telemetry-flags): export traces, metrics and logs over OTLP to this endpoint (turns telemetry on) |
+| `--otel-protocol <grpc\|http-protobuf>` | `http-protobuf` | Telemetry transport |
+| `--otel-header <key=value>` | — | Telemetry export header (gRPC metadata); repeatable; values masked |
+| `--no-telemetry` | off | No telemetry for this run, whatever the file and the environment say |
 
 **Exit codes:** see [Exit codes](#exit-codes). A run that fails once data is
 flowing prints the summary with `Status: error` and a `Cause:` line; a run that
@@ -83,6 +88,29 @@ Keep the grace period below your orchestrator's (see
 - **stderr** — tracing output at the configured log level, including the schema
   and the progress lines at doubling batch intervals (timestamped `INFO`
   records). Includes the full protocol handshake at `--log-level debug`.
+
+### Telemetry flags
+
+With telemetry on, the run's traces (one trace per run: `loadsmith.run`, a
+span per plugin process, the plugins' own spans), metrics and logs are exported
+over OTLP — see [Telemetry](../architecture/telemetry.md) and the
+[`telemetry:` block](pipeline-yaml.md#telemetry). The flags win over the block,
+which wins over the standard `OTEL_*` variables.
+
+| Flag | Overrides | Description |
+|---|---|---|
+| `--otel-endpoint <url>` | `telemetry.endpoint`, `OTEL_EXPORTER_OTLP_ENDPOINT` | `http(s)://` base URL; turns telemetry on unless `telemetry.enabled: false` |
+| `--otel-protocol <p>` | `telemetry.protocol`, `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` or `http-protobuf` (also spelled `http/protobuf`) |
+| `--otel-header <k=v>` | same key in `telemetry.headers` / `OTEL_EXPORTER_OTLP_HEADERS` | Repeatable. A value without `=` is a usage error (exit `2`). Values are masked everywhere |
+| `--no-telemetry` | everything | Telemetry off |
+
+An invalid telemetry setting (a non-HTTP endpoint, an unknown protocol in
+`OTEL_EXPORTER_OTLP_PROTOCOL`, a bad sampler) is a configuration error (exit
+`3`). A collector that is down or refuses the data never fails the run: the
+first failed export is reported once on stderr and the run goes on. At exit,
+every signal is flushed within the export timeout (and within
+`cancel_grace_seconds` after SIGINT/SIGTERM). `--print-resolved-config` shows
+the effective `telemetry:` block, header values masked.
 
 ### Machine-readable run summary
 
@@ -158,6 +186,7 @@ not applicable.
 | `started_at`, `finished_at` | string | UTC timestamps, RFC 3339 with milliseconds (`2026-10-20T14:03:08.398Z`) |
 | `state` | object \| null | With a `state:` block: `watermark_before` (the cursor loaded at start, `null` if none) and `watermark_after` (the cursor in the state after the run: the one this run persisted, else unchanged). The values are the opaque cursors, verbatim. `null` without a `state:` block |
 | `sink` | object \| null | With a `sink:` block: `objects_delivered` (`null` if delivery did not complete). `null` without a sink |
+| `trace_id` | string | Only when the run's traces were exported ([telemetry](#telemetry-flags)): the OpenTelemetry trace id of the run (32 hex digits). Absent otherwise |
 
 If `--summary-file` cannot be written, the error is reported on stderr and a
 run that otherwise succeeded exits `1`.
@@ -226,6 +255,7 @@ loadsmith validate pipeline.yaml --resolve --plugin-dir /opt/loadsmith/plugins
 | `--resolve` | off | Also resolve every template: read the `env()`/`file()` values and run the provider instances the `secret()` calls reference |
 | `--plugin-dir <path>` | `~/.loadsmith/plugins/` | Where `--resolve` finds provider binaries |
 | `--ignore-unknown-keys[=<bool>]` | off | Warn about [unknown keys](#unknown-keys) in the file's own blocks and ignore them. Also `LOADSMITH_IGNORE_UNKNOWN_KEYS=1`; the flag wins |
+| `--otel-endpoint`, `--otel-protocol`, `--otel-header`, `--no-telemetry` | — | As for `run`, [checked](#telemetry-flags) but nothing is exported: statically the flags and the `OTEL_*` variables; with `--resolve` also the resolved `telemetry:` block |
 
 **What is checked (always):**
 1. YAML syntax is valid
@@ -482,6 +512,8 @@ checksum, a manifest whose `protocol` range this engine does not support) exit
 | `NO_COLOR` | `--no-color` | Disable ANSI color (when set, to any value — even empty) |
 | `LOADSMITH_IGNORE_UNKNOWN_KEYS` | `--ignore-unknown-keys` | `1`/`true`/`yes`/`on`: warn about [unknown keys](#unknown-keys) and ignore them (`run`, `validate`, `state show`, `state rm`). The flag, when given, wins |
 | Any variable in `{{ env('NAME') }}` | — | Injected into pipeline template resolution |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_{TRACES,METRICS,LOGS}_EXPORTER=none`, `OTEL_TRACES_SAMPLER(_ARG)`, `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SDK_DISABLED` | [`telemetry:`](pipeline-yaml.md#telemetry) | The standard OpenTelemetry variables, below the `telemetry:` block and the [telemetry flags](#telemetry-flags) |
+
 
 Either `--no-color` or `NO_COLOR` disables color. The plugin directory has no
 environment variable: use `--plugin-dir`.

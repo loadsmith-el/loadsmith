@@ -343,8 +343,11 @@ You don't emit progress yourself: after each `next_batch()` the SDK sends a
 
 The SDK does not hand plugins a handle for custom fd4 `log` events today — no
 `SourcePlugin` method receives an `EventSender`, and opening your own fd4 writer
-would race the SDK's. For diagnostics, log with `tracing` to stderr, which the
-plugin inherits from the core.
+would race the SDK's. Log with `tracing` (`tracing::info!`, `warn!`): when the
+run exports [telemetry](#telemetry), those events reach the core as `log` lines
+with trace context (the core prints them, masked, and exports them). Without
+telemetry they are not forwarded; text written to stderr (`eprintln!`) is
+always copied, masked, to the engine's stderr.
 
 ## Streaming, not slurping
 
@@ -373,7 +376,53 @@ async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
 }
 ```
 
+## Telemetry
+
+The core exports traces, metrics and logs; a plugin only records, in-process
+— no OTLP or network code ([design](../architecture/telemetry.md)). When the
+run has telemetry on, the SDK's `run_source` records for you:
+
+- spans `configure`, `start` (`resume_from` + `schema()`), one
+  `loadsmith.batch` per `next_batch()` (`loadsmith.batch.seq`, `.rows`,
+  `.bytes`, `direction=read`), `finish`; a failing step marks its span
+  `error`;
+- metrics `loadsmith.plugin.rows`, `.batches`, `.bytes` and the
+  `loadsmith.plugin.batch.duration` histogram.
+
+Add your own with `tracing` spans and the SDK's instruments — they hang under
+the batch span they run in:
+
+```rust
+use loadsmith_plugin_sdk::telemetry::{histogram, kv};
+
+let span = tracing::info_span!("SELECT orders", otel.kind = "client", db.system.name = "mysql",
+    db.namespace = %db, db.collection.name = "orders", db.response.returned_rows = tracing::field::Empty);
+let rows = fetch().instrument(span.clone()).await?;          // tracing::Instrument
+span.record("db.response.returned_rows", rows.len());
+histogram("db.client.operation.duration").with_unit("s").record(took, &[kv("db.system.name", "mysql")]);
+```
+
+Rules: spans at `INFO` or above only; one span per query, batch, request or
+file — never per row (the SDK keeps at most 1000 spans per second and counts
+what it drops in `loadsmith.telemetry.dropped`). Name things after the
+OpenTelemetry semantic conventions:
+
+| Plugin | Span name | Attributes / metric |
+|---|---|---|
+| database | `<operation> <collection>` (`SELECT orders`), `otel.kind = "client"` | `db.system.name`, `db.namespace`, `db.collection.name`, `db.operation.name`, `db.query.text` (the generated statement only, never bound values), `db.response.returned_rows`; histogram `db.client.operation.duration` (s) |
+| HTTP API | `GET` / `POST`, `otel.kind = "client"` | `http.request.method`, `url.full` (no secrets in the query), `http.response.status_code`, `error.type`; histogram `http.client.request.duration` (s) |
+| files | `write <file>` / `read <file>` | `file.path`, `file.size`; `loadsmith.object.rows` |
+
+Special fields: `otel.name` (a dynamic span name), `otel.kind`,
+`otel.status_code` (`ok`/`error`), `otel.status_message`, and `error` (marks
+the span failed). Every text you record is masked by the core with the run's
+resolved secrets before export — but never record a credential on purpose.
+`telemetry::enabled()` says whether anything is recorded (skip expensive
+attribute formatting when it is off). If your plugin sets its own global
+`tracing` subscriber, add `loadsmith_plugin_sdk::telemetry::layer()` to it.
+
 ## End-to-end testing
+
 
 Do not wire your new plugin into a pipeline by hand to test it. The right
 approach is a **loadsmith-lab** case:

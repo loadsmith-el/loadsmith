@@ -307,7 +307,25 @@ values. Types outside the [protocol vocabulary](../protocol/messages.md#schema)
 (`union`, `run_end_encoded`, list views) become `null`. The full table is in
 the `loadsmith_arrow::convert` module docs.
 
+## Telemetry
+
+When the run has telemetry on, `run_destination` records spans `configure`,
+`start` (`prepare()`), one `loadsmith.batch` per `write_batch()`
+(`direction=written`, rows, bytes) and `finish` (`finalize()`), plus the
+`loadsmith.plugin.*` batch metrics; a failing step marks its span `error`. The
+core exports them under the run's trace — the plugin carries no OTLP code.
+Add your own spans with `tracing` and metrics with
+`loadsmith_plugin_sdk::telemetry::{counter, histogram, gauge}`, following the
+OpenTelemetry semantic conventions — for a database, one `client` span per
+statement, COPY, batch insert or merge phase (`db.system.name`,
+`db.namespace`, `db.collection.name`, `db.operation.name`, `db.query.text` =
+the generated statement, never bound values) and the
+`db.client.operation.duration` histogram; for files, one span per file
+written. Never one per row. The API, the rules and the conventions table are
+in [Writing a source → Telemetry](writing-a-source.md#telemetry).
+
 ## End-to-end testing
+
 
 Add a loadsmith-lab case (in `loadsmith-lab-canonical-catalog/cases/`, or a
 directory passed with `--cases-dir`) to verify your destination against a real

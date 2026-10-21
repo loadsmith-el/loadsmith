@@ -54,6 +54,18 @@ state:                    # optional — incremental state (core-owned watermark
   on_schema_change: string  # optional — "refuse" (default) | "continue"
   checkpoint_interval: int  # optional — persist at most once per N durably-
                             #   committed batches; 0 ⇒ only at end of run
+
+telemetry:                # optional — OpenTelemetry export (env()/file(), never secret())
+  enabled: bool           #   default: on exactly when an endpoint is resolved
+  endpoint: string        #   OTLP endpoint (base URL)
+  protocol: string        #   "http-protobuf" (default) | "grpc"
+  headers: {k: v}         #   export headers / gRPC metadata; values masked
+  timeout_seconds: int    #   per export. Default: 10
+  signals: [string]       #   subset of traces, metrics, logs. Default: all
+  sampling: { ratio: float }  # parent-based trace ratio 0.0–1.0. Default: 1.0
+  metrics_interval_seconds: int  # metric export interval. Default: 15
+  log_level: string       #   minimum level exported as logs. Default: info
+  resource: {k: scalar}   #   resource attributes (e.g. deployment.environment.name)
 ```
 
 ## Strictness: unknown keys
@@ -248,6 +260,46 @@ state:
 `loadsmith state show pipeline.yaml` prints the current watermark; `loadsmith
 state rm pipeline.yaml` clears it (the next run is a full read).
 
+### `telemetry`
+
+Optional. Exports the run's **traces, metrics and logs** over OTLP to an
+OpenTelemetry Collector (or any OTLP backend). The core is the only exporter:
+plugins send their spans, metrics and logs to the core, never to the network.
+Off unless an endpoint is resolved. Design, span tree and metric names:
+[Telemetry](../architecture/telemetry.md).
+
+Every field is optional. Precedence: CLI flags (`--otel-endpoint`,
+`--otel-protocol`, `--otel-header`, `--no-telemetry`) > this block > the
+standard `OTEL_*` environment variables > defaults.
+
+| Field | Type | Default | Description / environment fallback |
+|---|---|---|---|
+| `enabled` | bool | on iff an endpoint is resolved | `false` always wins (so does `--no-telemetry`). `true` without any endpoint uses the OTel default (`http://localhost:4318`, gRPC `:4317`). `OTEL_SDK_DISABLED=true` turns it off unless this block or a flag turns it on. |
+| `endpoint` | URL | — | `http://` or `https://` base URL. For `http-protobuf`, `/v1/traces`, `/v1/metrics`, `/v1/logs` are appended. Fallback: `OTEL_EXPORTER_OTLP_ENDPOINT`, then the per-signal `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT` (used as is). |
+| `protocol` | `http-protobuf` / `grpc` | `http-protobuf` | Fallback: `OTEL_EXPORTER_OTLP_PROTOCOL` (`http/protobuf` or `grpc`; anything else is a config error). |
+| `headers` | map | — | Merged over `OTEL_EXPORTER_OTLP_HEADERS`; `--otel-header` wins. Values are always masked. |
+| `timeout_seconds` | int ≥ 1 | 10 | Per export, and the bound of the final flush. Fallback: `OTEL_EXPORTER_OTLP_TIMEOUT` (ms). |
+| `signals` | list | all | Any of `traces`, `metrics`, `logs`. Without it, `OTEL_{TRACES,METRICS,LOGS}_EXPORTER=none` drops a signal. |
+| `sampling.ratio` | 0.0–1.0 | 1.0 | Parent-based trace-id ratio (per run). Fallback: `OTEL_TRACES_SAMPLER` (`always_on`, `always_off`, `traceidratio`, and their `parentbased_` forms) with `OTEL_TRACES_SAMPLER_ARG`. |
+| `metrics_interval_seconds` | int ≥ 1 | 15 | Fallback: `OTEL_METRIC_EXPORT_INTERVAL` (ms). A final export always happens at the end of the run. |
+| `log_level` | `trace`…`error` | `info` | Minimum level exported as OTLP logs, for the core and the plugins. stderr (`--log-level`) is unaffected. |
+| `resource` | map of scalars | — | Resource attributes, merged over `OTEL_RESOURCE_ATTRIBUTES` and `OTEL_SERVICE_NAME`. Default `service.name` is `loadsmith`. |
+
+`OTEL_EXPORTER_OTLP_CERTIFICATE` (a PEM CA bundle) is trusted besides the web
+roots. Like `pipeline:`, `state:` and `providers:`, this block is resolved
+before the providers start (so their resolution is traced): it may use `env()`
+and `file()`, never `secret()`.
+
+An export that fails (collector down, wrong endpoint) never fails the run: it
+is reported once on stderr, and the run goes on.
+
+```yaml
+telemetry:
+  endpoint: https://otel-collector.observability:4318
+  headers: { authorization: "Bearer {{ env('OTEL_TOKEN') }}" }
+  resource: { deployment.environment.name: prod }
+```
+
 ## Template syntax
 
 Any string value anywhere in the file (including the `config` sections,
@@ -333,10 +385,12 @@ Rules:
 
 - the instance must be declared under `providers:` — an undeclared one is a
   static error (`loadsmith validate` catches it, exit `3`);
-- `secret()` is not allowed in `pipeline:`, `state:` or `providers:`: those
-  blocks resolve without providers (`loadsmith state show|rm` read only
-  `pipeline:` and `state:`, and a provider's own config is resolved before it
-  starts);
+- `secret()` is not allowed in `pipeline:`, `state:`, `providers:` or
+  `telemetry:`: those blocks resolve without providers (`loadsmith state
+  show|rm` read only `pipeline:` and `state:`, a provider's own config is
+  resolved before it starts, and telemetry is set up before the providers so
+  that they run inside the traced run);
+
 - each distinct `(instance, ref)` pair is resolved once per run, however often
   it appears; values are kept in memory for the run only, never on disk;
 - a reference the provider cannot resolve, a provider crash, a protocol error

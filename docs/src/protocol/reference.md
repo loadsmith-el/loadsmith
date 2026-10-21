@@ -11,7 +11,8 @@ fd0 (stdin)  — JSONL, core → plugin  — lifecycle commands
 fd1 (stdout) — JSONL, plugin → core  — lifecycle responses
 fd2 (stderr) — free text, plugin → core — copied to the engine's stderr, masked
 fd3          — Arrow IPC stream       — data (sources and parsers write, destinations read)
-fd4          — JSONL, plugin → core  — events (logs, progress, object_ready, object_parsed, checkpoint, committed)
+fd4          — JSONL, plugin → core  — events (logs, progress, object_ready, object_parsed, checkpoint, committed;
+                                        telemetry: span, metrics)
 ```
 
 fd0 and fd1 are the standard Unix stdin/stdout. fd3 and fd4 are created by the
@@ -296,7 +297,10 @@ The core redacts (`***`) every value it resolved from `env()`, `file()` or
 `secret()` templates from: plugin log lines (fd4), the texts of
 `configure_ack`, `finished` and `resolved` errors, the `cancel`/`error`
 reasons it sends to plugins, plugin stderr, the final `error:` line, the
-summary's root cause and the JSON run summary's `cause`. Each line of at least
+summary's root cause and the JSON run summary's `cause`, and — with telemetry
+on — everything it exports: span names, string attributes, events and status
+messages, log bodies and attributes (a plugin's included). Each line of at least
+
 8 characters of a multi-line value (a PEM key) and the value's JSON-escaped
 spelling are masked too. A plugin should still never log a value.
 
@@ -378,5 +382,8 @@ The protocol is transport-agnostic JSON. Any language that can:
   for a destination, read an Arrow IPC stream from fd3
 - Write JSONL to fd4
 
-can implement a loadsmith plugin. The message schema is in
-[Message Reference](./messages.md).
+can implement a loadsmith plugin (telemetry is optional: a plugin that does not
+advertise `handshake_ack.telemetry` simply takes no part in it). The message
+schema is in [Message Reference](./messages.md).
+
+

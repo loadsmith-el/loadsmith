@@ -11,6 +11,46 @@ release notes in their repositories.
 
 ### Added
 
+- **OpenTelemetry.** Traces, metrics and logs of every run, exported over
+  OTLP (http/protobuf or gRPC; pure-Rust TLS) by the core — the only exporter:
+  plugins record in-process and send what they record on fd4, with no network
+  code of their own. Off by default; on when an endpoint is resolved. One trace
+  per run (`loadsmith.run` → a `plugin <name>` span per plugin process →
+  `handshake`, `configure` and the plugin's own spans; `provider.resolve`,
+  `lock.acquire`, `state.load`, `checkpoint`, `state.commit`, `parser.feed`,
+  `sink.deliver`; `cancel`/`error`/`resend`/`respawn`/`retry` span events), the
+  core metrics `loadsmith.rows`, `.batches`, `.bytes`, `.run.duration`,
+  `.runs`, `.plugin.respawns`, `.checkpoint.lag`, `.state.commit.duration`, and
+  core and plugin log lines with trace context; stderr is unchanged. Export
+  failures never fail the run (reported once); everything exported is masked.
+  See [Telemetry](docs/src/architecture/telemetry.md).
+  - `pipeline.yaml`: the optional `telemetry:` block (`enabled`, `endpoint`,
+    `protocol`, `headers`, `timeout_seconds`, `signals`, `sampling.ratio`,
+    `metrics_interval_seconds`, `log_level`, `resource`), strict like every
+    core-owned block, secret-free (resolved before the providers, which run
+    inside the traced run). The standard `OTEL_*` variables are honored below
+    it.
+  - CLI: `run` (and `validate`, for checking) take `--otel-endpoint`,
+    `--otel-protocol`, `--otel-header KEY=VALUE` and `--no-telemetry`, above
+    the file. `--print-resolved-config` shows the effective block, header
+    values masked. The JSON run summary gains `trace_id` when traces were
+    exported.
+  - Protocol v1, additive: `handshake_ack.telemetry`, `configure.telemetry`
+    (W3C `traceparent` of the plugin's parent span, log level, metrics
+    interval), the fd4 messages `span` and `metrics`, and the optional `log`
+    fields `trace_id`, `span_id`, `time_unix_nano`, `attributes`. Older plugins
+    and older cores keep working (tolerant reader).
+  - Plugin SDK: the run entry points install a `tracing` layer that sends
+    closed spans and log events to the core
+    (`otel.name`/`otel.kind`/`otel.status_code`/`error` honored), thin
+    delta-aggregated instruments (`telemetry::counter`, `up_down_counter`,
+    `histogram`, `gauge`), and baseline instrumentation for every plugin
+    (`configure`, `start`, `loadsmith.batch`, `finish` spans; the
+    `loadsmith.plugin.*` batch metrics). Bounded: 1000 spans/s, the excess
+    counted in `loadsmith.telemetry.dropped`.
+  - The gRPC exporter is the default `grpc` cargo feature. The static release
+    binary grows from 8.7 MB to 13.5 MB (x86_64 musl; 12.0 MB without gRPC).
+
 - [Stability Policy](docs/src/reference/stability.md): what 1.0 freezes (wire
   protocol v1, CLI, `pipeline.yaml`, state format, plugin manifest and index,
   image tags, plugin discovery), what it does not cover, and the decisions

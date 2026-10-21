@@ -214,7 +214,19 @@ the provider receives `error{TIMEOUT}`; when another instance fails, it receives
 early exit or a protocol violation fails the run with exit `3`; a missing
 binary exits `4`.
 
+## Telemetry
+
+When the run has telemetry on, `run_provider` records a `configure` span and
+one `loadsmith.resolve` span per reference (`loadsmith.provider.ref` — the
+reference, never the value), marked `error` when it fails. The core holds a
+provider's telemetry, like its logs, until the conversation is over, and
+masks it with the values it just learned. The core's `provider.resolve` span
+covers the whole resolution, under the run's root span. Never put a value in a
+span, an attribute or a log line. The API and the rules are in
+[Writing a source → Telemetry](writing-a-source.md#telemetry).
+
 ## The canonical `file` provider
+
 
 [`loadsmith-canonical-plugins`](https://github.com/loadsmith-el/loadsmith-canonical-plugins)
 ships a `file` provider (binary `loadsmith-provider-file`): the reference is

@@ -32,6 +32,10 @@ and a clean separation between control, data, and event channels.
   delegates plugin config to the plugin that understands it.
 - **Observable from day one.** Live progress, a final run summary with throughput,
   structured logs, and `--log-level debug` to watch the full protocol handshake.
+  OpenTelemetry built in: traces, metrics and logs of every run — the plugins'
+  included — exported over OTLP by the core (`--otel-endpoint`, or the
+  standard `OTEL_*` variables).
+
 
 ---
 

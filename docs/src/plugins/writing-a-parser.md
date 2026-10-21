@@ -192,7 +192,20 @@ parser.
   `header` options; infer columns as nullable unless declared otherwise, so
   files with and without empty cells share one schema.
 
+## Telemetry
+
+When the run has telemetry on, `run_parser` records a `configure` span, one
+`loadsmith.parse` span per file (`loadsmith.object.path`,
+`loadsmith.object.rows`) with a `loadsmith.batch` span per `next_batch()`
+inside it, and the `loadsmith.plugin.*` batch metrics; `run_object_source`
+records `configure` and one `loadsmith.object` span per `next_object()`
+(the path once known). The core adds a `parser.feed` span per file it hands to
+the parser. Add your own spans (listing, downloading, decoding a sheet) with
+`tracing`; the API, the rules and the conventions table are in
+[Writing a source → Telemetry](writing-a-source.md#telemetry).
+
 ## Not in 1.0
+
 
 - **Incremental loads through a parser** (`parser:` + `state:`). The
   `object_parsed.last_batch_seq` field already ties each file to the batch
