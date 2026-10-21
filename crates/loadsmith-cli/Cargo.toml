@@ -19,7 +19,7 @@ tracing-subscriber = { workspace = true }
 serde_yaml         = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
-loadsmith-core     = { path = "../loadsmith-core" }
+loadsmith-core     = { path = "../loadsmith-core", default-features = false }
 loadsmith-config   = { path = "../loadsmith-config" }
 loadsmith-plugin-manifest = { path = "../loadsmith-plugin-manifest" }
 loadsmith-tls      = { path = "../loadsmith-tls" }
@@ -32,6 +32,11 @@ flate2             = "1"
 tar                = "0.4"
 # Global allocator (static musl release builds; see main.rs).
 mimalloc           = { version = "0.1", default-features = false }
+
+[features]
+default = ["grpc"]
+# The OTLP/gRPC telemetry exporter (see loadsmith-core).
+grpc = ["loadsmith-core/grpc"]
 
 [dev-dependencies]
 # The fake plugins the exit-code tests run against (shared with the core's

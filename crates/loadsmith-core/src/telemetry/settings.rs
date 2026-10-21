@@ -70,6 +70,10 @@ impl TelemetrySettings {
     }
 }
 
+/// Why `protocol: grpc` fails in a build without the `grpc` feature.
+pub(crate) const NO_GRPC: &str =
+    "this loadsmith build has no OTLP/gRPC exporter (built without the `grpc` feature); use http-protobuf";
+
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_METRICS_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -114,6 +118,10 @@ pub fn resolve(
         })?,
         (None, None, None) => OtlpProtocol::HttpProtobuf,
     };
+    if protocol == OtlpProtocol::Grpc && !cfg!(feature = "grpc") {
+        return Err(invalid(NO_GRPC));
+    }
+
     let base = flags.endpoint.clone().or_else(|| yaml.endpoint.clone()).map(|e| e.trim().to_string());
     if let Some(b) = &base {
         check_url("the telemetry endpoint", b)?;

@@ -31,15 +31,21 @@ loadsmith-tls       = { path = "../loadsmith-tls" }
 # crypto provider (multi-arch rule: no ring / aws-lc).
 opentelemetry         = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
 opentelemetry_sdk     = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
-opentelemetry-otlp    = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs", "http-proto", "reqwest-blocking-client", "grpc-tonic", "tls-provider-agnostic"] }
+opentelemetry-otlp    = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs", "http-proto", "reqwest-blocking-client"] }
 opentelemetry-http    = { version = "0.33.1", default-features = false, features = ["reqwest-blocking"] }
 tracing-opentelemetry = { version = "0.34.0", default-features = false }
 reqwest               = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider"] }
-tonic                 = { version = "0.14", default-features = false, features = ["tls-webpki-roots"] }
+tonic                 = { version = "0.14", default-features = false, features = ["tls-webpki-roots"], optional = true }
 rustls                = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 webpki-roots          = "0.26"
 async-trait           = { workspace = true }
 http                  = "1"
+
+[features]
+default = ["grpc"]
+# The OTLP/gRPC exporter (tonic). Off: telemetry speaks http/protobuf only,
+# and a smaller binary.
+grpc = ["dep:tonic", "opentelemetry-otlp/grpc-tonic", "opentelemetry-otlp/tls-provider-agnostic"]
 
 [dev-dependencies]
 arrow-array          = { workspace = true }

@@ -11,7 +11,9 @@ use std::time::Duration;
 use loadsmith_config::{MaskList, OtlpProtocol, TelemetrySignal};
 use opentelemetry::trace::{SpanId, TraceId};
 use opentelemetry::{Array, KeyValue, StringValue, Value};
-use opentelemetry_otlp::{WithExportConfig, WithHttpConfig, WithTonicConfig};
+use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
+#[cfg(feature = "grpc")]
+use opentelemetry_otlp::WithTonicConfig;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::logs::{LogBatch, LogExporter, SdkLoggerProvider};
 use opentelemetry_sdk::metrics::data::ResourceMetrics;
@@ -76,6 +78,9 @@ pub(super) fn build(settings: &TelemetrySettings, resource: Resource, mask: &Mas
                 .transpose()?;
             Ok(pipelines(settings, resource, mask, span_exporter, metric_exporter, log_exporter))
         }
+        #[cfg(not(feature = "grpc"))]
+        OtlpProtocol::Grpc => Err(super::settings::NO_GRPC.to_string()),
+        #[cfg(feature = "grpc")]
         OtlpProtocol::Grpc => {
             let grpc = GrpcConfig::new(settings)?;
             let span_exporter = traces
@@ -237,12 +242,15 @@ impl opentelemetry_http::HttpClient for HeaderClient {
 
 // ── gRPC: tonic over rustls ───────────────────────────────────────────────────
 
+#[cfg(feature = "grpc")]
 struct GrpcConfig {
     tls: Option<tonic::transport::ClientTlsConfig>,
     metadata: Arc<Vec<(tonic::metadata::AsciiMetadataKey, tonic::metadata::AsciiMetadataValue)>>,
 }
 
+#[cfg(feature = "grpc")]
 impl GrpcConfig {
+
     fn new(settings: &TelemetrySettings) -> Result<Self, String> {
         let mut metadata = Vec::new();
         for (k, v) in &settings.headers {
