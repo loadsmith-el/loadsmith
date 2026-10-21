@@ -14,6 +14,7 @@
 - [Incremental State](./architecture/incremental-state.md)
 - [Multi-arch & TLS](./architecture/multi-arch-and-tls.md)
 - [Oracle Source — Research Spike](./architecture/oracle-source-spike.md)
+- [Telemetry (OpenTelemetry)](./architecture/telemetry.md)
 - [Rejected Ideas](./architecture/rejected-ideas.md)
 
 # Getting Started
