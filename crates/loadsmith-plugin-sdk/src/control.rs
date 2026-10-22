@@ -204,21 +204,6 @@ impl<W: AsyncWrite + Unpin> Control<W> {
             }
         }
     }
-
-    /// Like [`recv`](Self::recv), but a clean EOF is `Ok(None)` — for a sink,
-    /// whose stdin closing means "no more objects".
-    pub(crate) async fn recv_or_eof(&mut self) -> Result<Option<Message>, Flow> {
-        loop {
-            match self.next_inbound().await {
-                Inbound::Eof => return Ok(None),
-                inbound => {
-                    if let Some(msg) = self.process(inbound).await? {
-                        return Ok(Some(msg));
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// Handshake, version negotiation and the capability exchange, common to
@@ -479,12 +464,5 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(ctl.recv().await.unwrap(), Message::Configure(_)));
-    }
-
-    #[tokio::test]
-    async fn sink_eof_is_not_an_abort() {
-        let (mut ctl, core_in, _o) = wired();
-        drop(core_in);
-        assert!(ctl.recv_or_eof().await.unwrap().is_none());
     }
 }

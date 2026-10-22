@@ -535,7 +535,7 @@ A **sink-only** liveness check today. The core's sink supervisor sends `ping`
 every 5 s (fixed); the sink responds with `pong`. A missing `pong` by the next
 tick counts as a hang: the sink is respawned (up to 5 restarts) and every unacked
 object is re-sent. Sources and destinations are not pinged. (The SDK answers `ping`
-for every plugin kind.)
+for every plugin kind, also while a sink's `deliver` is running.)
 
 ```json
 {"type": "ping"}

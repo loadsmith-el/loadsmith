@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -10,7 +11,9 @@ use crate::telemetry::{self, phase_span};
 use tracing::Instrument;
 
 use crate::config::PluginConfig;
-use crate::control::{answer_configure, conclude, handshake, recv_configure, recv_start, unexpected, Control, Flow};
+use crate::control::{
+    answer_configure, conclude, handshake, recv_configure, recv_start, unexpected, Control, Flow, Inbound,
+};
 
 /// Implemented by sink plugins.
 ///
@@ -105,24 +108,57 @@ async fn drive_sink<P: SinkPlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Unpin>
     // The core sends one DeliverObject per staged file and closes our stdin
     // (EOF) once everything is delivered. Each successful deliver is ack'd with
     // ObjectDelivered so the core's ledger knows what survived a crash. `ping`,
-    // `resend`, `cancel` and `error` are handled by `Control`.
-    while let Some(msg) = ctl.recv_or_eof().await? {
-        match msg {
-            Message::DeliverObject(d) => {
-                let path = PathBuf::from(&d.path);
-                let span = telemetry::object_span("loadsmith.deliver", &d.path);
-                if let Err(e) = plugin.deliver(path).instrument(span.clone()).await {
-                    telemetry::fail(&span, &e);
-                    drop(span);
-                    events.error_msg(format!("deliver error for {}: {e:#}", d.path)).await;
-                    return Err(Flow::fatal("DELIVER_FAILED", e));
-                }
-                drop(span);
-                events.flush_telemetry().await;
-                ctl.send(Message::ObjectDelivered(ObjectDelivered { path: d.path })).await?;
+    // `resend`, `cancel` and `error` are handled by `Control` — also while an
+    // object is being delivered: the core pings a sink every few seconds and
+    // takes a missing pong for a hang, and an upload over a slow link easily
+    // outlasts that. Objects the core hands over meanwhile queue behind it.
+    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut input_done = false;
+    loop {
+        let Some(path) = queue.pop_front() else {
+            if input_done {
+                break;
             }
-            other => return Err(unexpected("deliver_object", &other)),
+            match ctl.next_inbound().await {
+                Inbound::Eof => input_done = true,
+                inbound => match ctl.process(inbound).await? {
+                    None => {}
+                    Some(Message::DeliverObject(d)) => queue.push_back(d.path),
+                    Some(other) => return Err(unexpected("deliver_object", &other)),
+                },
+            }
+            continue;
+        };
+
+        let span = telemetry::object_span("loadsmith.deliver", &path);
+        let outcome = {
+            let work = plugin.deliver(PathBuf::from(&path)).instrument(span.clone());
+            tokio::pin!(work);
+            loop {
+                tokio::select! {
+                    biased;
+                    inbound = ctl.next_inbound(), if !input_done => match inbound {
+                        Inbound::Eof => input_done = true,
+                        inbound => match ctl.process(inbound).await {
+                            Ok(None) => {}
+                            Ok(Some(Message::DeliverObject(d))) => queue.push_back(d.path),
+                            Ok(Some(other)) => break Err(unexpected("deliver_object", &other)),
+                            Err(flow) => break Err(flow),
+                        },
+                    },
+                    result = &mut work => break Ok(result),
+                }
+            }
+        }?;
+        if let Err(e) = outcome {
+            telemetry::fail(&span, &e);
+            drop(span);
+            events.error_msg(format!("deliver error for {path}: {e:#}")).await;
+            return Err(Flow::fatal("DELIVER_FAILED", e));
         }
+        drop(span);
+        events.flush_telemetry().await;
+        ctl.send(Message::ObjectDelivered(ObjectDelivered { path })).await?;
     }
 
     let span = phase_span!("finish");
@@ -135,4 +171,177 @@ async fn drive_sink<P: SinkPlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Unpin>
     // (rows_written/batches_written both = objects delivered) — no new field.
     ctl.send(Message::Finished(Finished::success_destination(count, count))).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
+    use tokio::sync::Notify;
+
+    /// Delivers by recording the path; `slow*` paths wait for `release`
+    /// (an upload over a slow link), `boom` fails.
+    #[derive(Default)]
+    struct Fake {
+        delivered: Arc<Mutex<Vec<String>>>,
+        release: Arc<Notify>,
+        cancelled: bool,
+    }
+
+    #[async_trait]
+    impl SinkPlugin for Fake {
+        fn plugin_name(&self) -> &str {
+            "loadsmith-sink-fake"
+        }
+        fn plugin_version(&self) -> &str {
+            "0.0.0"
+        }
+        async fn configure(&mut self, _config: PluginConfig) -> Result<()> {
+            Ok(())
+        }
+        async fn prepare(&mut self) -> Result<()> {
+            Ok(())
+        }
+        async fn deliver(&mut self, path: PathBuf) -> Result<()> {
+            let path = path.to_string_lossy().into_owned();
+            if path.starts_with("slow") {
+                self.release.notified().await;
+            }
+            anyhow::ensure!(path != "boom", "upload failed");
+            self.delivered.lock().unwrap().push(path);
+            Ok(())
+        }
+        async fn finalize(&mut self) -> Result<u64> {
+            Ok(self.delivered.lock().unwrap().len() as u64)
+        }
+        async fn cancel(&mut self) {
+            self.cancelled = true;
+        }
+    }
+
+    struct Core {
+        to_plugin: DuplexStream,
+        from_plugin: BufReader<DuplexStream>,
+    }
+
+    impl Core {
+        async fn send(&mut self, line: &str) {
+            self.to_plugin.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+        }
+        async fn deliver(&mut self, path: &str) {
+            self.send(&format!(r#"{{"type":"deliver_object","path":"{path}"}}"#)).await;
+        }
+        async fn close(&mut self) {
+            self.to_plugin.shutdown().await.unwrap();
+        }
+        async fn recv(&mut self) -> String {
+            let mut s = String::new();
+            tokio::time::timeout(Duration::from_secs(5), self.from_plugin.read_line(&mut s))
+                .await
+                .expect("the sink answers")
+                .unwrap();
+            s.trim_end().to_string()
+        }
+        /// Up to `ready`.
+        async fn start(&mut self) {
+            self.send(r#"{"type":"handshake"}"#).await;
+            assert!(self.recv().await.contains(r#""kind":"sink""#));
+            self.send(r#"{"type":"set_protocol_version","protocol_version":1}"#).await;
+            self.send(r#"{"type":"capabilities_request"}"#).await;
+            assert!(self.recv().await.starts_with(r#"{"type":"capabilities_response""#));
+            self.send(r#"{"type":"configure","config":{}}"#).await;
+            assert_eq!(self.recv().await, r#"{"type":"configure_ack","status":"ok"}"#);
+            self.send(r#"{"type":"start"}"#).await;
+            assert_eq!(self.recv().await, r#"{"type":"ready"}"#);
+        }
+    }
+
+    /// Runs the sink on in-memory pipes; returns the core's ends, the fake's
+    /// `release` handle and the task yielding (lifecycle ok, exit code,
+    /// `cancel` called, delivered paths).
+    #[allow(clippy::type_complexity)]
+    fn spawn() -> (Core, Arc<Notify>, tokio::task::JoinHandle<(bool, i32, bool, Vec<String>)>) {
+        let (core_in, plugin_in) = tokio::io::duplex(1 << 16);
+        let (plugin_out, core_out) = tokio::io::duplex(1 << 16);
+        let mut plugin = Fake::default();
+        let release = plugin.release.clone();
+        let task = tokio::spawn(async move {
+            let mut ctl = Control::new(BufReader::new(plugin_in), plugin_out);
+            let mut events = EventSender::new(tokio::io::sink());
+            let mut started = false;
+            let result = drive_sink(&mut plugin, &mut ctl, &mut events, &mut started).await;
+            let ok = result.is_ok();
+            let mut cancelled = false;
+            let code = conclude(&mut ctl, result, started, || {
+                cancelled = true;
+                async {}
+            })
+            .await;
+            let delivered = plugin.delivered.lock().unwrap().clone();
+            (ok, code, cancelled || plugin.cancelled, delivered)
+        });
+        (Core { to_plugin: core_in, from_plugin: BufReader::new(core_out) }, release, task)
+    }
+
+    #[tokio::test]
+    async fn delivers_each_object_then_finishes_on_eof() {
+        let (mut core, _release, task) = spawn();
+        core.start().await;
+        core.deliver("a.parquet").await;
+        assert_eq!(core.recv().await, r#"{"type":"object_delivered","path":"a.parquet"}"#);
+        core.deliver("b.parquet").await;
+        assert_eq!(core.recv().await, r#"{"type":"object_delivered","path":"b.parquet"}"#);
+        core.close().await;
+        assert!(core.recv().await.starts_with(r#"{"type":"finished","status":"success""#));
+        let (ok, code, cancelled, delivered) = task.await.unwrap();
+        assert_eq!((ok, code, cancelled), (true, 0, false));
+        assert_eq!(delivered, ["a.parquet", "b.parquet"]);
+    }
+
+    #[tokio::test]
+    async fn answers_pings_while_a_slow_delivery_runs_and_queues_new_objects() {
+        let (mut core, release, task) = spawn();
+        core.start().await;
+        core.deliver("slow.parquet").await;
+        core.deliver("next.parquet").await;
+        // Mid-upload: the core's liveness check must still get its pong.
+        core.send(r#"{"type":"ping"}"#).await;
+        assert_eq!(core.recv().await, r#"{"type":"pong"}"#);
+        core.send(r#"{"type":"ping"}"#).await;
+        assert_eq!(core.recv().await, r#"{"type":"pong"}"#);
+        release.notify_one();
+        assert_eq!(core.recv().await, r#"{"type":"object_delivered","path":"slow.parquet"}"#);
+        assert_eq!(core.recv().await, r#"{"type":"object_delivered","path":"next.parquet"}"#);
+        core.close().await;
+        assert!(core.recv().await.starts_with(r#"{"type":"finished","status":"success""#));
+        let (ok, _, _, delivered) = task.await.unwrap();
+        assert!(ok);
+        assert_eq!(delivered, ["slow.parquet", "next.parquet"]);
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_a_slow_delivery() {
+        let (mut core, _release, task) = spawn();
+        core.start().await;
+        core.deliver("slow.parquet").await;
+        core.send(r#"{"type":"cancel","reason":"destination failed"}"#).await;
+        assert_eq!(core.recv().await, r#"{"type":"finished","status":"cancelled"}"#);
+        let (ok, code, cancelled, delivered) = tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        assert_eq!((ok, code, cancelled), (false, 0, true));
+        assert!(delivered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_delivery_fails_the_sink() {
+        let (mut core, _release, task) = spawn();
+        core.start().await;
+        core.deliver("boom").await;
+        let finished = core.recv().await;
+        assert!(finished.contains(r#""status":"error","code":"DELIVER_FAILED""#), "{finished}");
+        assert!(finished.contains("upload failed"), "{finished}");
+        let (ok, code, cancelled, _) = task.await.unwrap();
+        assert_eq!((ok, code, cancelled), (false, 1, true));
+    }
 }

@@ -42,6 +42,15 @@ for S3, overwrite the object key (or abort any orphaned multipart upload first).
 The SDK acknowledges each successful `deliver` to the core with an
 `object_delivered` message automatically — you just return `Ok(())`.
 
+## `deliver` can take as long as the transfer does
+
+The core pings a sink every 5 s and takes a missing `pong` for a hang. The SDK
+keeps answering while `deliver` runs (and queues the objects the core hands
+over meanwhile), so an upload over a slow link is not mistaken for one. Keep
+`deliver` async all the way down: blocking I/O on the runtime's thread (`std::fs`,
+a blocking HTTP client) stalls the answers with it — use `tokio::fs` and an
+async client, or `spawn_blocking`.
+
 ## Skeleton: the `local-copy` sink
 
 ```rust

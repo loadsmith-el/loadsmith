@@ -9,6 +9,15 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+### Fixed
+
+- SDK: a sink answers `ping` while it delivers an object. It used to wait for
+  `deliver` to return, so an upload longer than the 5 s ping interval (64 MiB
+  over a ~100 Mbit/s link) looked like a hang: the core respawned the sink and
+  re-sent the object, and on a link slow enough for every attempt to outlast
+  the window the run failed after five restarts. Objects the core hands over
+  during a delivery are queued behind it.
+
 ## [1.0.0] - 2026-10-22
 
 The first stable release: the interfaces listed in the
