@@ -9,6 +9,14 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+### Added
+
+- Protocol v1, additive: `configure.run` — the run's `id`, `pipeline` and
+  `started_at_unix_ms`, sent to every source, parser, destination and sink
+  (the same across a sink's respawns). A sink uses it to name what it
+  delivers per run, so incremental runs add objects instead of overwriting
+  them. SDK: `PluginConfig::run()` (and `RunInfo`).
+
 ### Changed
 
 - Stability policy: the last two open decisions are settled. A remote state

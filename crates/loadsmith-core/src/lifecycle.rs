@@ -139,7 +139,8 @@ pub async fn run_handshake_and_configure_with(
             .filter(|v| *v >= loadsmith_protocol::TELEMETRY_VERSION)
             .and_then(|_| peer.scope().configure_context());
         tracing::debug!(plugin = %label, "→ configure");
-        peer.send(Message::Configure(Configure { config, unknown_keys: Some(unknown_keys), telemetry })).await?;
+        let run = peer.run().cloned();
+        peer.send(Message::Configure(Configure { config, unknown_keys: Some(unknown_keys), telemetry, run })).await?;
 
         let configure_limit = Timeouts::limit(timeouts.configure_seconds);
         match peer.recv_expect("configure_ack", configure_limit, shutdown).await? {

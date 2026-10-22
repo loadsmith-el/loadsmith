@@ -28,7 +28,7 @@ use std::os::unix::io::IntoRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use loadsmith_arrow::ipc::IpcError;
 use loadsmith_arrow::IpcReader;
@@ -53,7 +53,7 @@ use crate::{
     pump::{pump, PumpControl, PumpOutcome, PumpOutput},
     reporter::Reporter,
     shutdown::{Halt, Shutdown},
-    sink_supervisor::run_sink_supervisor,
+    sink_supervisor::{run_sink_supervisor, SinkLaunch},
     spawner::{create_data_pipe, spawn_plugin, StderrRoute},
     state::{check_schema_drift, new_run_id, open_backend, schema_fingerprint},
     state_supervisor::{run_state_supervisor, StateRun},
@@ -150,6 +150,12 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     }
     let timeouts = config.pipeline.timeouts;
     let grace = Duration::from_secs(timeouts.cancel_grace_seconds);
+    // Sent to every data plugin and the sink in `configure`.
+    let run = Some(loadsmith_protocol::RunInfo {
+        id: opts.run_id.clone(),
+        pipeline: config.pipeline.name.clone(),
+        started_at_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
+    });
 
     // ── Incremental state setup ───────────────────────────────────────────
     // With a `state:` block we lock the pipeline's state (failing fast if a
@@ -289,15 +295,15 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     let dst_event = tokio::fs::File::from_std(dst_sp.event_fd_take());
     let prs_event = prs_sp.as_mut().map(|sp| tokio::fs::File::from_std(sp.event_fd_take()));
 
-    let mut src = Peer::new(PluginKind::Source.as_str(), src_sp).with_mask(opts.mask.clone());
+    let mut src = Peer::new(PluginKind::Source.as_str(), src_sp).with_mask(opts.mask.clone()).with_run(run.clone());
     let mut prs = prs_sp.map(|sp| {
-        let mut peer = Peer::new(PluginKind::Parser.as_str(), sp).with_mask(opts.mask.clone());
+        let mut peer = Peer::new(PluginKind::Parser.as_str(), sp).with_mask(opts.mask.clone()).with_run(run.clone());
         // The parser's stdin is owned by a writer task: one `parse_object`
         // per file must never stall the runner on a full pipe.
         peer.queue_input();
         peer
     });
-    let mut dst = Peer::new(PluginKind::Destination.as_str(), dst_sp).with_mask(opts.mask.clone());
+    let mut dst = Peer::new(PluginKind::Destination.as_str(), dst_sp).with_mask(opts.mask.clone()).with_run(run.clone());
 
     let (src_mask, dst_mask) = (opts.mask.clone(), opts.mask.clone());
     let (src_scope, dst_scope) = (Some(src.scope().clone()), Some(dst.scope().clone()));
@@ -432,7 +438,18 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         // ObjectReady paths forwarded by the destination's event drain.
         if let (Some(bin), Some(cfg), Some(rx)) = (sink_bin, sink_config, object_rx) {
             sink_task = Some(tokio::spawn(
-                run_sink_supervisor(bin, cfg, opts.unknown_keys, rx, timeouts, sink_shutdown, opts.mask.clone())
+                run_sink_supervisor(
+                    SinkLaunch {
+                        binary: bin,
+                        config: cfg,
+                        unknown_keys: opts.unknown_keys,
+                        mask: opts.mask.clone(),
+                        run: run.clone(),
+                    },
+                    rx,
+                    timeouts,
+                    sink_shutdown,
+                )
                     .in_current_span(),
             ));
         }

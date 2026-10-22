@@ -16,4 +16,4 @@ pub use provider::{ProviderPlugin, ResolveFailure, run_provider};
 pub use parser::{ParserPlugin, run_parser};
 pub use object_source::{ObjectSourcePlugin, run_object_source};
 pub use context::EventSender;
-pub use config::{ConfigRejection, PluginConfig, UnknownKeys};
+pub use config::{ConfigRejection, PluginConfig, RunInfo, UnknownKeys};

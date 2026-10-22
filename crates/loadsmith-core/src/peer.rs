@@ -119,6 +119,8 @@ pub struct Peer {
     mask: MaskList,
     /// The plugin process's place in the run's trace.
     scope: PluginScope,
+    /// The run sent in `configure` (none for providers, which run first).
+    run: Option<loadsmith_protocol::RunInfo>,
 }
 
 /// The plugin kind behind a peer label (`source`, `provider 'vault'`, …).
@@ -168,7 +170,18 @@ impl Peer {
             replay_on_resend: true,
             mask: MaskList::new(),
             scope,
+            run: None,
         }
+    }
+
+    /// The run to send this plugin in `configure`.
+    pub fn with_run(mut self, run: Option<loadsmith_protocol::RunInfo>) -> Self {
+        self.run = run;
+        self
+    }
+
+    pub fn run(&self) -> Option<&loadsmith_protocol::RunInfo> {
+        self.run.as_ref()
     }
 
     /// The plugin process's telemetry scope (its span; what its fd4 drain

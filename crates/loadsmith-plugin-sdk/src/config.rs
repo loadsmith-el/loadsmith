@@ -48,7 +48,7 @@ use serde::de::{
 };
 use serde_json::{Error, Value};
 
-pub use loadsmith_protocol::UnknownKeys;
+pub use loadsmith_protocol::{RunInfo, UnknownKeys};
 
 /// `configure_ack` code: the config has keys the plugin does not know.
 pub const UNKNOWN_CONFIG_KEYS: &str = "UNKNOWN_CONFIG_KEYS";
@@ -69,11 +69,24 @@ pub struct PluginConfig {
     value: Value,
     unknown_keys: UnknownKeys,
     warnings: Arc<Mutex<Vec<String>>>,
+    run: Option<RunInfo>,
 }
 
 impl PluginConfig {
     pub fn new(value: Value, unknown_keys: UnknownKeys) -> Self {
-        Self { value, unknown_keys, warnings: Arc::default() }
+        Self { value, unknown_keys, warnings: Arc::default(), run: None }
+    }
+
+    /// The run this configuration is for (`configure.run`).
+    pub fn with_run(mut self, run: Option<RunInfo>) -> Self {
+        self.run = run;
+        self
+    }
+
+    /// The run this plugin works for: `None` from a core that doesn't send
+    /// it, and for providers (they run before the run starts).
+    pub fn run(&self) -> Option<&RunInfo> {
+        self.run.as_ref()
     }
 
     /// Parses the block into `T`, applying the policy: an unknown key is an

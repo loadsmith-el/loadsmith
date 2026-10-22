@@ -273,7 +273,7 @@ pub(crate) async fn recv_configure<W: AsyncWrite + Unpin>(
         Message::Configure(c) => {
             crate::telemetry::GLOBAL.start(c.telemetry.as_ref());
             let policy = c.unknown_keys();
-            let config = PluginConfig::new(c.config, policy);
+            let config = PluginConfig::new(c.config, policy).with_run(c.run);
             let warnings = config.warnings();
             Ok((config, warnings))
         }

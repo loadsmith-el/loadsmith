@@ -153,12 +153,30 @@ pub struct Configure {
     /// this build cannot read, means telemetry is off for the plugin.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_telemetry")]
     pub telemetry: Option<TelemetryContext>,
+    /// The run this plugin works for. Optional and tolerant: absent (an
+    /// older core, or a provider, which runs before the run starts) or
+    /// unreadable reads as unknown. Older plugins ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_run")]
+    pub run: Option<RunInfo>,
+}
+
+/// `configure.run`: the identity of the run, the same for every plugin of the
+/// run and across a plugin's respawns within it — e.g. for a sink to name
+/// what it delivers so a later run never overwrites it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunInfo {
+    /// The run's id (as in the state file and the run summary).
+    pub id: String,
+    /// `pipeline.name`.
+    pub pipeline: String,
+    /// When the run started: UTC, milliseconds since the Unix epoch.
+    pub started_at_unix_ms: u64,
 }
 
 impl Configure {
     /// A `configure` with the default policy (unknown keys are an error).
     pub fn new(config: serde_json::Value) -> Self {
-        Self { config, unknown_keys: None, telemetry: None }
+        Self { config, unknown_keys: None, telemetry: None, run: None }
     }
 
     /// Whether the plugin should record telemetry for this run.
@@ -198,6 +216,12 @@ impl UnknownKeys {
 /// Tolerant reader for `configure.unknown_keys`: a value this build does not
 /// know (or of the wrong type) reads as absent, i.e. the strict default.
 fn lenient_unknown_keys<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<UnknownKeys>, D::Error> {
+    let raw = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(raw).ok())
+}
+
+/// Tolerant reader for `configure.run`: unreadable reads as absent.
+fn lenient_run<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<RunInfo>, D::Error> {
     let raw = serde_json::Value::deserialize(d)?;
     Ok(serde_json::from_value(raw).ok())
 }
@@ -1037,6 +1061,27 @@ mod tests {
         assert!(parse(r#"{"type":"configure","config":{},"telemetry":"yes"}"#).telemetry.is_none());
         let odd = r#"{"type":"configure","config":{},"telemetry":{"enabled":true,"log_level":"chatty"}}"#;
         assert!(parse(odd).telemetry.is_none());
+    }
+
+    #[test]
+    fn configure_run_is_optional_and_tolerant() {
+        let parse = |line: &str| match serde_json::from_str::<Message>(line).unwrap() {
+            Message::Configure(c) => c,
+            other => panic!("wrong variant: {other:?}"),
+        };
+        assert!(parse(r#"{"type":"configure","config":{}}"#).run.is_none());
+        let c = parse(
+            r#"{"type":"configure","config":{},"run":{"id":"42-1","pipeline":"p","started_at_unix_ms":1761134400000,"x":1}}"#,
+        );
+        assert_eq!(
+            c.run,
+            Some(RunInfo { id: "42-1".into(), pipeline: "p".into(), started_at_unix_ms: 1_761_134_400_000 })
+        );
+        // Unreadable is "unknown run", not a failed configure.
+        assert!(parse(r#"{"type":"configure","config":{},"run":{"id":7}}"#).run.is_none());
+        // Absent from the wire when unknown: older plugins see the same line.
+        let bare = serde_json::to_string(&Message::Configure(Configure::new(serde_json::json!({})))).unwrap();
+        assert!(!bare.contains("run"), "{bare}");
     }
 
     #[test]

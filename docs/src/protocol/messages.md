@@ -127,6 +127,11 @@ template resolution.
     "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
     "log_level": "info",
     "metrics_interval_ms": 15000
+  },
+  "run": {
+    "id": "4242-1761134400000",
+    "pipeline": "orders-to-s3",
+    "started_at_unix_ms": 1761134400000
   }
 }
 ```
@@ -136,6 +141,7 @@ template resolution.
 | `config` | object | Arbitrary JSON — the plugin's configuration |
 | `unknown_keys` | string (optional) | What the plugin does with a key of `config` it does not recognise, at any depth: `"error"` (the default) rejects the config with `configure_ack` `error` (code `UNKNOWN_CONFIG_KEYS`), naming every unknown key path; `"warn"` logs one `warn` event per unknown key on fd4 and ignores it. Absent, or a value the plugin does not know, means `"error"` |
 | `telemetry` | object (optional) | Sent only to a plugin that advertised `handshake_ack.telemetry`, and only when the run exports telemetry. `enabled` (bool); `traceparent` (optional, W3C: the core's span for this plugin process — the parent of the plugin's top-level spans; flag `00` = not sampled: record no spans); `tracestate` (optional, W3C, verbatim); `log_level` (minimum level of the `log` lines to send with trace context, default `info`); `metrics_interval_ms` (optional, how often to flush `metrics`). Absent, `enabled: false`, or a shape the plugin cannot read ⇒ the plugin records nothing (never a failed `configure`). See [telemetry](#telemetry-on-the-event-channel) |
+| `run` | object (optional) | The run this plugin works for: `id` (the run's id, as in the state file and the run summary), `pipeline` (`pipeline.name`), `started_at_unix_ms` (when the run started, UTC). The same for every plugin of the run and across a plugin's respawns within it, so a sink can name what it delivers per run (a later run never overwrites an earlier one) and a re-delivery after a respawn lands on the same name. Sent to sources, parsers, destinations and sinks; not to providers (they run before the run starts). Absent (an older core) or unreadable ⇒ unknown, never a failed `configure`. The Rust SDK exposes it as `PluginConfig::run()` |
 
 `unknown_keys` is how the operator's choice reaches every plugin: the core
 sends `"warn"` when the run was started with `--ignore-unknown-keys` (or

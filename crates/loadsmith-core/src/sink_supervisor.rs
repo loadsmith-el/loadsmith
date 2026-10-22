@@ -65,20 +65,28 @@ enum Driven {
     Halted(Halt),
 }
 
+/// What every sink instance is spawned and configured with.
+pub struct SinkLaunch {
+    pub binary: PathBuf,
+    pub config: serde_json::Value,
+    pub unknown_keys: UnknownKeys,
+    pub mask: loadsmith_config::MaskList,
+    /// `configure.run`: the same for every respawn.
+    pub run: Option<loadsmith_protocol::RunInfo>,
+}
+
 /// Runs the sink stage to completion, respawning the sink as needed.
 ///
 /// `object_rx` yields staged file paths as the destination finalizes them and
 /// closes when the destination's event channel reaches EOF (i.e. no more files
 /// will be produced).
 pub async fn run_sink_supervisor(
-    binary: PathBuf,
-    config: serde_json::Value,
-    unknown_keys: UnknownKeys,
+    launch: SinkLaunch,
     mut object_rx: UnboundedReceiver<PathBuf>,
     timeouts: Timeouts,
     mut shutdown: Shutdown,
-    mask: loadsmith_config::MaskList,
 ) -> Result<SinkOutcome, CoreError> {
+    let SinkLaunch { binary, config, unknown_keys, mask, run } = launch;
     // Ledger — lives across respawns.
     let mut emitted: Vec<PathBuf> = Vec::new();
     let mut delivered: HashSet<PathBuf> = HashSet::new();
@@ -91,7 +99,7 @@ pub async fn run_sink_supervisor(
         let mut sp = spawn_plugin(&binary, None, StderrRoute::Forward(mask.clone()))
             .map_err(|e| CoreError::PluginIncompatible(format!("spawn sink: {e}")))?;
         let event = tokio::fs::File::from_std(sp.event_fd_take());
-        let mut peer = Peer::new(PluginKind::Sink.as_str(), sp).with_mask(mask.clone());
+        let mut peer = Peer::new(PluginKind::Sink.as_str(), sp).with_mask(mask.clone()).with_run(run.clone());
         if restarts > 0 {
             peer.scope().respawned(restarts);
             peer.scope().event("respawn", vec![opentelemetry::KeyValue::new("loadsmith.plugin.respawns", i64::from(restarts))]);
