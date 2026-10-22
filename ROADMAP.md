@@ -14,6 +14,12 @@ What's shipped and what's queued next. Shipped items are documented in
       plugin (`resolve`/`resolved`, SDK `ProviderPlugin`); every `env()`/`file()`/
       `secret()` value masked in logs, plugin stderr, errors and the run summary;
       `validate` static by default, `--resolve` for the full resolution
+- [x] **1.0.0** (2026-10-22) — the interfaces in the
+      [Stability Policy](docs/src/reference/stability.md) are frozen: wire
+      protocol v1, CLI and exit codes, `pipeline.yaml`, the state format,
+      manifest v1, the plugin index, image tags and telemetry names. Released
+      after two candidates and a soak of seven full lab rounds (four image
+      flavors on amd64, and arm64)
 - [x] **`s3` sink** (canonical plugins) — delivers staged files to AWS S3 or
       S3-compatible stores: pure-Rust SigV4 over rustls, multipart uploads,
       retries, and keys naming the run (`configure.run`) so incremental runs
@@ -102,32 +108,6 @@ What's shipped and what's queued next. Shipped items are documented in
       v0.2.0 images. The Custom image builder (below) is its future shortcut.
 
 ## Planned
-
-- [ ] **1.0** — freeze the interfaces listed in the
-      [Stability Policy](docs/src/reference/stability.md). Done so far: the
-      policy itself; a CI gate (build/test/clippy `-D warnings`, pinned
-      toolchain) and tests before every release; the 1.0 blockers fixed
-      (tolerant protocol reader and an fd4 drain that never stops, UTF-8-safe
-      templates, a versioned state format with a stable fingerprint, strict
-      plugin blocks in `pipeline.yaml`, lock-lease fixes); a correct abort
-      (the destination's input ends only after the source succeeded; on any
-      failure or SIGINT/SIGTERM the core sends `cancel`/`error`, waits a grace
-      period and kills — the destination rolls back instead of committing a
-      partial load), per-phase timeouts and an opt-in stall timeout, one
-      `resend` for a malformed control line, and distinct exit codes; a
-      complete Arrow field-type vocabulary in the `schema` message (with
-      nullability and tolerant reading) and drift detection on the exact Arrow
-      stream schema (state format v2, migrated automatically); a versioned
-      JSON run summary (`--output json`, `--summary-file`).
-      Done since: providers wired into the core (`providers:` + `secret()`,
-      the `provider` kind rename, masking everywhere, static `validate`) and
-      the parser stage (wired and covered; `parser:` + `state:` deferred to
-      1.x), and the unknown-keys policy (an error by default, warnings with
-      `--ignore-unknown-keys`; SDK `PluginConfig::parse`), OpenTelemetry, and
-      the canonical plugins on the new SDK (`cancel()` rolling back, config
-      through `PluginConfig::parse`). The policy's last two decisions are
-      settled (one state format for every backend; the Rust crates stay
-      unpublished). Remaining: the release candidate's soak, then 1.0.0.
 
 - [ ] **`s3` sink follow-ups** — the sink ships in the canonical plugins
       (pure-Rust SigV4 + multipart, one key prefix per run via

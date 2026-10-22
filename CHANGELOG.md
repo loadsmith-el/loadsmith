@@ -9,6 +9,15 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-22
+
+The first stable release: the interfaces listed in the
+[Stability Policy](docs/src/reference/stability.md) are frozen for 1.x. No
+change since 1.0.0-rc.2, which soaked through seven full lab rounds (the four
+image flavors on amd64, and arm64) with no failure. Rolling image tags
+(`:slim`, `:static`, `:static-debug`, `:bundled`, `:latest`) move to this
+release.
+
 ## [1.0.0-rc.2] - 2026-10-22
 
 ### Added
@@ -366,7 +375,8 @@ release notes in their repositories.
 - The hermetic `Dockerfile` gains the same targets.
 - Container Images documentation page.
 
-[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.0-rc.2...HEAD
+[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.0-rc.2...v1.0.0
 [1.0.0-rc.2]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.0-rc.1...v1.0.0-rc.2
 [1.0.0-rc.1]: https://github.com/loadsmith-el/loadsmith/compare/v0.2.0...v1.0.0-rc.1
 [0.2.0]: https://github.com/loadsmith-el/loadsmith/compare/v0.1.1...v0.2.0
