@@ -3,6 +3,8 @@ name    = "loadsmith-plugin-manifest"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
+# 0.x, consumed by git revision; not published (see docs/src/reference/stability.md).
+publish = false
 
 # The plugin manifest (`loadsmith-plugin.yaml`) schema + validation. The stable
 # contract behind `loadsmith plugin install`: parsing, host artifact selection,

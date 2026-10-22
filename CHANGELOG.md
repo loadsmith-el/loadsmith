@@ -9,6 +9,13 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+### Changed
+
+- Stability policy: the last two open decisions are settled. A remote state
+  backend stores the same state format as the local file (only the location
+  and the lock differ), and the Rust crates are not published to crates.io —
+  every workspace crate is now `publish = false`.
+
 ## [1.0.0-rc.1] - 2026-10-21
 
 ### Added

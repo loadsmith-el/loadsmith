@@ -46,8 +46,9 @@ These can change in any release:
   versioned apart from the engine. Their public APIs expose `arrow` and `rustls`
   types, so they have to follow those crates' breaking releases. Plugins pin
   them by git revision. A newer SDK may need code changes in a plugin, but the
-  plugin's **wire** compatibility does not change. `loadsmith-plugin-manifest`
-  is in the same position: the manifest *format* is covered and the crate API is
+  plugin's **wire** compatibility does not change. They are not published to
+  crates.io (`publish = false`; see [decision 13](#decisions-for-10)).
+  `loadsmith-plugin-manifest` is in the same position: the manifest *format* is covered and the crate API is
   not.
 - **Engine internals.** `loadsmith-core`, `loadsmith-config` and `loadsmith-cli`
   are not libraries. They are marked `publish = false`.
@@ -180,12 +181,15 @@ These were open and are now settled. 1.0 freezes them as described.
     plugins built before it. The Rust SDK applies it through
     `PluginConfig::parse`, so every SDK plugin behaves the same.
 
-## Open decisions before 1.0
+12. **Remote state backends: one state format.** A remote backend (the
+    planned `s3` one) stores the same document as the local file, under the
+    same `version` field and the same upgrade rules, so a state file moves
+    between backends by copying it. Only where the document lives and how the
+    lock is taken (a conditional write instead of a lock file) belong to the
+    backend; that lock is documented with the backend when it ships, as an
+    addition.
 
-These are still open, and each one changes what 1.0 freezes:
-
-1. **Remote state backends.** The `s3` state backend will need its own format
-   and lock semantics. Should they fall under the same state-format version?
-2. **Publishing the SDK crates** to crates.io (they are consumed by git
-   revision today), and whether `loadsmith-plugin-manifest` should also be
-   `publish = false`.
+13. **The Rust crates are not published.** Plugins consume the SDK and its
+    sibling crates by git revision; every crate in the workspace is marked
+    `publish = false`. Publishing them to crates.io later is additive and
+    does not change what 1.0 covers.

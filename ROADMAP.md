@@ -119,10 +119,11 @@ What's shipped and what's queued next. Shipped items are documented in
       the `provider` kind rename, masking everywhere, static `validate`) and
       the parser stage (wired and covered; `parser:` + `state:` deferred to
       1.x), and the unknown-keys policy (an error by default, warnings with
-      `--ignore-unknown-keys`; SDK `PluginConfig::parse`). Remaining: the
-      policy's open decisions (remote state, SDK publishing), and the
-      canonical plugins' `cancel()` rolling back and config parsing through
-      `PluginConfig::parse` once they move to the new SDK.
+      `--ignore-unknown-keys`; SDK `PluginConfig::parse`), OpenTelemetry, and
+      the canonical plugins on the new SDK (`cancel()` rolling back, config
+      through `PluginConfig::parse`). The policy's last two decisions are
+      settled (one state format for every backend; the Rust crates stay
+      unpublished). Remaining: the release candidate's soak, then 1.0.0.
 
 - [ ] **`s3` sink** — multipart-upload delivery of staged files to S3. The TLS
       direction is settled (`rustls` + the pure-Rust `rustls-rustcrypto` provider
