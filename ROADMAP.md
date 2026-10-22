@@ -14,6 +14,10 @@ What's shipped and what's queued next. Shipped items are documented in
       plugin (`resolve`/`resolved`, SDK `ProviderPlugin`); every `env()`/`file()`/
       `secret()` value masked in logs, plugin stderr, errors and the run summary;
       `validate` static by default, `--resolve` for the full resolution
+- [x] **`s3` sink** (canonical plugins) — delivers staged files to AWS S3 or
+      S3-compatible stores: pure-Rust SigV4 over rustls, multipart uploads,
+      retries, and keys naming the run (`configure.run`) so incremental runs
+      add objects instead of overwriting them
 - [x] **Sink delivery stage** — separates format from location (no `s3_parquet`
       explosion); `local-copy` sink, `object_ready`/`deliver_object` protocol,
       and a core supervisor that respawns + resumes a crashed/hung sink from the
@@ -125,20 +129,16 @@ What's shipped and what's queued next. Shipped items are documented in
       settled (one state format for every backend; the Rust crates stay
       unpublished). Remaining: the release candidate's soak, then 1.0.0.
 
-- [ ] **`s3` sink** — multipart-upload delivery of staged files to S3. The TLS
-      direction is settled (`rustls` + the pure-Rust `rustls-rustcrypto` provider
-      — see [docs](docs/src/architecture/multi-arch-and-tls.md)); the remaining
-      work is the pure-Rust multipart upload + SigV4 signing, not the crypto stack.
-- [ ] **Parsers** — done in the engine: the core wiring (raw source → core →
-      parser → pump, abort and commit rules, capability gates, download
-      scratch dir) and the SDK runtimes (`ParserPlugin`,
-      `ObjectSourcePlugin`). Next, in the canonical plugins: a `file` raw
-      source, a streaming `csv` parser, an `excel` parser. Later (1.x):
-      `parser:` + `state:` (per-file checkpoints from
-      `object_parsed.last_batch_seq`), raw-source backpressure.
-- [ ] **More providers** — port the canonical `file` provider to the new
-      `provider` kind and API (pending in loadsmith-canonical-plugins); an
-      `aws-secrets-manager` provider (1.x, needs SigV4 like the s3 sink);
+- [ ] **`s3` sink follow-ups** — the sink ships in the canonical plugins
+      (pure-Rust SigV4 + multipart, one key prefix per run via
+      `configure.run`). Next: instance/task-role credentials (EC2 instance
+      profile, ECS task role, EKS IRSA); server-side encryption options.
+- [ ] **Parsers** — shipped: the core wiring, the SDK runtimes, and in the
+      canonical plugins a `file` raw source, a streaming `csv` parser and an
+      `excel` parser. Later (1.x): `parser:` + `state:` (per-file checkpoints
+      from `object_parsed.last_batch_seq`), raw-source backpressure.
+- [ ] **More providers** — the canonical `file` provider ships on the
+      `provider` kind and API; next, an `aws-secrets-manager` provider (1.x, needs SigV4 like the s3 sink);
       Vault and other cloud secret managers.
 - [ ] **Whole-document config loading** (`--config-ref`, 1.x) — load the
       pipeline document itself from a remote reference through a provider.

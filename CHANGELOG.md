@@ -9,6 +9,8 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+## [1.0.0-rc.2] - 2026-10-22
+
 ### Added
 
 - Protocol v1, additive: `configure.run` — the run's `id`, `pipeline` and
@@ -364,6 +366,7 @@ release notes in their repositories.
 - The hermetic `Dockerfile` gains the same targets.
 - Container Images documentation page.
 
-[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.0-rc.1...HEAD
+[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.0-rc.2...HEAD
+[1.0.0-rc.2]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.0-rc.1...v1.0.0-rc.2
 [1.0.0-rc.1]: https://github.com/loadsmith-el/loadsmith/compare/v0.2.0...v1.0.0-rc.1
 [0.2.0]: https://github.com/loadsmith-el/loadsmith/compare/v0.1.1...v0.2.0
