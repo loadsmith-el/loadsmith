@@ -9,6 +9,8 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-23
+
 ### Added
 
 - **With a sink, the incremental watermark advances file by file.** A file
@@ -451,7 +453,8 @@ release.
 - The hermetic `Dockerfile` gains the same targets.
 - Container Images documentation page.
 
-[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.0-rc.2...v1.0.0
