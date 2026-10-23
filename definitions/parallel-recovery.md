@@ -143,8 +143,14 @@ incremental `cursor_value`:
 - **Incremental:** the cursor range is cut into many small ordered chunks;
   workers take them in order and a bounded reorder window emits batches in
   cursor order (the documented source rule).
-- A resumed full load reads the remaining partitions at a **new** snapshot; this
-  is stated in the docs.
+- **Resume of a partitioned full load is consistent by default.** Oracle resumes
+  at the same SCN while undo still covers it; when the original snapshot cannot
+  be reused (Postgres: an exported snapshot dies with its transaction; Oracle:
+  `ORA-01555`), the full load restarts from zero with a clear warning. Opt-in
+  `parallel.resume_snapshot: new` reads the remaining partitions at a new
+  snapshot (the output then mixes two points in time); it is accepted only with
+  a key `split_by` (never `ctid`/`rowid`, where an UPDATE moves a row between
+  partitions: duplicated or lost).
 - Only for `query:` shapes that can be split (a table or a simple
   `SELECT … FROM t [WHERE …]`); anything else errors at configure with the
   reason.
@@ -271,8 +277,9 @@ seconds per thread sampled from `/proc` (DB = the database container's CPU):
 
 ## 7. Open decisions
 
-1. Resumed partitioned full load reads remaining partitions at a new snapshot —
-   acceptable, or must a resume refuse when the source changed?
+1. ~~Resumed partitioned full load at a new snapshot?~~ Decided 2026-10-23:
+   consistent by default (same SCN or restart), `resume_snapshot: new` opt-in
+   with a key `split_by` only (3.5).
 2. ~~Default `recovery.max_attempts`: keep 1 (opt-in) or default to 3?~~
    Decided 2026-10-23: default 1 (off); retry is opt-in.
 3. Object names on resume continue the numbering in the same prefix — any
