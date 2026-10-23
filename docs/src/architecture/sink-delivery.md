@@ -152,6 +152,15 @@ supervisor uses it as the durable frontier of the incremental watermark:
 A destination that announces no batch ranges keeps the all-or-nothing rule:
 the watermark is persisted only once the sink delivered every object.
 
+**Stopping.** On a graceful stop (SIGTERM, or an abort elsewhere in the run)
+the supervisor hands the sink nothing new and waits, up to
+`cancel_grace_seconds`, for the delivery in flight to be acknowledged: an
+object that reached the target counts as delivered, and the next run does not
+read its rows again. A crash (SIGKILL) cannot wait: the object being uploaded
+may land unacknowledged, and the next run reads that one file's rows again.
+After a crash the state lock stays leased for 60 s; a run started sooner is
+refused (exit `5`).
+
 Each run's objects must land under names of their own (the `s3` sink's default
 key is `{run_date}/{run_id}/{file}`): a sink that names objects by file name
 alone (`local-copy`) lets a later run's file replace an earlier run's.

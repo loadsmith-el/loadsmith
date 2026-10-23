@@ -173,8 +173,14 @@ pub async fn run_sink_supervisor(
                 &mut input_closed,
                 &mut shutdown,
                 &mut deliveries,
+                grace,
             )
             .await
+        };
+        // A sink that failed while the run was halting is not respawned.
+        let outcome = match (outcome, shutdown.fired()) {
+            (Driven::Recoverable(_), Some(halt)) => Driven::Halted(halt),
+            (outcome, _) => outcome,
         };
         deliveries.abandon();
 
@@ -248,6 +254,14 @@ impl Ledger {
     }
 }
 
+/// Fires at the halt's deadline; never when not halting.
+async fn sleep_until_halt(halting: &Option<(Halt, tokio::time::Instant)>) {
+    match halting {
+        Some((_, deadline)) => tokio::time::sleep_until(*deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// The highest batch ordinal whose rows are all delivered: every file holding
 /// batches `1..=n` was acknowledged by the sink. Files announce their batch
 /// ranges in order; a file without a range stops the prefix (that
@@ -296,6 +310,11 @@ impl DeliveredPrefix {
 /// its writer ([`Peer::close_input`]): tokio's `ChildStdin` only closes its
 /// pipe on drop, so a `shutdown` would leave the sink waiting for an EOF that
 /// never comes.
+///
+/// A halt with objects still unacknowledged waits, up to `grace`, for the next
+/// acknowledgement — the delivery in flight, whose object may already be at
+/// the target — and sends nothing new meanwhile: an object the target holds
+/// then counts as delivered (and its rows are not read again on resume).
 async fn drive_instance(
     peer: &mut Peer,
     object_rx: &mut UnboundedReceiver<StagedObject>,
@@ -303,7 +322,9 @@ async fn drive_instance(
     input_closed: &mut bool,
     shutdown: &mut Shutdown,
     deliveries: &mut Deliveries,
+    grace: Duration,
 ) -> Driven {
+    let mut halting: Option<(Halt, tokio::time::Instant)> = None;
     let mut input_open = true;
     let mut awaiting_pong = false;
     let mut ping = tokio::time::interval(PING_INTERVAL);
@@ -319,7 +340,17 @@ async fn drive_instance(
         }
 
         tokio::select! {
-            halt = shutdown.wait() => return Driven::Halted(halt),
+            halt = shutdown.wait(), if halting.is_none() => {
+                if ledger.pending().next().is_none() || grace.is_zero() {
+                    return Driven::Halted(halt);
+                }
+                tracing::debug!("halting: waiting for the delivery in flight");
+                halting = Some((halt, tokio::time::Instant::now() + grace));
+            }
+            _ = sleep_until_halt(&halting) => {
+                let (halt, _) = halting.take().expect("guarded by sleep_until_halt");
+                return Driven::Halted(halt);
+            }
             maybe = object_rx.recv(), if !*input_closed => {
                 match maybe {
                     Some(object) => {
@@ -327,7 +358,7 @@ async fn drive_instance(
                         let path = object.path;
                         if !ledger.delivered.contains(&path) && !ledger.emitted.contains(&path) {
                             ledger.emitted.push(path.clone());
-                            if input_open {
+                            if input_open && halting.is_none() {
                                 if let Err(e) = send_deliver(peer, &path, deliveries).await {
                                     return Driven::Recoverable(format!("deliver send failed: {e}"));
                                 }
@@ -351,6 +382,9 @@ async fn drive_instance(
                         deliveries.done(&path);
                         ledger.delivered.insert(path);
                         ledger.prefix.update(&ledger.emitted, &ledger.delivered);
+                        if let Some((halt, _)) = halting.take() {
+                            return Driven::Halted(halt);
+                        }
                     }
                     Event::Msg(Message::Pong) => {
                         awaiting_pong = false;

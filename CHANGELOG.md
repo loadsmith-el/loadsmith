@@ -9,6 +9,19 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-10-23
+
+### Fixed
+
+- **A graceful stop no longer reads the delivery in flight again.** On
+  SIGTERM (or any abort), the sink used to be cancelled at once: the object it
+  was uploading could still land at the target, unacknowledged, so the
+  watermark stayed before it and the next run read its rows again (one file of
+  duplicates, measured on a 5M-row incremental load stopped at 60%). The sink
+  supervisor now stops handing out objects and waits, up to
+  `cancel_grace_seconds`, for the acknowledgement of the delivery in flight.
+  A crash (SIGKILL) still leaves at most that one file read twice.
+
 ## [1.2.0] - 2026-10-23
 
 ### Added
@@ -453,7 +466,8 @@ release.
 - The hermetic `Dockerfile` gains the same targets.
 - Container Images documentation page.
 
-[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/loadsmith-el/loadsmith/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.0...v1.0.1
