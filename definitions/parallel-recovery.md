@@ -273,8 +273,8 @@ seconds per thread sampled from `/proc` (DB = the database container's CPU):
 
 1. Resumed partitioned full load reads remaining partitions at a new snapshot —
    acceptable, or must a resume refuse when the source changed?
-2. Default `recovery.max_attempts`: keep 1 (opt-in) or default to 3?
+2. ~~Default `recovery.max_attempts`: keep 1 (opt-in) or default to 3?~~
+   Decided 2026-10-23: default 1 (off); retry is opt-in.
 3. Object names on resume continue the numbering in the same prefix — any
    consumer that expects one prefix per attempt instead?
-4. B1 as an immediate 1.0.1 before the rest (recommended: yes, the client flow
-   is exposed today).
+4. ~~B1 as an immediate 1.0.1 before the rest~~ Done: released as 1.0.1.
