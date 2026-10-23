@@ -35,12 +35,16 @@ pub trait SourcePlugin: Send {
 | `resume_from(cursor)` | After `start`, before `schema()` | Stash the opaque resume watermark (incremental sources) |
 | `schema()` | After `start` signal | Return the Arrow schema of the rows you will emit |
 | `next_batch()` | Repeatedly, until done | Return the next `RecordBatch`, or `Ok(None)` when exhausted |
-| `current_watermark()` | After each batch | Return the high cursor value so far — the core persists it (durability-gated) |
+| `current_watermark()` | After each batch, and once after the last | Return the tie-safe cursor value so far (`TieSafeCursor`) — the core persists it (durability-gated) |
 | `cancel()` | The run will not complete (after `start`): the core sent `cancel`/`error`, the core is gone, or the source itself failed | Stop producing and release the cursor/connection. On `cancel`, an in-flight `next_batch()` future may have been dropped first |
 
 > **Incremental sources.** Advertise `incremental_state`, store the value from
 > `resume_from`, build `WHERE cursor > value ORDER BY cursor` yourself (the core
-> never builds queries), and return the running max from `current_watermark`.
+> never builds queries), and return a **tie-safe** watermark from
+> `current_watermark`: feed each batch's cursor values to a `TieSafeCursor`
+> (newest first) and call its `end()` when the stream is exhausted. While the
+> stream runs it reports only a value no later row can repeat, so a resume that
+> reads `> value` never skips rows tied with a batch's last one.
 > Declare any cursor lazily — `resume_from` is delivered *after* `configure`. See
 > [Incremental State](../architecture/incremental-state.md).
 

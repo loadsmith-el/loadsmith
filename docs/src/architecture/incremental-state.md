@@ -44,6 +44,13 @@ everything `≤ Vn` is durably at the destination (no data loss), and the source
 rereads strictly `> Vn`. The only overlap is the boundary, which an idempotent
 destination absorbs.
 
+**Ties on the cursor.** `Vn` is never the value of a batch's last row while the
+stream runs: the next batch may begin with more rows of that same value, and a
+resume `> Vn` would skip them. A source reports the last value it knows is
+complete — the last one in the batch that differs from the batch's final value —
+and the final value only once the stream has ended (the SDK's `TieSafeCursor`).
+The rows of the boundary value are read again on resume.
+
 This makes the guarantee **at-least-once**. Exactly-once needs an idempotent
 destination — the database destinations' `mode: merge` (a merge on
 `merge_key`) is exactly that: re-applying the delta is harmless, so the
