@@ -8,6 +8,7 @@ pub mod context;
 pub mod telemetry;
 pub mod config;
 pub mod flow;
+pub mod watermark;
 mod control;
 
 pub use source::{SourcePlugin, run_source};
@@ -18,4 +19,5 @@ pub use parser::{ParserPlugin, run_parser};
 pub use object_source::{ObjectSourcePlugin, run_object_source};
 pub use context::EventSender;
 pub use flow::FlowGate;
+pub use watermark::TieSafeCursor;
 pub use config::{ConfigRejection, PluginConfig, RunInfo, UnknownKeys};

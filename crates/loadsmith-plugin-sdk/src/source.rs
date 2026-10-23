@@ -58,8 +58,13 @@ pub trait SourcePlugin: Send {
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>>;
 
     /// The high watermark of the cursor column produced so far, as an opaque
-    /// scalar the core will persist. Consulted by the SDK after each batch.
+    /// scalar the core will persist. Consulted by the SDK after each batch, and
+    /// once more after `next_batch` returned `Ok(None)`. While the stream runs,
+    /// report only a value no later row can repeat ([`TieSafeCursor`]), since
+    /// a resume reads strictly after it; at the end, the last value.
     /// `None` (the default) ⇒ this source has no watermark to report.
+    ///
+    /// [`TieSafeCursor`]: crate::TieSafeCursor
     fn current_watermark(&self) -> Option<serde_json::Value> {
         None
     }
@@ -200,6 +205,8 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Un
 
     let mut rows_total: u64 = 0;
     let mut batches_total: u64 = 0;
+    // The last watermark sent: an unchanged one is not sent again.
+    let mut reported: Option<serde_json::Value> = None;
 
     loop {
         // The core's grant first: never ask for a batch past it.
@@ -223,10 +230,22 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Un
                 // pairs it with the destination's durable-commit ack before
                 // persisting, so emitting per batch is safe (and cheap on fd4).
                 if let Some(watermark) = plugin.current_watermark() {
-                    events.checkpoint(batches_total, watermark).await;
+                    if reported.as_ref() != Some(&watermark) {
+                        events.checkpoint(batches_total, watermark.clone()).await;
+                        reported = Some(watermark);
+                    }
                 }
             }
-            Ok(None) => break,
+            Ok(None) => {
+                // The stream is over: the source may now report a value it
+                // held back (the last one, which no row can follow).
+                if let Some(watermark) = plugin.current_watermark() {
+                    if batches_total > 0 && reported.as_ref() != Some(&watermark) {
+                        events.checkpoint(batches_total, watermark).await;
+                    }
+                }
+                break;
+            }
             Err(e) => {
                 telemetry::fail(&span, &e);
                 drop(span);

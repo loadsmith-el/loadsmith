@@ -9,6 +9,18 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A watermark persisted mid-run could skip rows tied on the cursor.** A
+  resume reads strictly after the persisted value; when it was the cursor of
+  a batch's last row and the next batch went on with the same value, those
+  rows were never read. The SDK's new `TieSafeCursor` makes a source report,
+  while it streams, only a value no later row can repeat (the last one that
+  differs from the batch's final value), and the final value once the stream
+  ended; the SDK asks for the watermark once more at the end of the stream.
+  Rows of the boundary value are read again on resume (at-least-once, as
+  documented).
+
 ## [1.1.0] - 2026-10-23
 
 ### Added
