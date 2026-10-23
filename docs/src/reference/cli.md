@@ -183,6 +183,7 @@ not applicable.
 | `batches` | integer | Batches the source produced |
 | `duration_ms` | integer | Wall-clock time of the command, `finished_at − started_at` |
 | `throughput_rows_per_sec` | integer | `rows_read` per second of `duration_ms` (`0` for an instant run) |
+| `attempts` | integer | Which attempt of the run the outcome is from: `1`, or more when [`pipeline.recovery`](pipeline-yaml.md#pipelinerecovery) retried it. The row and batch counts are that attempt's (1.2+) |
 | `started_at`, `finished_at` | string | UTC timestamps, RFC 3339 with milliseconds (`2026-10-20T14:03:08.398Z`) |
 | `state` | object \| null | With a `state:` block: `watermark_before` (the cursor loaded at start, `null` if none) and `watermark_after` (the cursor in the state after the run: the one this run persisted, else unchanged). The values are the opaque cursors, verbatim. `null` without a `state:` block |
 | `sink` | object \| null | With a `sink:` block: `objects_delivered` (`null` if delivery did not complete). `null` without a sink |

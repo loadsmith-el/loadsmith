@@ -299,6 +299,7 @@ const SUMMARY_V1_KEYS: &[&str] = &[
     "batches",
     "duration_ms",
     "throughput_rows_per_sec",
+    "attempts",
     "started_at",
     "finished_at",
     "state",

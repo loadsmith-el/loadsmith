@@ -72,6 +72,9 @@ pub struct Summary {
     pub root_cause: Option<String>,
     /// The operator signal that stopped the run, when status is `Cancelled`.
     pub signal: Option<crate::shutdown::StopSignal>,
+    /// Which attempt of the run this is (1-based; above 1 only with
+    /// `pipeline.recovery`).
+    pub attempts: u32,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -110,6 +113,9 @@ impl Summary {
             println!("Route:        {}", stages.join(" → "));
         }
         println!("Status:       {}", self.status.as_str());
+        if self.attempts > 1 {
+            println!("Attempt:      {}", self.attempts);
+        }
         if let Some(cause) = &self.root_cause {
             println!("Cause:        {cause}");
         }

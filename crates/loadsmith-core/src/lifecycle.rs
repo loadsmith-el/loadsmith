@@ -187,7 +187,8 @@ pub async fn start_source(
     shutdown: &mut Shutdown,
 ) -> Result<loadsmith_protocol::Schema, Failure> {
     tracing::debug!(plugin = "source", has_resume = resume.is_some(), "→ start");
-    let params = StartParams { resume: resume.map(|cursor_value| ResumeCursor { cursor_value }), credit };
+    let params =
+        StartParams { resume: resume.map(|cursor_value| ResumeCursor { cursor_value }), credit, first_object_seq: None };
     peer.send(Message::Start(params)).await?;
     match peer.recv_expect("schema", Timeouts::limit(timeouts.start_seconds), shutdown).await? {
         Message::Schema(s) => {
@@ -205,9 +206,20 @@ pub async fn start_and_await_ready(
     timeouts: &Timeouts,
     shutdown: &mut Shutdown,
 ) -> Result<(), Failure> {
+    start_with_and_await_ready(peer, StartParams::default(), timeouts, shutdown).await
+}
+
+/// [`start_and_await_ready`] with `params` (a retried run's destination gets
+/// `first_object_seq`).
+pub async fn start_with_and_await_ready(
+    peer: &mut Peer,
+    params: StartParams,
+    timeouts: &Timeouts,
+    shutdown: &mut Shutdown,
+) -> Result<(), Failure> {
     let label = peer.label();
     tracing::debug!(plugin = %label, "→ start");
-    peer.send(Message::Start(StartParams::default())).await?;
+    peer.send(Message::Start(params)).await?;
     match peer.recv_expect("ready", Timeouts::limit(timeouts.start_seconds), shutdown).await? {
         Message::Ready => {
             tracing::debug!(plugin = %label, "← ready");

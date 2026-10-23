@@ -55,6 +55,13 @@ pub trait DestinationPlugin: Send {
         self.take_ready_objects().into_iter().map(|path| ReadyObject { path, batches: None }).collect()
     }
 
+    /// Called after `start`, before `prepare`, when the core retries a run
+    /// whose earlier attempt already delivered files: number the files staged
+    /// from now on starting at `seq`, so no file takes the name of one already
+    /// delivered under the same run. Destinations that stage no numbered
+    /// files leave the default no-op.
+    fn first_object_seq(&mut self, _seq: u64) {}
+
     /// Called after `configure`. Plugin validates config and prepares.
     async fn configure(&mut self, config: PluginConfig) -> Result<()>;
 
@@ -172,8 +179,11 @@ async fn drive_destination<P: DestinationPlugin, W: AsyncWrite + Unpin, E: Async
     answer_configure(ctl, events, &warnings, outcome).await?;
 
     // ── Start + Prepare ───────────────────────────────────────────────────
-    recv_start(ctl).await?;
+    let params = recv_start(ctl).await?;
     *started = true;
+    if let Some(seq) = params.first_object_seq {
+        plugin.first_object_seq(seq);
+    }
     let span = phase_span!("start");
     let prepared = plugin.prepare().instrument(span.clone()).await;
     telemetry::outcome(&span, &prepared);

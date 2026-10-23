@@ -141,6 +141,39 @@ pub struct PipelineMeta {
     /// optional.
     #[serde(default)]
     pub flow: FlowConfig,
+    /// Retrying a failed run in the same process. Off by default.
+    #[serde(default)]
+    pub recovery: RecoveryConfig,
+}
+
+/// `pipeline.recovery`: how many times the core runs a pipeline that failed
+/// for a reason that may pass (a plugin failure, a timeout, a lost
+/// connection), and how long it waits in between. Each attempt is a whole
+/// run under the same run id: an incremental pipeline resumes from the
+/// watermark the failed attempt persisted (the delivered prefix, with a sink);
+/// a full load reads everything again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryConfig {
+    /// Attempts in total, the first included. `1` (the default) never retries.
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+    /// The wait before the second attempt, doubled before each later one
+    /// (at most an hour).
+    #[serde(default = "default_backoff_seconds")]
+    pub backoff_seconds: u64,
+}
+
+fn default_max_attempts() -> u32 {
+    1
+}
+fn default_backoff_seconds() -> u64 {
+    30
+}
+
+impl Default for RecoveryConfig {
+    fn default() -> Self {
+        Self { max_attempts: default_max_attempts(), backoff_seconds: default_backoff_seconds() }
+    }
 }
 
 /// `pipeline.flow`: the core's flow control. A source that obeys credits

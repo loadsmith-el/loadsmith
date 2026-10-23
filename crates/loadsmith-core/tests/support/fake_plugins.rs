@@ -141,7 +141,8 @@ fn opt_u64(config: &serde_json::Value, key: &str) -> Option<u64> {
 /// before each batch, and at most one fault, applied when batch N+1 is asked
 /// for: `crash_after` (exit 42), `fail_after` (`next_batch` errors),
 /// `hang_after` (never returns). `incremental: true` advertises
-/// `incremental_state` and reports a watermark. `wide: true` adds a
+/// `incremental_state` and reports a watermark. `fail_once_after` fails like
+/// `fail_after`, in the first run of a journal only. `wide: true` adds a
 /// `seen_at` timestamp column (a schema change). `journal_credit: true`
 /// journals `credit <batch>/<granted>` before each batch.
 #[derive(Default)]
@@ -283,6 +284,15 @@ impl SourcePlugin for FakeSource {
         if opt_u64(&self.config, "crash_after") == Some(n) {
             note(&self.journal, "crash");
             std::process::exit(42);
+        }
+        if opt_u64(&self.config, "fail_once_after") == Some(n) {
+            // Fails the first run only: the marker beside the journal says a
+            // run already failed here.
+            let marker = self.journal.as_ref().map(|j| j.with_extension("failed-once"));
+            if let Some(marker) = marker.filter(|m| !m.exists()) {
+                std::fs::write(&marker, b"").unwrap();
+                anyhow::bail!("fake source fails once after {n} batches");
+            }
         }
         if opt_u64(&self.config, "fail_after") == Some(n) {
             if self.leaks() {

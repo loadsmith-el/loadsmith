@@ -203,6 +203,16 @@ To a source that advertised `flow_credit`, the core adds `credit`: the initial
 grant, as in [`credit`](#credit). Without it no credits follow, and the source
 is bounded by its data pipe alone.
 
+To a destination, when [`pipeline.recovery`](../reference/pipeline-yaml.md#pipelinerecovery)
+retries an incremental run whose earlier attempt already staged files, the core
+adds `first_object_seq`: number the files staged from here on starting at this
+value, so none takes the name of a file already delivered under the same run
+id. Absent means from the start.
+
+```json
+{"type": "start", "first_object_seq": 7}
+```
+
 ---
 
 ### `schema`

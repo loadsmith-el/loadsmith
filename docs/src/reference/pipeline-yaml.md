@@ -20,6 +20,9 @@ pipeline:
     cancel_grace_seconds: int # cancel → plugin exit, then kill. Default: 30
     stall_seconds: int        # opt-in: no batch for N s fails the run. Default: 0 (off)
     first_batch_seconds: int  # with stall_seconds on: budget for the first batch. Default: 3600
+  recovery:               # optional — retry a failed run in the same process (off by default)
+    max_attempts: int         # attempts in total, the first included. Default: 1 (never retry)
+    backoff_seconds: int      # wait before the 2nd attempt, doubled each time (≤ 1 h). Default: 30
   flow:                   # optional — how far a source may read ahead of the destination
     max_inflight_batches: int # largest window, in batches. Default: 8
     memory_budget_mib: int    # memory the window may hold, in MiB. 0 = no limit. Default: 256
@@ -105,6 +108,46 @@ environment variable and their precedence.
 | `heartbeat_seconds` | integer | no | Interval of the "still running" heartbeat log emitted during the data pump. `0` disables it. Default: `30` |
 | `timeouts` | object | no | Limits on how long the core waits for plugins. See [`pipeline.timeouts`](#pipelinetimeouts) |
 | `flow` | object | no | How far a source may read ahead of the destination. See [`pipeline.flow`](#pipelineflow) |
+| `recovery` | object | no | Retry a failed run in the same process. Off by default. See [`pipeline.recovery`](#pipelinerecovery) |
+
+### `pipeline.recovery`
+
+**Off by default.** With `max_attempts` above `1`, a run that failed for a
+reason that may pass runs again in the same process, after a wait that starts
+at `backoff_seconds` and doubles before each later attempt (at most an hour).
+
+| Field | Default | Meaning |
+|---|---|---|
+| `max_attempts` | `1` | Attempts in total, the first included. `1` never retries |
+| `backoff_seconds` | `30` | The wait before the second attempt |
+
+- **Retried:** a plugin failure or crash, a timeout, a failed delivery, a lost
+  connection — including a database that refuses the connection at
+  `configure`, which reports a rejected config (so a genuinely wrong config is
+  retried too, then fails the same way).
+- **Not retried:** a configuration error, a missing or incompatible plugin, a
+  protocol violation, a state problem (the lock held by another run, a schema
+  drift), and an operator signal (SIGINT/SIGTERM, also during the wait).
+- **Each attempt is a whole run under the same run id** (and the same start
+  time), so a sink names its objects as for one run — the `s3` sink's default
+  key `{run_date}/{run_id}/{file}` puts every attempt's files under one prefix.
+  - An **incremental** pipeline resumes from the watermark the failed attempt
+    persisted — with a sink, the last delivered file — and its destination
+    numbers new files after the ones already staged, so delivered files are
+    never replaced.
+  - A **full load** reads everything again and writes the run's files again
+    under the same names, replacing the failed attempt's. (If the new attempt
+    produces fewer files, the extra ones from the failed attempt stay.)
+- The run summary reports `attempts`; the rows and batches are the last
+  attempt's. Each failed attempt is logged as a warning with its cause.
+
+```yaml
+pipeline:
+  name: nightly-orders
+  recovery:
+    max_attempts: 3
+    backoff_seconds: 60     # waits 60 s, then 120 s
+```
 
 ### `pipeline.flow`
 

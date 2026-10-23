@@ -16,6 +16,8 @@ pub trait DestinationPlugin: Send {
     fn capabilities(&self) -> Vec<String> { /* ["batch_write"] */ }
     fn durable_through(&mut self) -> Option<u64> { None }
     fn take_ready_objects(&mut self) -> Vec<PathBuf> { Vec::new() }
+    fn take_ready(&mut self) -> Vec<ReadyObject> { /* take_ready_objects, no ranges */ }
+    fn first_object_seq(&mut self, _seq: u64) {}
 
     async fn configure(&mut self, config: PluginConfig) -> Result<()>;
     async fn prepare(&mut self) -> Result<()>;
@@ -35,6 +37,8 @@ pub trait DestinationPlugin: Send {
 | `write_batch(batch)` | Once per incoming batch | Write this `RecordBatch` to the sink |
 | `durable_through()` | After each batch | Highest batch ordinal now **durably** committed — gates the core's watermark persistence. Leave `None` if only durable at `finalize` |
 | `take_ready_objects()` | After each `write_batch()` and after `finalize()` | Return (and clear) the paths of files finalized since the last call — the SDK emits an `object_ready` for each. Required with `object_output`: advertising the capability alone delivers nothing to the sink |
+| `take_ready()` | Instead of `take_ready_objects()` | The same, with the batches each file holds (`ReadyObject { path, batches: Some(BatchRange { first, last }) }`, ordinals = the count of `write_batch` calls). Override it rather than `take_ready_objects()` when you know them: with a sink, the core then advances the incremental watermark as each file is delivered |
+| `first_object_seq(seq)` | After `start`, before `prepare()`, only when a retried run's earlier attempt staged files | Number the files you stage from `seq` on, so none takes the name of a file already delivered under the same run |
 | `finalize()` | After the IPC stream ends **cleanly** (the core writes the end marker only after the source succeeded) | Flush buffers, commit, close resources, return total `rows_written` |
 | `cancel()` | The run will not complete (after `start`): the core sent `cancel`/`error`, the core is gone (stdin closed, or fd3 ended without the end-of-stream marker), or `write_batch`/`finalize` failed | **Undo the partial load**: roll back the open transaction, drop the staging table, delete partial files. `finalize()` is never called after it |
 

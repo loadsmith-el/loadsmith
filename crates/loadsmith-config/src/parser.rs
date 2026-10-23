@@ -108,6 +108,15 @@ unknown_field: bad
     }
 
     #[test]
+    fn recovery_is_off_by_default() {
+        let (config, _) = parse_pipeline_yaml(BASIC_YAML).unwrap();
+        assert_eq!(config.pipeline.recovery.max_attempts, 1);
+        let yaml = "pipeline:\n  name: x\n  recovery:\n    max_attempts: 3\nsource:\n  type: postgres\ndestination:\n  type: jsonl\n";
+        let (config, _) = parse_pipeline_yaml(yaml).unwrap();
+        assert_eq!(config.pipeline.recovery, crate::RecoveryConfig { max_attempts: 3, backoff_seconds: 30 });
+    }
+
+    #[test]
     fn timeouts_are_partial_and_strict() {
         let yaml = r#"
 pipeline:

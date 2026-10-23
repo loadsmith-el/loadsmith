@@ -269,6 +269,11 @@ pub struct StartParams {
     /// credits will follow and the pipe alone applies backpressure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credit: Option<u64>,
+    /// To a destination, when a run is retried: number the files it stages
+    /// from here on, so they never take the names of files an earlier attempt
+    /// of the same run already delivered. Absent means from the start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_object_seq: Option<u64>,
 }
 
 // ── Flow control ──────────────────────────────────────────────────────────────
@@ -868,6 +873,7 @@ mod tests {
                 cursor_value: serde_json::json!("2026-06-09T08:00:00Z"),
             }),
             credit: None,
+            first_object_seq: None,
         });
         if let Message::Start(p) = roundtrip(&msg) {
             assert_eq!(p.resume.unwrap().cursor_value, "2026-06-09T08:00:00Z");
@@ -913,7 +919,7 @@ mod tests {
     fn start_credit_is_optional() {
         let bare: Message = serde_json::from_str(r#"{"type":"start"}"#).unwrap();
         assert!(matches!(bare, Message::Start(StartParams { credit: None, .. })));
-        let msg = Message::Start(StartParams { resume: None, credit: Some(2) });
+        let msg = Message::Start(StartParams { resume: None, credit: Some(2), first_object_seq: None });
         assert_eq!(serde_json::to_string(&msg).unwrap(), r#"{"type":"start","credit":2}"#);
     }
 

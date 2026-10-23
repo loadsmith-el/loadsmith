@@ -46,6 +46,7 @@ use crate::{
     events::{drain_events, EventForward},
     lifecycle::{
         run_handshake_and_configure, run_handshake_and_configure_with, start_and_await_ready, start_source,
+        start_with_and_await_ready,
         PluginHandshake,
     },
     parser_feed::{await_parser_schema, Feed, FeedEvent},
@@ -130,6 +131,10 @@ impl RunOpts {
 /// gate, the state lock, a signal); the plugins are cancelled and reaped
 /// first. Once data flows, the outcome — success, error, or cancelled by a
 /// signal — is a [`Summary`] (already printed) with the root cause.
+///
+/// With `pipeline.recovery.max_attempts` above 1, a run that failed for a
+/// reason that may pass ([`retryable`]) runs again, after a doubling wait,
+/// under the same run id; the result is the last attempt's.
 pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summary, CoreError> {
     validate_pipeline(&config)?;
 
@@ -140,10 +145,89 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         return Ok(Summary {
             pipeline_name: config.pipeline.name.clone(),
             status: SummaryStatus::Success,
+            attempts: 1,
             ..Default::default()
         });
     }
 
+    let recovery = config.pipeline.recovery;
+    let max_attempts = recovery.max_attempts.max(1);
+    let mut attempt = Attempt {
+        number: 1,
+        started_at_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
+        objects_staged: Arc::default(),
+    };
+    loop {
+        let outcome = run_attempt(config.clone(), &opts, &attempt).await;
+        let cause = match &outcome {
+            Ok(summary) if summary.status == SummaryStatus::Error => summary.root_cause.clone(),
+            Err(e) if retryable(e) => Some(opts.mask.apply(&e.to_string())),
+            _ => None,
+        };
+        let mut shutdown = opts.shutdown.clone();
+        let Some(cause) = cause.filter(|_| attempt.number < max_attempts && shutdown.fired().is_none()) else {
+            return outcome.map(|summary| Summary { attempts: attempt.number, ..summary });
+        };
+        let wait = backoff(recovery.backoff_seconds, attempt.number);
+        tracing::warn!(
+            attempt = attempt.number,
+            max_attempts,
+            "attempt {} of {max_attempts} failed: {cause}; retrying in {}s (pipeline.recovery)",
+            attempt.number,
+            wait.as_secs()
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = shutdown.wait() => {
+                return outcome.map(|summary| Summary { attempts: attempt.number, ..summary });
+            }
+        }
+        attempt.number += 1;
+    }
+}
+
+/// One attempt of a run: its number (1-based), and what every attempt of the
+/// run shares.
+struct Attempt {
+    number: u32,
+    /// When the first attempt started: the run's `configure.run` (and so the
+    /// sink's object names) stays the same across attempts.
+    started_at_unix_ms: u64,
+    /// The files the destination staged so far, across attempts.
+    objects_staged: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Whether a failure may pass on its own (a plugin failure, a timeout, a lost
+/// connection — a database down at `configure` is reported as a rejected
+/// config): those are retried. A configuration error, a missing or
+/// incompatible plugin, a protocol violation, a state problem (the lock, a
+/// schema drift) or an operator signal is not.
+fn retryable(e: &CoreError) -> bool {
+    match e {
+        CoreError::PluginFailed(_)
+        | CoreError::PluginProcess(_)
+        | CoreError::PluginRejectedConfig(_)
+        | CoreError::Timeout(_)
+        | CoreError::Transport(_)
+        | CoreError::Io(_) => true,
+        CoreError::PluginNotFound(_)
+        | CoreError::PluginIncompatible(_)
+        | CoreError::Protocol(_)
+        | CoreError::Interrupted(_)
+        | CoreError::Config(_)
+        | CoreError::State(_) => false,
+    }
+}
+
+/// The wait before attempt `failed + 1`: `base`, doubled for each attempt
+/// after the second, at most an hour.
+fn backoff(base: u64, failed: u32) -> Duration {
+    let factor = 1u64 << failed.saturating_sub(1).min(20);
+    Duration::from_secs(base.saturating_mul(factor).min(3600))
+}
+
+/// One attempt of [`run_pipeline`].
+async fn run_attempt(config: PipelineConfig, opts: &RunOpts, attempt: &Attempt) -> Result<Summary, CoreError> {
     let mut shutdown = opts.shutdown.clone();
     if let Some(halt) = shutdown.fired() {
         return Err(Failure::halted(halt).error);
@@ -154,7 +238,7 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     let run = Some(loadsmith_protocol::RunInfo {
         id: opts.run_id.clone(),
         pipeline: config.pipeline.name.clone(),
-        started_at_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
+        started_at_unix_ms: attempt.started_at_unix_ms,
     });
 
     // ── Incremental state setup ───────────────────────────────────────────
@@ -179,7 +263,9 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     };
     let resume_value = prior_state.as_ref().map(|d| d.cursor_value.clone());
     let facts = opts.facts.clone();
-    facts.update(|f| f.watermark_before = resume_value.clone());
+    if attempt.number == 1 {
+        facts.update(|f| f.watermark_before = resume_value.clone());
+    }
     let (checkpoint_tx, checkpoint_rx) = maybe_channel(state_enabled);
     let (committed_tx, committed_rx) = maybe_channel(state_enabled);
 
@@ -188,7 +274,7 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     let reporter = Reporter::new(opts.color);
     let parser_type = config.parser.as_ref().map(|p| p.plugin_type.clone());
     let sink_type = config.sink.as_ref().map(|s| s.plugin_type.clone());
-    if opts.human_report {
+    if opts.human_report && attempt.number == 1 {
         reporter.header(
             &opts.version,
             &config.source.plugin_type,
@@ -327,11 +413,19 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
             .await;
         })
     });
+    let objects_seen = Arc::clone(&attempt.objects_staged);
     let dst_events = tokio::spawn(async move {
         drain_events(
             ControlReader::new(BufReader::new(dst_event)),
             "destination",
-            EventForward { staged_tx: object_tx, committed_tx, mask: dst_mask, scope: dst_scope, ..Default::default() },
+            EventForward {
+                staged_tx: object_tx,
+                committed_tx,
+                objects_seen: Some(objects_seen),
+                mask: dst_mask,
+                scope: dst_scope,
+                ..Default::default()
+            },
         )
         .await;
     });
@@ -532,7 +626,19 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
 
         }
 
-        start_and_await_ready(&mut dst, &timeouts, &mut shutdown).await?;
+        // A retried incremental run goes on after the files its earlier
+        // attempts staged: those up to the watermark are delivered and must
+        // keep their names. A full load reads everything again and replaces
+        // them.
+        let staged = attempt.objects_staged.load(Ordering::Relaxed);
+        let first_object_seq = (state_enabled && staged > 0).then_some(staged + 1);
+        start_with_and_await_ready(
+            &mut dst,
+            loadsmith_protocol::StartParams { first_object_seq, ..Default::default() },
+            &timeouts,
+            &mut shutdown,
+        )
+        .await?;
         tracing::info!("destination ready — pump starting");
         Ok((src_info, prs_info, dst_info, reader))
     }
@@ -776,6 +882,7 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         duration,
         root_cause: root_cause.map(|c| opts.mask.apply(&c)),
         signal,
+        attempts: attempt.number,
     };
 
     if opts.human_report {

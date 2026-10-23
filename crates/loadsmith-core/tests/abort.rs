@@ -25,6 +25,9 @@ fn main() {
     let tests: &[(&str, fn())] = &[
         ("happy_path_finalizes_once", happy_path_finalizes_once),
         ("credits_bound_the_source", credits_bound_the_source),
+        ("recovery_retries_a_failure_that_passes", recovery_retries_a_failure_that_passes),
+        ("recovery_is_off_by_default", recovery_is_off_by_default),
+        ("recovery_does_not_retry_a_missing_plugin", recovery_does_not_retry_a_missing_plugin),
         ("source_crash_mid_stream_cancels_destination", source_crash_mid_stream_cancels_destination),
         ("source_finished_error_cancels_destination", source_finished_error_cancels_destination),
         ("destination_crash_cancels_source", destination_crash_cancels_source),
@@ -233,6 +236,64 @@ fn credits_bound_the_source() {
     for (n, granted) in &credits {
         assert_eq!(n, granted, "{credits:?}");
     }
+}
+
+/// `pipeline.recovery`: the first attempt fails mid-stream, the second runs
+/// the pipeline again and succeeds; the run reports both.
+fn recovery_retries_a_failure_that_passes() {
+    let run = Run::new("retry");
+    let yaml = pipeline_yaml(
+        "retry",
+        "fake",
+        run.src_config(json!({ "batches": 4, "fail_once_after": 2 })),
+        run.dst_config(json!({})),
+        &format!("{}  recovery:\n    max_attempts: 3\n    backoff_seconds: 0\n", timeouts("")),
+        "",
+    );
+    let summary = run.exec(&yaml).expect("run");
+    assert_eq!(summary.status, SummaryStatus::Success, "{:?}", summary.root_cause);
+    assert_eq!(summary.attempts, 2);
+    assert_eq!(summary.rows_written, 40);
+    let src = run.journal("source");
+    assert_eq!(src.iter().filter(|l| *l == "configure").count(), 2, "{src:?}");
+    let dst = run.journal("destination");
+    assert_eq!(dst.iter().filter(|l| *l == "cancel").count(), 1, "the failed attempt rolled back: {dst:?}");
+    assert_eq!(dst.iter().filter(|l| *l == "finalize").count(), 1, "{dst:?}");
+}
+
+/// Without `pipeline.recovery` a failure is final, as before.
+fn recovery_is_off_by_default() {
+    let run = Run::new("noretry");
+    let yaml = pipeline_yaml(
+        "noretry",
+        "fake",
+        run.src_config(json!({ "batches": 4, "fail_once_after": 2 })),
+        run.dst_config(json!({})),
+        &timeouts(""),
+        "",
+    );
+    let summary = run.exec(&yaml).expect("run");
+    assert_eq!(summary.status, SummaryStatus::Error);
+    assert_eq!(summary.attempts, 1);
+    assert_eq!(run.journal("source").iter().filter(|l| *l == "configure").count(), 1);
+}
+
+/// A failure that can't pass (here, no such plugin) is not retried, nor
+/// waited on.
+fn recovery_does_not_retry_a_missing_plugin() {
+    let run = Run::new("nosuch");
+    let yaml = pipeline_yaml(
+        "nosuch",
+        "no-such-type",
+        json!({}),
+        run.dst_config(json!({})),
+        &format!("{}  recovery:\n    max_attempts: 3\n    backoff_seconds: 30\n", timeouts("")),
+        "",
+    );
+    let began = Instant::now();
+    let err = run.exec(&yaml).expect_err("no plugin");
+    assert!(matches!(err, CoreError::PluginNotFound(_)), "{err}");
+    assert!(began.elapsed() < Duration::from_secs(10), "retried: {:?}", began.elapsed());
 }
 
 /// The bug: a source dying at a batch boundary looked like a clean end, the

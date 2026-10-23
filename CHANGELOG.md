@@ -21,6 +21,16 @@ release notes in their repositories.
   what never reached the target (1.0.1 kept the watermark where it was, so the
   next run read everything again). Destinations that announce no ranges keep
   the all-or-nothing rule.
+- **`pipeline.recovery`: retry a failed run in the same process.** Off by
+  default (`max_attempts: 1`). With more attempts, a run that failed for a
+  reason that may pass (a plugin failure, a timeout, a failed delivery, a
+  lost connection) runs again after a doubling wait (`backoff_seconds`,
+  default 30), under the same run id and start time, so a sink keeps one
+  prefix for the run. An incremental pipeline resumes from the watermark the
+  failed attempt persisted, and its destination numbers new files after the
+  staged ones (new `start.first_object_seq`, SDK
+  `DestinationPlugin::first_object_seq`). The run summary reports `attempts`
+  (also a new field of the JSON run summary).
 
 ### Fixed
 

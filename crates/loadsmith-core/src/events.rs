@@ -24,6 +24,9 @@ pub struct EventForward {
     pub checkpoint_tx: Option<UnboundedSender<(u64, serde_json::Value)>>,
     /// `Committed` batch_seq → state supervisor. Destination drain.
     pub committed_tx: Option<UnboundedSender<u64>>,
+    /// Counts `ObjectReady` events (destination drain): the files a run has
+    /// staged so far, across its attempts.
+    pub objects_seen: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// Resolved template values to redact from the plugin's log lines and
     /// from anything else this drain prints. A shared handle: values added
     /// later are masked too.
@@ -135,6 +138,9 @@ pub async fn drain_events<R: AsyncBufRead + Unpin>(
             }
             Ok(Some(Message::ObjectReady(o))) => {
                 tracing::debug!(plugin, path = %o.path, "object ready for delivery");
+                if let Some(seen) = &forward.objects_seen {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 if let Some(tx) = &forward.staged_tx {
                     let batches = o.batches.map(|r| (r.first, r.last));
                     let _ = tx.send(StagedObject { path: PathBuf::from(&o.path), batches });

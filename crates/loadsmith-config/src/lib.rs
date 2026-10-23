@@ -9,7 +9,7 @@ pub mod strict;
 
 pub use document::{resolve_subtrees, Document, SECRET_FREE_BLOCKS};
 pub use model::{
-    FlowConfig,
+    FlowConfig, RecoveryConfig,
     OtlpProtocol, PipelineConfig, PluginRef, ProviderRef, SamplingConfig, SchemaChangePolicy, StateConfig,
     TelemetryConfig, TelemetrySignal, Timeouts,
     DEFAULT_PROVIDER_TIMEOUT_SECONDS,

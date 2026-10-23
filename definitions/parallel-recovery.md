@@ -288,6 +288,29 @@ type probe, in ms/us/ns).
   thread; column-parallel conversion (F2) matters after that.
 - W7/W8 (core raw forward, 1 MiB pipes) deferred: the core used 0.7 CPU-s.
 
+### F3 progress (2026-10-23)
+
+- **F3b tie-safe watermarks — done** (SDK `TieSafeCursor`; postgres, oracle,
+  mysql). Lab case `postgres-to-parquet-localcopy-outage-ties`.
+- **F3a delivered-prefix durability — done** (`object_ready.batches`, parquet
+  ranges, sink ledger `DeliveredPrefix` → state supervisor). The outage case
+  now reads only the undelivered rows on run 2 (96,001 of 100,000).
+  *Deviation:* no `object_batch_ranges` capability (presence of the field
+  suffices); parquet without a sink keeps all-or-nothing (its local dataset is
+  atomic by design), so no `durable_through` there.
+- **F3d `pipeline.recovery` — done** (in-process retry, default off; same run
+  id and start time; incremental continues file numbering via
+  `start.first_object_seq`).
+- **F3c resume record across processes — deferred.** For the client flow
+  (incremental → S3) F3a already resumes at the delivered prefix and every run
+  keeps its own `run_id` prefix, so the data is complete; reusing the run id
+  across processes would only merge the prefixes, and keeping the file
+  numbering crash-safe needs it persisted continuously. Revisit with F4
+  (partition-set resume needs a record anyway).
+- Found: `local-copy` names objects by file name only, so two incremental runs
+  into the same `dest` replace each other's files. A `key` template like the
+  s3 sink's would fix it (parked).
+
 ## 6. Validation
 
 - **Byte-identical output** for F1/F2: compare Parquet against 1.0.0 on the same
