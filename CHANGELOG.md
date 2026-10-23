@@ -9,6 +9,8 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-23
+
 ### Added
 
 - **Flow control: the core decides how far a source reads ahead.** After each
@@ -414,7 +416,8 @@ release.
 - The hermetic `Dockerfile` gains the same targets.
 - Container Images documentation page.
 
-[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.0-rc.2...v1.0.0
 [1.0.0-rc.2]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.0-rc.1...v1.0.0-rc.2

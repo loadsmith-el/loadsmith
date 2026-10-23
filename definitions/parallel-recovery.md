@@ -268,6 +268,26 @@ seconds per thread sampled from `/proc` (DB = the database container's CPU):
   and the main thread spends 6.1 s parsing those strings back. The database
   needs only 3.9 s. Native cells (W1–W4) and parallel conversion target ≥2×.
 
+### F1 results (2026-10-23)
+
+Released as engine **1.1.0**, postgres **0.5.0**, oracle **0.6.0**. Same 5M
+rows, A/B interleaved against the 1.0 plugins on the same machine (loaded by
+other work, so absolute times are indicative; the F5 bench repeats them on a
+quiet machine). Output byte-identical (JSONL of the bench tables and an Oracle
+type probe, in ms/us/ns).
+
+| Run | Before | After | Where the time goes now |
+|---|---|---|---|
+| pg → null | 16.9 s | **7.4 s** (2.3×) | conversion 7.0 s (0.96 core) ≈ database 6.2 s |
+| oracle → null | 19.2 s | **12.2 s** (1.6×) | `oracle-fetch` 9.4 s (driver decode + one connection's waits), conversion 7.7 s |
+
+- **Postgres** is now at the database's pace on one connection; column-parallel
+  conversion (F2) only helps once partitioned reads (F4) raise the database side.
+- **Oracle** is bound by the driver's decode on one connection: the next step is
+  partitioned reads (F4), each partition with its own connection and fetch
+  thread; column-parallel conversion (F2) matters after that.
+- W7/W8 (core raw forward, 1 MiB pipes) deferred: the core used 0.7 CPU-s.
+
 ## 6. Validation
 
 - **Byte-identical output** for F1/F2: compare Parquet against 1.0.0 on the same
