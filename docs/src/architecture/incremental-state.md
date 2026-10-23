@@ -67,6 +67,7 @@ advance:
 | default | at `finalize` | end of run | at-least-once |
 | implements `durable_through()` | incremental flush | intra-run | at-least-once |
 | `mode: merge` | one transaction at end | end of run | exactly-once effective |
+| file destination + sink, with `object_ready.batches` (`parquet`) | each file delivered by the sink | per delivered file | at-least-once |
 
 The core reads no durability capability: intra-run durability is reported by
 implementing `DestinationPlugin::durable_through()`, after which the SDK emits a

@@ -15,6 +15,14 @@ use tracing::Instrument;
 use crate::config::PluginConfig;
 use crate::control::{answer_configure, conclude, handshake, recv_configure, recv_start, Control, Flow};
 
+/// A finalized file a sink can deliver, and the batches it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyObject {
+    pub path: std::path::PathBuf,
+    /// The first and last batch ordinal in the file (inclusive), when known.
+    pub batches: Option<loadsmith_protocol::BatchRange>,
+}
+
 /// Implemented by destination plugins.
 #[async_trait]
 pub trait DestinationPlugin: Send {
@@ -34,6 +42,17 @@ pub trait DestinationPlugin: Send {
     /// with no file output (databases, `null`) leave the default empty impl.
     fn take_ready_objects(&mut self) -> Vec<std::path::PathBuf> {
         Vec::new()
+    }
+
+    /// Like [`take_ready_objects`](Self::take_ready_objects), with the batches
+    /// each file holds. A destination that knows them overrides this one
+    /// instead: the core then counts a file's batches durable as soon as the
+    /// sink delivered it, so the incremental watermark advances file by file
+    /// rather than only at the end of the run. The batch ordinals are the
+    /// 1-based count of `write_batch` calls. The default wraps
+    /// `take_ready_objects` without ranges.
+    fn take_ready(&mut self) -> Vec<ReadyObject> {
+        self.take_ready_objects().into_iter().map(|path| ReadyObject { path, batches: None }).collect()
     }
 
     /// Called after `configure`. Plugin validates config and prepares.
@@ -200,8 +219,8 @@ async fn drive_destination<P: DestinationPlugin, W: AsyncWrite + Unpin, E: Async
                 drop(span);
                 // Announce any files finalized by this batch (e.g. a chunk that
                 // rolled over) so the sink can start delivering mid-pump.
-                for path in plugin.take_ready_objects() {
-                    events.object_ready(path.to_string_lossy().into_owned()).await;
+                for object in plugin.take_ready() {
+                    events.object_ready_with(object.path.to_string_lossy().into_owned(), object.batches).await;
                 }
                 // Tell the core how far durability has advanced, so it may
                 // persist the matching watermark mid-run.
@@ -235,8 +254,8 @@ async fn drive_destination<P: DestinationPlugin, W: AsyncWrite + Unpin, E: Async
     // Announce the final files (single-file mode closes its only file here, and
     // chunked mode closes the last partial chunk). These events must reach fd4
     // before the process exits so the sink delivers every object.
-    for path in plugin.take_ready_objects() {
-        events.object_ready(path.to_string_lossy().into_owned()).await;
+    for object in plugin.take_ready() {
+        events.object_ready_with(object.path.to_string_lossy().into_owned(), object.batches).await;
     }
     // finalize() succeeded ⇒ everything is durable. Emit a final Committed
     // covering every batch (the only durability signal for staged/atomic

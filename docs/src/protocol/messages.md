@@ -466,11 +466,13 @@ the moment it closes while the pump keeps filling the next.
 
 ```json
 {"type": "object_ready", "path": "/scratch/events.00000001.snappy.parquet"}
+{"type": "object_ready", "path": "/scratch/events.00000002.snappy.parquet", "batches": {"first": 5, "last": 9}}
 ```
 
 | Field | Type | Description |
 |---|---|---|
 | `path` | string | Local path of the finalized file |
+| `batches` | object (optional) | The batches the file holds: `first` and `last` batch ordinal, inclusive (as in [`checkpoint`](#checkpoint)). With it, the core counts those batches durable as soon as the sink delivered the file, so the incremental watermark advances file by file; without it, only once every object was delivered. Files announce contiguous ranges, in order |
 
 A **raw source** (capability `object_output`) sends `object_ready` for each
 local file it produces, once the file is complete; the core forwards each

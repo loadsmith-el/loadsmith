@@ -9,6 +9,19 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+### Added
+
+- **With a sink, the incremental watermark advances file by file.** A file
+  destination may announce the batches each file holds (`object_ready.batches`,
+  SDK `DestinationPlugin::take_ready` / `ReadyObject`); the core then counts
+  them durable once the sink delivered the file, and persists the watermark at
+  the **delivered prefix** during the run (throttled by
+  `state.checkpoint_interval`). When the sink fails for good, the run fails
+  with the watermark at the last delivered file, and the next run reads only
+  what never reached the target (1.0.1 kept the watermark where it was, so the
+  next run read everything again). Destinations that announce no ranges keep
+  the all-or-nothing rule.
+
 ### Fixed
 
 - **A watermark persisted mid-run could skip rows tied on the cursor.** A

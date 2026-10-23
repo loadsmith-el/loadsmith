@@ -333,6 +333,18 @@ pub struct Progress {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectReady {
     pub path: String,
+    /// The batches the file holds (a file-output destination). Optional and
+    /// additive: with it, the core counts the batches durable once the sink
+    /// delivered the file; without it, only at the end of the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batches: Option<BatchRange>,
+}
+
+/// An inclusive range of batch ordinals (1-based, as in `checkpoint`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchRange {
+    pub first: u64,
+    pub last: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -958,6 +970,7 @@ mod tests {
     fn object_ready_roundtrip() {
         let msg = Message::ObjectReady(ObjectReady {
             path: "/scratch/events.00000001.snappy.parquet".into(),
+            batches: None,
         });
         if let Message::ObjectReady(o) = roundtrip(&msg) {
             assert_eq!(o.path, "/scratch/events.00000001.snappy.parquet");
@@ -965,7 +978,15 @@ mod tests {
             panic!("wrong variant");
         }
         let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"type\":\"object_ready\""));
+        assert!(json.contains("\"type\":\"object_ready\"") && !json.contains("batches"));
+        let ranged = Message::ObjectReady(ObjectReady {
+            path: "a.parquet".into(),
+            batches: Some(BatchRange { first: 3, last: 7 }),
+        });
+        assert_eq!(
+            serde_json::to_string(&ranged).unwrap(),
+            r#"{"type":"object_ready","path":"a.parquet","batches":{"first":3,"last":7}}"#
+        );
     }
 
     #[test]

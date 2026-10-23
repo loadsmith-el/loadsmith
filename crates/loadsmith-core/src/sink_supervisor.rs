@@ -22,15 +22,16 @@
 //! The control channel is read through [`Peer`], whose inbound channel is
 //! cancel-safe, so the supervisor can `select!` over it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use loadsmith_config::Timeouts;
 use loadsmith_protocol::{DeliverObject, FinishedStatus, Message, PluginKind, UnknownKeys};
 use tokio::io::BufReader;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
+use crate::events::StagedObject;
 use crate::{
     error::CoreError,
     events::drain_events,
@@ -77,19 +78,20 @@ pub struct SinkLaunch {
 
 /// Runs the sink stage to completion, respawning the sink as needed.
 ///
-/// `object_rx` yields staged file paths as the destination finalizes them and
+/// `object_rx` yields staged files as the destination finalizes them and
 /// closes when the destination's event channel reaches EOF (i.e. no more files
-/// will be produced).
+/// will be produced). `delivered_tx` receives the [`DeliveredPrefix`] each time
+/// it advances.
 pub async fn run_sink_supervisor(
     launch: SinkLaunch,
-    mut object_rx: UnboundedReceiver<PathBuf>,
+    mut object_rx: UnboundedReceiver<StagedObject>,
+    delivered_tx: Option<UnboundedSender<u64>>,
     timeouts: Timeouts,
     mut shutdown: Shutdown,
 ) -> Result<SinkOutcome, CoreError> {
     let SinkLaunch { binary, config, unknown_keys, mask, run } = launch;
     // Ledger — lives across respawns.
-    let mut emitted: Vec<PathBuf> = Vec::new();
-    let mut delivered: HashSet<PathBuf> = HashSet::new();
+    let mut ledger = Ledger { emitted: Vec::new(), delivered: HashSet::new(), prefix: DeliveredPrefix::new(delivered_tx) };
     let mut input_closed = false;
     let mut restarts: u32 = 0;
     let grace = Duration::from_secs(timeouts.cancel_grace_seconds);
@@ -145,7 +147,7 @@ pub async fn run_sink_supervisor(
 
         // Resume: (re-)send every object not yet acknowledged, in order.
         let pending: Vec<PathBuf> =
-            emitted.iter().filter(|p| !delivered.contains(*p)).cloned().collect();
+            ledger.pending().cloned().collect();
         if restarts > 0 && !pending.is_empty() {
             tracing::warn!(count = pending.len(), "resuming sink — re-sending unacked objects");
             peer.scope().event("retry", vec![opentelemetry::KeyValue::new("loadsmith.objects", pending.len() as i64)]);
@@ -167,8 +169,7 @@ pub async fn run_sink_supervisor(
             drive_instance(
                 &mut peer,
                 &mut object_rx,
-                &mut emitted,
-                &mut delivered,
+                &mut ledger,
                 &mut input_closed,
                 &mut shutdown,
                 &mut deliveries,
@@ -197,7 +198,7 @@ pub async fn run_sink_supervisor(
                 return Ok(SinkOutcome {
                     name: sink_name,
                     version: sink_version,
-                    objects_delivered: delivered.len() as u64,
+                    objects_delivered: ledger.delivered.len() as u64,
                 });
             }
             Driven::Halted(halt) => {
@@ -205,8 +206,8 @@ pub async fn run_sink_supervisor(
                     Halt::Signal(sig) => CoreError::Interrupted(sig),
                     Halt::Abort(reason) => CoreError::PluginProcess(format!(
                         "sink cancelled ({reason}); {} of {} objects delivered",
-                        delivered.len(),
-                        emitted.len()
+                        ledger.delivered.len(),
+                        ledger.emitted.len()
                     )),
                 });
             }
@@ -216,13 +217,73 @@ pub async fn run_sink_supervisor(
                     return Err(CoreError::PluginFailed(format!(
                         "sink failed after {MAX_RESTARTS} restarts (last: {reason}); \
                          {} of {} objects delivered",
-                        delivered.len(),
-                        emitted.len()
+                        ledger.delivered.len(),
+                        ledger.emitted.len()
                     )));
                 }
                 tracing::warn!(restarts, reason, "sink stopped — respawning");
                 telemetry::record_respawn(PluginKind::Sink.as_str());
                 // Loop respawns and resumes from the ledger.
+            }
+        }
+    }
+}
+
+/// What the sink was handed and what it acknowledged — lives across respawns.
+struct Ledger {
+    /// Every object announced, in order.
+    emitted: Vec<PathBuf>,
+    delivered: HashSet<PathBuf>,
+    prefix: DeliveredPrefix,
+}
+
+impl Ledger {
+    /// The objects not yet acknowledged, in order.
+    fn pending(&self) -> impl Iterator<Item = &PathBuf> {
+        self.emitted.iter().filter(|p| !self.delivered.contains(*p))
+    }
+
+    fn all_delivered(&self) -> bool {
+        self.emitted.iter().all(|p| self.delivered.contains(p))
+    }
+}
+
+/// The highest batch ordinal whose rows are all delivered: every file holding
+/// batches `1..=n` was acknowledged by the sink. Files announce their batch
+/// ranges in order; a file without a range stops the prefix (that
+/// destination's batches count only at the end of the run).
+pub(crate) struct DeliveredPrefix {
+    ranges: HashMap<PathBuf, (u64, u64)>,
+    through: u64,
+    tx: Option<UnboundedSender<u64>>,
+}
+
+impl DeliveredPrefix {
+    pub(crate) fn new(tx: Option<UnboundedSender<u64>>) -> Self {
+        Self { ranges: HashMap::new(), through: 0, tx }
+    }
+
+    fn record(&mut self, object: &StagedObject) {
+        if let Some(range) = object.batches {
+            self.ranges.insert(object.path.clone(), range);
+        }
+    }
+
+    /// Recomputes the prefix after a delivery; reports it when it advanced.
+    fn update(&mut self, emitted: &[PathBuf], delivered: &HashSet<PathBuf>) {
+        let mut through = 0;
+        for path in emitted {
+            match self.ranges.get(path) {
+                Some(&(first, last)) if delivered.contains(path) && first <= through + 1 => {
+                    through = through.max(last);
+                }
+                _ => break,
+            }
+        }
+        if through > self.through {
+            self.through = through;
+            if let Some(tx) = &self.tx {
+                let _ = tx.send(through);
             }
         }
     }
@@ -237,9 +298,8 @@ pub async fn run_sink_supervisor(
 /// never comes.
 async fn drive_instance(
     peer: &mut Peer,
-    object_rx: &mut UnboundedReceiver<PathBuf>,
-    emitted: &mut Vec<PathBuf>,
-    delivered: &mut HashSet<PathBuf>,
+    object_rx: &mut UnboundedReceiver<StagedObject>,
+    ledger: &mut Ledger,
     input_closed: &mut bool,
     shutdown: &mut Shutdown,
     deliveries: &mut Deliveries,
@@ -252,7 +312,7 @@ async fn drive_instance(
     loop {
         // Once the destination is done and every emitted object is acked, close
         // the sink's stdin so it sees EOF and finalizes.
-        if *input_closed && input_open && emitted.iter().all(|p| delivered.contains(p)) {
+        if *input_closed && input_open && ledger.all_delivered() {
             peer.close_input();
             input_open = false;
             tracing::debug!("all objects delivered; closed sink stdin");
@@ -262,9 +322,11 @@ async fn drive_instance(
             halt = shutdown.wait() => return Driven::Halted(halt),
             maybe = object_rx.recv(), if !*input_closed => {
                 match maybe {
-                    Some(path) => {
-                        if !delivered.contains(&path) && !emitted.contains(&path) {
-                            emitted.push(path.clone());
+                    Some(object) => {
+                        ledger.prefix.record(&object);
+                        let path = object.path;
+                        if !ledger.delivered.contains(&path) && !ledger.emitted.contains(&path) {
+                            ledger.emitted.push(path.clone());
                             if input_open {
                                 if let Err(e) = send_deliver(peer, &path, deliveries).await {
                                     return Driven::Recoverable(format!("deliver send failed: {e}"));
@@ -287,7 +349,8 @@ async fn drive_instance(
                     Event::Msg(Message::ObjectDelivered(d)) => {
                         let path = PathBuf::from(d.path);
                         deliveries.done(&path);
-                        delivered.insert(path);
+                        ledger.delivered.insert(path);
+                        ledger.prefix.update(&ledger.emitted, &ledger.delivered);
                     }
                     Event::Msg(Message::Pong) => {
                         awaiting_pong = false;
@@ -305,7 +368,7 @@ async fn drive_instance(
                     Event::ResendRequested => {
                         if input_open {
                             let pending: Vec<PathBuf> =
-                                emitted.iter().filter(|p| !delivered.contains(*p)).cloned().collect();
+                                ledger.pending().cloned().collect();
                             tracing::debug!(count = pending.len(), "sink asked for a resend");
                             for p in &pending {
                                 if let Err(e) = send_deliver(peer, p, deliveries).await {
@@ -369,5 +432,55 @@ impl Deliveries {
         for (_, span) in self.0.drain() {
             span.record("error", "not acknowledged by the sink");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn staged(name: &str, batches: Option<(u64, u64)>) -> StagedObject {
+        StagedObject { path: PathBuf::from(name), batches }
+    }
+
+    /// Marks `name` delivered; returns the prefixes reported.
+    fn deliver(ledger: &mut Ledger, name: &str, rx: &mut UnboundedReceiver<u64>) -> Vec<u64> {
+        ledger.delivered.insert(PathBuf::from(name));
+        ledger.prefix.update(&ledger.emitted, &ledger.delivered);
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn ledger(objects: &[StagedObject]) -> (Ledger, UnboundedReceiver<u64>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ledger =
+            Ledger { emitted: Vec::new(), delivered: HashSet::new(), prefix: DeliveredPrefix::new(Some(tx)) };
+        for o in objects {
+            ledger.prefix.record(o);
+            ledger.emitted.push(o.path.clone());
+        }
+        (ledger, rx)
+    }
+
+    #[test]
+    fn the_prefix_waits_for_every_earlier_file() {
+        let (mut l, mut rx) = ledger(&[staged("a", Some((1, 3))), staged("b", Some((4, 6))), staged("c", Some((7, 7)))]);
+        assert_eq!(deliver(&mut l, "b", &mut rx), Vec::<u64>::new(), "a is still pending");
+        assert_eq!(deliver(&mut l, "a", &mut rx), vec![6]);
+        assert_eq!(deliver(&mut l, "c", &mut rx), vec![7]);
+    }
+
+    #[test]
+    fn a_file_without_a_range_stops_the_prefix() {
+        let (mut l, mut rx) = ledger(&[staged("a", Some((1, 2))), staged("b", None), staged("c", Some((5, 6)))]);
+        assert_eq!(deliver(&mut l, "a", &mut rx), vec![2]);
+        assert_eq!(deliver(&mut l, "c", &mut rx), Vec::<u64>::new());
+        assert_eq!(deliver(&mut l, "b", &mut rx), Vec::<u64>::new(), "b's batches are unknown");
+    }
+
+    #[test]
+    fn a_gap_between_ranges_stops_the_prefix() {
+        let (mut l, mut rx) = ledger(&[staged("a", Some((1, 2))), staged("b", Some((4, 5)))]);
+        assert_eq!(deliver(&mut l, "a", &mut rx), vec![2]);
+        assert_eq!(deliver(&mut l, "b", &mut rx), Vec::<u64>::new(), "batch 3 is in no file");
     }
 }

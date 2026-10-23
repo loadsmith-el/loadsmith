@@ -132,3 +132,26 @@ run fails with a clear error.
 This in-process recovery (the core survives, the sink restarts) is distinct from
 resuming across a whole-run crash, which belongs to the future *state &
 checkpoints* work.
+
+## Delivered means durable: the incremental watermark
+
+With a sink, a batch is durable when the file holding it **reached the
+target**, not when the destination wrote it locally. A destination that knows
+which batches each file holds says so in `object_ready.batches` (`parquet`
+does); the ledger then tracks the **delivered prefix** — the highest batch
+whose file, and every earlier file, the sink acknowledged — and the state
+supervisor uses it as the durable frontier of the incremental watermark:
+
+- the watermark advances file by file during the run (throttled by
+  `state.checkpoint_interval`);
+- if the sink fails for good, the run fails with the watermark at the last
+  delivered file, and the next run reads only what did not reach the target
+  (plus the rows tied with the boundary value, see
+  [Incremental State](./incremental-state.md)).
+
+A destination that announces no batch ranges keeps the all-or-nothing rule:
+the watermark is persisted only once the sink delivered every object.
+
+Each run's objects must land under names of their own (the `s3` sink's default
+key is `{run_date}/{run_id}/{file}`): a sink that names objects by file name
+alone (`local-copy`) lets a later run's file replace an earlier run's.

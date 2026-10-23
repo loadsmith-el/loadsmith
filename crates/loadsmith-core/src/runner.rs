@@ -331,7 +331,7 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         drain_events(
             ControlReader::new(BufReader::new(dst_event)),
             "destination",
-            EventForward { object_tx, committed_tx, mask: dst_mask, scope: dst_scope, ..Default::default() },
+            EventForward { staged_tx: object_tx, committed_tx, mask: dst_mask, scope: dst_scope, ..Default::default() },
         )
         .await;
     });
@@ -352,6 +352,7 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     let mut sink_task = None;
     let mut state_task = None;
     let mut delivery_gate = None;
+    let mut delivered_prefix = None;
     // Flow control, when the producer is a source that obeys credits: the
     // pump sizes the window, the data phase relays its grants.
     let mut flow_window: Option<FlowWindow> = None;
@@ -446,6 +447,9 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
             // the sink reports every object delivered (see state_supervisor).
             let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
             delivery_gate = Some(gate_rx);
+            // The delivered prefix: the state supervisor's durable frontier.
+            let (prefix_tx, prefix_rx) = maybe_channel(state_enabled);
+            delivered_prefix = prefix_rx;
             let supervisor = run_sink_supervisor(
                 SinkLaunch {
                     binary: bin,
@@ -455,6 +459,7 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
                     run: run.clone(),
                 },
                 rx,
+                prefix_tx,
                 timeouts,
                 sink_shutdown,
             );
@@ -521,7 +526,8 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
                 checkpoint_interval: config.state.as_ref().map(|c| c.checkpoint_interval).unwrap_or(0),
             };
             state_task = Some(tokio::spawn(
-                run_state_supervisor(backend, guard, run, ck_rx, cm_rx, delivery_gate.take()).in_current_span(),
+                run_state_supervisor(backend, guard, run, ck_rx, cm_rx, delivery_gate.take(), delivered_prefix.take())
+                    .in_current_span(),
             ));
 
         }

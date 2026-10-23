@@ -15,8 +15,11 @@ use tokio::sync::mpsc::UnboundedSender;
 /// corresponding supervisor has exited).
 #[derive(Default)]
 pub struct EventForward {
-    /// `ObjectReady` paths → sink supervisor.
+    /// `ObjectReady` paths → the parser feed (raw source drain).
     pub object_tx: Option<UnboundedSender<PathBuf>>,
+    /// `ObjectReady` paths with their batch ranges → sink supervisor
+    /// (destination drain).
+    pub staged_tx: Option<UnboundedSender<StagedObject>>,
     /// `Checkpoint` (batch_seq, cursor_value) → state supervisor. Source drain.
     pub checkpoint_tx: Option<UnboundedSender<(u64, serde_json::Value)>>,
     /// `Committed` batch_seq → state supervisor. Destination drain.
@@ -28,6 +31,14 @@ pub struct EventForward {
     /// The plugin's telemetry scope: its `span` and `metrics` messages, and
     /// its log lines, are re-emitted through it (when telemetry is on).
     pub scope: Option<PluginScope>,
+}
+
+/// A file a destination finalized for the sink: where it is, and the batches
+/// it holds (inclusive) when the destination says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedObject {
+    pub path: PathBuf,
+    pub batches: Option<(u64, u64)>,
 }
 
 /// Logs one plugin log line through `tracing`, masked.
@@ -124,6 +135,10 @@ pub async fn drain_events<R: AsyncBufRead + Unpin>(
             }
             Ok(Some(Message::ObjectReady(o))) => {
                 tracing::debug!(plugin, path = %o.path, "object ready for delivery");
+                if let Some(tx) = &forward.staged_tx {
+                    let batches = o.batches.map(|r| (r.first, r.last));
+                    let _ = tx.send(StagedObject { path: PathBuf::from(&o.path), batches });
+                }
                 if let Some(tx) = &forward.object_tx {
                     let _ = tx.send(PathBuf::from(o.path));
                 }

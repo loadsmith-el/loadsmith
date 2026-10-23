@@ -12,7 +12,8 @@ pub mod watermark;
 mod control;
 
 pub use source::{SourcePlugin, run_source};
-pub use destination::{DestinationPlugin, run_destination};
+pub use destination::{DestinationPlugin, ReadyObject, run_destination};
+pub use loadsmith_protocol::BatchRange;
 pub use sink::{SinkPlugin, run_sink};
 pub use provider::{ProviderPlugin, ResolveFailure, run_provider};
 pub use parser::{ParserPlugin, run_parser};

@@ -108,7 +108,13 @@ impl<W: AsyncWrite + Unpin> EventSender<W> {
     /// the event plane (fd4) so it overlaps the live data pump — the core's
     /// event drain forwards it to the sink supervisor.
     pub async fn object_ready(&mut self, path: impl Into<String>) {
-        let msg = Message::ObjectReady(ObjectReady { path: path.into() });
+        self.object_ready_with(path, None).await;
+    }
+
+    /// Destination → core: a staged file is finalized, holding the batches
+    /// `batches` (when the destination tracks them).
+    pub async fn object_ready_with(&mut self, path: impl Into<String>, batches: Option<loadsmith_protocol::BatchRange>) {
+        let msg = Message::ObjectReady(ObjectReady { path: path.into(), batches });
         self.send(&msg).await;
     }
 
