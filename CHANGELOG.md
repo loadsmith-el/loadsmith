@@ -22,6 +22,11 @@ release notes in their repositories.
   older SDK keep the data pipe as their only bound. The end of a run logs the
   time the pump spent on each side of the data plane and the largest window.
 
+### Changed
+
+- SDK: a source encodes and writes its Arrow stream on its own thread
+  (`ipc-writer`), so it fetches the next batch while the last one is written.
+
 ## [1.0.1] - 2026-10-23
 
 ### Fixed

@@ -164,8 +164,10 @@ From the investigation (§1.5, O2–O4), all byte-identical output:
 - **Postgres source:** a fetch task one or two batches ahead; allocation-free
   decimal and timestamp parsing.
 - **Both sources:** Arrow columns built in parallel (rayon over the 34 columns).
-- **SDK:** the source's IPC writer on its own thread.
+- **SDK:** the source's IPC writer on its own thread. *(Done 2026-10-23.)*
 - **Core:** 1 MiB pipes; forward IPC messages raw instead of decode + re-encode.
+  *(Deferred 2026-10-23: F0 measured the core at 0.7 CPU-s of a 17 s run; not
+  worth the complexity until a profile says otherwise.)*
 - **Parquet:** column-parallel encoding (`get_column_writers` +
   `ArrowColumnChunk`, already in the pinned parquet 54.3.1); same row groups,
   same rollover, same bytes.

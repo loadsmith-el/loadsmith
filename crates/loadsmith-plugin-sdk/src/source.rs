@@ -75,6 +75,33 @@ pub trait SourcePlugin: Send {
     async fn cancel(&mut self);
 }
 
+type DataWriter = loadsmith_arrow::IpcWriter<std::fs::File>;
+
+/// The writer thread: writes every queued batch to fd3, in order, and hands
+/// the stream back (for its end marker) once the queue is closed.
+fn write_stream(
+    mut writer: DataWriter,
+    mut batches: tokio::sync::mpsc::Receiver<RecordBatch>,
+) -> Result<DataWriter, String> {
+    while let Some(batch) = batches.blocking_recv() {
+        writer.write_batch(&batch).map_err(|e| e.to_string())?;
+    }
+    Ok(writer)
+}
+
+async fn join_writer(writer: std::thread::JoinHandle<Result<DataWriter, String>>) -> anyhow::Result<DataWriter> {
+    match tokio::task::spawn_blocking(move || writer.join()).await {
+        Ok(Ok(Ok(w))) => Ok(w),
+        Ok(Ok(Err(e))) => Err(anyhow::anyhow!("{e}")),
+        _ => Err(anyhow::anyhow!("the data writer thread panicked")),
+    }
+}
+
+async fn writer_failure(writer: std::thread::JoinHandle<Result<DataWriter, String>>) -> Flow {
+    let e = join_writer(writer).await.err().unwrap_or_else(|| anyhow::anyhow!("the data writer stopped"));
+    Flow::fatal("IPC_WRITE_FAILED", e)
+}
+
 /// Runs `work` while answering the core, so a `cancel` stops a source even
 /// while it is busy producing (some sources buffer their whole result before
 /// the first batch) or waiting for credit. Only a stopping message drops
@@ -160,8 +187,16 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Un
 
     // ── Data loop (Arrow IPC on fd3) ──────────────────────────────────────
     let data_fd = unsafe { std::fs::File::from_raw_fd(3) };
-    let mut ipc_writer = loadsmith_arrow::IpcWriter::new(data_fd, &schema)
+    let ipc_writer = loadsmith_arrow::IpcWriter::new(data_fd, &schema)
         .map_err(|e| Flow::fatal("IPC_WRITE_FAILED", anyhow::anyhow!("{e}")))?;
+    // Encoding and writing fd3 run on their own thread, so the source fetches
+    // the next batch meanwhile. One batch waits in the queue; the core's
+    // credit counts it like any other fetched batch.
+    let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<RecordBatch>(1);
+    let writer = std::thread::Builder::new()
+        .name("ipc-writer".into())
+        .spawn(move || write_stream(ipc_writer, batch_rx))
+        .map_err(|e| Flow::fatal("IPC_WRITE_FAILED", anyhow::anyhow!("spawning the writer: {e}")))?;
 
     let mut rows_total: u64 = 0;
     let mut batches_total: u64 = 0;
@@ -179,9 +214,10 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Un
                 drop(span);
                 rows_total += batch.num_rows() as u64;
                 batches_total += 1;
-                ipc_writer
-                    .write_batch(&batch)
-                    .map_err(|e| Flow::fatal("IPC_WRITE_FAILED", anyhow::anyhow!("{e}")))?;
+                if attending(ctl, &grant, batch_tx.send(batch)).await?.is_err() {
+                    // The writer stopped: its error says why.
+                    return Err(writer_failure(writer).await);
+                }
                 events.progress_source(rows_total, batches_total).await;
                 // Report the high watermark for this batch ordinal. The core
                 // pairs it with the destination's durable-commit ack before
@@ -203,6 +239,11 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Un
     // The end-of-stream marker tells the core the stream is complete. It is
     // written only after the last batch succeeded; a source that dies before
     // this point leaves a stream the core recognises as truncated.
+    drop(batch_tx);
+    let ipc_writer = match join_writer(writer).await {
+        Ok(w) => w,
+        Err(e) => return Err(Flow::fatal("IPC_WRITE_FAILED", e)),
+    };
     let span = phase_span!("finish");
     let finished = span.in_scope(|| ipc_writer.finish());
     drop(span);
