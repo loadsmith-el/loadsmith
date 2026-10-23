@@ -13,11 +13,19 @@
 //! only once, at the end. Every persisted value is durability-gated, so flushing
 //! mid-run — even if the run later fails — never records a watermark ahead of
 //! what landed.
+//!
+//! **With a sink, the destination's `committed` is not durability.** A file
+//! destination commits when it has written its files locally; they reach the
+//! target only when the sink delivers them. So a run with a sink passes a
+//! *delivery gate*: nothing is persisted mid-run, and the final flush happens
+//! only once the sink reports every object delivered. If delivery fails, the
+//! watermark stays where it was and the next run rereads those rows.
 
 use std::collections::BTreeMap;
 
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::oneshot;
 
 use crate::error::CoreError;
 use crate::state::{LockGuard, StateBackend, StateDoc};
@@ -36,6 +44,10 @@ pub struct StateRun {
 /// Runs until both event channels close (i.e. both plugins have exited), then
 /// does a final flush. Returns the last watermark actually persisted, if any.
 ///
+/// `delivery` is the delivery gate of a run with a sink: it resolves `true`
+/// once the sink has delivered every object, `false` (or is dropped) if it did
+/// not. While it is set, nothing is persisted before it resolves `true`.
+///
 /// `guard` is held for the lifetime of this task and dropped on return, so the
 /// pipeline's state lock is released exactly when state tracking ends.
 pub async fn run_state_supervisor(
@@ -44,6 +56,7 @@ pub async fn run_state_supervisor(
     run: StateRun,
     mut checkpoint_rx: UnboundedReceiver<(u64, Value)>,
     mut committed_rx: UnboundedReceiver<u64>,
+    delivery: Option<oneshot::Receiver<bool>>,
 ) -> Result<Option<Value>, CoreError> {
     let mut watermark_at: BTreeMap<u64, Value> = BTreeMap::new();
     let mut durable_through: u64 = 0;
@@ -72,8 +85,9 @@ pub async fn run_state_supervisor(
             },
         }
 
-        // Throttled, durability-gated persist. interval 0 ⇒ defer to final flush.
-        if run.checkpoint_interval > 0 {
+        // Throttled, durability-gated persist. interval 0 ⇒ defer to final flush;
+        // a delivery gate defers everything to it too.
+        if run.checkpoint_interval > 0 && delivery.is_none() {
             if let Some((seq, value)) = safe_watermark(&watermark_at, durable_through) {
                 if seq >= last_persisted_seq + run.checkpoint_interval {
                     let span = tracing::info_span!(target: "loadsmith::state", "checkpoint", loadsmith.batch.seq = seq);
@@ -83,6 +97,18 @@ pub async fn run_state_supervisor(
                     telemetry::record_checkpoint_lag(latest_checkpoint.saturating_sub(last_persisted_seq));
                 }
             }
+        }
+    }
+
+    // Delivery gate: committed files only count once the sink delivered them.
+    if let Some(gate) = delivery {
+        if !gate.await.unwrap_or(false) {
+            tracing::warn!(
+                pipeline = %run.pipeline,
+                "the sink did not deliver every object: the incremental watermark is not advanced"
+            );
+            drop(guard);
+            return Ok(persisted);
         }
     }
 
@@ -187,11 +213,60 @@ mod tests {
             run_id: "r".into(),
             checkpoint_interval: 0,
         };
-        let persisted = run_state_supervisor(backend, guard, run, ck_rx, cm_rx).await.unwrap();
+        let persisted = run_state_supervisor(backend, guard, run, ck_rx, cm_rx, None).await.unwrap();
         assert_eq!(persisted, Some(serde_json::json!(20)));
 
         // And the file reflects the durable watermark, not the unconfirmed 30.
         let doc = LocalFileBackend::new(&path).load("p1").unwrap().unwrap();
         assert_eq!(doc.cursor_value, 20);
+    }
+
+    /// Runs the supervisor over a fully committed run (batches 1..=2) with a
+    /// delivery gate resolved to `delivered`; returns what it persisted.
+    async fn gated_run(tag: &str, interval: u64, delivered: Option<bool>) -> (Option<Value>, Option<StateDoc>) {
+        let (_tmp, path) = tmp_path(tag);
+        let backend = Box::new(LocalFileBackend::new(&path));
+        let guard = backend.lock("p1").unwrap();
+        let (ck_tx, ck_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cm_tx, cm_rx) = tokio::sync::mpsc::unbounded_channel();
+        ck_tx.send((1, serde_json::json!(10))).unwrap();
+        ck_tx.send((2, serde_json::json!(20))).unwrap();
+        cm_tx.send(2).unwrap();
+        drop(ck_tx);
+        drop(cm_tx);
+        let (gate_tx, gate_rx) = oneshot::channel();
+        match delivered {
+            Some(ok) => gate_tx.send(ok).unwrap(),
+            None => drop(gate_tx), // the sink task died without answering
+        }
+        let run = StateRun {
+            pipeline: "p1".into(),
+            schema_hash: "h".into(),
+            run_id: "r".into(),
+            checkpoint_interval: interval,
+        };
+        let persisted = run_state_supervisor(backend, guard, run, ck_rx, cm_rx, Some(gate_rx)).await.unwrap();
+        (persisted, LocalFileBackend::new(&path).load("p1").unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_sink_failure_keeps_the_watermark() {
+        // Committed by the destination, but the sink failed: nothing persisted,
+        // mid-run (interval 1) or at the end.
+        for (tag, interval) in [("gate-fail-end", 0), ("gate-fail-mid", 1)] {
+            let (persisted, doc) = gated_run(tag, interval, Some(false)).await;
+            assert_eq!(persisted, None, "{tag}");
+            assert!(doc.is_none(), "{tag}");
+        }
+        let (persisted, doc) = gated_run("gate-dropped", 0, None).await;
+        assert_eq!(persisted, None);
+        assert!(doc.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_full_delivery_persists_the_watermark() {
+        let (persisted, doc) = gated_run("gate-ok", 1, Some(true)).await;
+        assert_eq!(persisted, Some(serde_json::json!(20)));
+        assert_eq!(doc.unwrap().cursor_value, 20);
     }
 }

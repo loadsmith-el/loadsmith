@@ -351,6 +351,7 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     let (sink_trigger, sink_shutdown) = Shutdown::channel();
     let mut sink_task = None;
     let mut state_task = None;
+    let mut delivery_gate = None;
     let start_time = std::time::Instant::now();
 
     // ── Setup: handshake, gates, start ────────────────────────────────────
@@ -437,20 +438,29 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         // files the instant the destination starts finalizing them. It consumes the
         // ObjectReady paths forwarded by the destination's event drain.
         if let (Some(bin), Some(cfg), Some(rx)) = (sink_bin, sink_config, object_rx) {
+            // The delivery gate: the state supervisor persists nothing until
+            // the sink reports every object delivered (see state_supervisor).
+            let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+            delivery_gate = Some(gate_rx);
+            let supervisor = run_sink_supervisor(
+                SinkLaunch {
+                    binary: bin,
+                    config: cfg,
+                    unknown_keys: opts.unknown_keys,
+                    mask: opts.mask.clone(),
+                    run: run.clone(),
+                },
+                rx,
+                timeouts,
+                sink_shutdown,
+            );
             sink_task = Some(tokio::spawn(
-                run_sink_supervisor(
-                    SinkLaunch {
-                        binary: bin,
-                        config: cfg,
-                        unknown_keys: opts.unknown_keys,
-                        mask: opts.mask.clone(),
-                        run: run.clone(),
-                    },
-                    rx,
-                    timeouts,
-                    sink_shutdown,
-                )
-                    .in_current_span(),
+                async move {
+                    let outcome = supervisor.await;
+                    let _ = gate_tx.send(outcome.is_ok());
+                    outcome
+                }
+                .in_current_span(),
             ));
         }
 
@@ -497,7 +507,9 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
                 run_id: opts.run_id.clone(),
                 checkpoint_interval: config.state.as_ref().map(|c| c.checkpoint_interval).unwrap_or(0),
             };
-            state_task = Some(tokio::spawn(run_state_supervisor(backend, guard, run, ck_rx, cm_rx).in_current_span()));
+            state_task = Some(tokio::spawn(
+                run_state_supervisor(backend, guard, run, ck_rx, cm_rx, delivery_gate.take()).in_current_span(),
+            ));
 
         }
 
@@ -623,7 +635,9 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     // Both drains are done ⇒ the checkpoint/committed channels are closed and
     // the state supervisor performs its final watermark flush and releases the
     // pipeline state lock. Only durably committed watermarks are ever
-    // persisted, so this is safe after an abort too.
+    // persisted, so this is safe after an abort too. With a sink, the flush
+    // also waits for the sink's delivery gate, so this resolves only once the
+    // sink is done.
     let mut late_failure: Option<String> = None;
     if let Some(task) = state_task {
         match task.await {
