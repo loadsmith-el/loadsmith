@@ -804,6 +804,12 @@ pub(crate) fn outcome<T>(span: &tracing::Span, result: &anyhow::Result<T>) {
 /// The baseline metrics of one batch: `loadsmith.plugin.rows`,
 /// `loadsmith.plugin.batches`, `loadsmith.plugin.bytes` and
 /// `loadsmith.plugin.batch.duration`, by `direction` (`read`/`written`).
+/// The Arrow size of a batch for its span and metrics; `0` (not computed)
+/// with telemetry off.
+pub(crate) fn batch_bytes(batch: &arrow_array::RecordBatch) -> u64 {
+    if enabled() { loadsmith_arrow::batch_bytes(batch) } else { 0 }
+}
+
 pub(crate) fn batch_done(span: &tracing::Span, direction: &'static str, rows: u64, bytes: u64, took: Duration) {
     if !enabled() {
         return;

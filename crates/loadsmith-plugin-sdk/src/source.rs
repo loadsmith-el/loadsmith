@@ -209,7 +209,7 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Un
         let next = attending(ctl, &grant, plugin.next_batch().instrument(span.clone())).await;
         match next? {
             Ok(Some(batch)) => {
-                let bytes = loadsmith_arrow::batch_bytes(&batch);
+                let bytes = telemetry::batch_bytes(&batch);
                 telemetry::batch_done(&span, "read", batch.num_rows() as u64, bytes, began.elapsed());
                 drop(span);
                 rows_total += batch.num_rows() as u64;

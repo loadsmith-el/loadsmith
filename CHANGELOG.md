@@ -26,6 +26,8 @@ release notes in their repositories.
 
 - SDK: a source encodes and writes its Arrow stream on its own thread
   (`ipc-writer`), so it fetches the next batch while the last one is written.
+- SDK: the Arrow size of each batch is computed only when telemetry is on
+  (it fed only the batch span and metrics).
 
 ## [1.0.1] - 2026-10-23
 
