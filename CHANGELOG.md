@@ -9,8 +9,18 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-23
+
 ### Fixed
 
+- **An incremental run with a sink could advance its watermark past rows that
+  never reached the target.** The watermark was persisted when the destination
+  committed, i.e. once its files were written locally, before the sink had
+  delivered them; when the sink then failed (on the last file, or on any file
+  still queued), the run failed with the watermark already moved, and the next
+  run skipped those rows. A run with a sink now persists its watermark only
+  after the sink has delivered every object; if delivery fails, the watermark
+  stays and the next run rereads the rows.
 - SDK: a sink answers `ping` while it delivers an object. It used to wait for
   `deliver` to return, so an upload longer than the 5 s ping interval (64 MiB
   over a ~100 Mbit/s link) looked like a hang: the core respawned the sink and
@@ -384,7 +394,8 @@ release.
 - The hermetic `Dockerfile` gains the same targets.
 - Container Images documentation page.
 
-[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.0-rc.2...v1.0.0
 [1.0.0-rc.2]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.0-rc.1...v1.0.0-rc.2
 [1.0.0-rc.1]: https://github.com/loadsmith-el/loadsmith/compare/v0.2.0...v1.0.0-rc.1
