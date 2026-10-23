@@ -311,6 +311,37 @@ type probe, in ms/us/ns).
   into the same `dest` replace each other's files. A `key` template like the
   s3 sink's would fix it (parked).
 
+### F4 + F2 progress (2026-10-23)
+
+- **F4 partitioned reads — done** (full loads; not with `incremental`).
+  - oracle 0.7.0: ROWID ranges at one SCN (`AS OF SCN`). Ranges cut evenly by
+    block from a 1% `SAMPLE BLOCK` (segment spans), bounds built by
+    `DBMS_ROWID.ROWID_CREATE` — which returns **text**, so order is checked
+    with `CHARTOROWID` (a text order made overlapping ranges: duplicates) —
+    open-ended ranges first in the queue (they hold the unsampled edges).
+    Unique SQL per range: the beta driver's statement cache breaks
+    re-executing one text with new binds. No `DBA_*`/`DBMS_PARALLEL_EXECUTE`.
+    5M → null: 11.8 s → 4.9 s (8 workers).
+  - postgres 0.6.0: exported snapshot + `ctid` page ranges (TID range scan,
+    PG14+). 5M → null: 7.1 s → 3.3 s (8 workers).
+  - Workers fetch **and convert** (parallel conversion: the F2 source half);
+    one shared credit (`started` counter, released on an empty fetch).
+  - Partition-set resume: not done (a failed partitioned full load restarts;
+    with recovery, the retried attempt re-reads everything).
+- **F2 column-parallel Parquet — done** (parquet 0.4.0, `encode_threads`):
+  byte-identical to `ArrowWriter` (unit test + 13 files of a 1M export).
+  Client flow pg 5M (8 workers) → Parquet → S3: 8.4 s → 5.5 s.
+- **Failure tests** (bench `chaos.sh`, 5M incremental → Parquet → S3, real
+  S3 simulator): SIGKILL at 60% → resume reads exactly the undelivered rows,
+  0 missing; duplicates ≤ one file (the upload in flight) — engine 1.2.1 made
+  graceful stops (SIGTERM) wait for that upload: duplicates 1 (tie boundary).
+  After SIGKILL the state lock stays leased 60 s (a run sooner is refused,
+  exit 5). S3 down 45 s with `recovery` → attempt 2 resumes, 0 missing.
+  Embulk killed at 60%: nothing in S3, rerun from zero.
+  - Possible next: F3c's idempotent object names (resume record keeps run id
+    + numbering) would make even the SIGKILL window overwrite instead of
+    duplicate.
+
 ## 6. Validation
 
 - **Byte-identical output** for F1/F2: compare Parquet against 1.0.0 on the same
