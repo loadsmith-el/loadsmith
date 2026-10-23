@@ -98,6 +98,7 @@ Sent by the **plugin** in response to `capabilities_request`.
 | `object_delivery` | sinks (SDK default) | no |
 | `resolve` | providers (SDK default) | yes — required of every provider instance |
 | `parse` | parsers (SDK default) | yes — required of the pipeline's parser |
+| `flow_credit` | sources (added by the SDK) | yes — the core sends `start.credit` and [`credit`](#credit) to such a source, and only to it |
 
 ---
 
@@ -190,12 +191,17 @@ Sent by the **core** after both plugins have sent `configure_ack: ok`.
 ```json
 {"type": "start"}
 {"type": "start", "resume": {"cursor_value": "2026-06-09T08:00:00Z"}}
+{"type": "start", "credit": 2}
 ```
 
 The signal to begin execution. For an incremental source whose pipeline has a
 watermark persisted from a previous run, the core includes `resume` with the
 opaque `cursor_value` to resume after; the core never interprets it. The bare
 form (no `resume`) is unchanged and still valid.
+
+To a source that advertised `flow_credit`, the core adds `credit`: the initial
+grant, as in [`credit`](#credit). Without it no credits follow, and the source
+is bounded by its data pipe alone.
 
 ---
 
@@ -541,6 +547,31 @@ for every plugin kind, also while a sink's `deliver` is running.)
 {"type": "ping"}
 {"type": "pong"}
 ```
+
+---
+
+### `credit`
+
+Sent by the **core** to a **source** that advertised `flow_credit`: the source
+may have fetched batches up to and including `batch_seq` (1-based, the order of
+its stream, as in [`checkpoint`](#checkpoint)) — counting every batch read from
+its system and not yet written to fd3, across read-ahead and workers. It then
+waits for the next grant.
+
+```json
+{"type": "credit", "batch_seq": 10}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `batch_seq` | integer | The highest batch ordinal the source may fetch |
+
+Grants are cumulative and never shrink: a smaller value than one already
+received is ignored. The core grants after each batch it hands to the
+destination, a window ahead of it (see [`pipeline.flow`](../reference/pipeline-yaml.md#pipelineflow)),
+so a source that reads faster than the destination writes waits instead of
+filling its memory. The SDK enforces the grant; a source built without it never
+advertises `flow_credit` and ignores the message (unknown type).
 
 ---
 

@@ -4,7 +4,8 @@ use anyhow::Result;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use loadsmith_protocol::{Finished, Message, PluginKind};
+use loadsmith_protocol::{capabilities, Finished, Message, PluginKind};
+use std::future::Future;
 use tokio::io::AsyncWrite;
 
 use crate::context::EventSender;
@@ -14,6 +15,7 @@ use tracing::Instrument;
 
 use crate::config::PluginConfig;
 use crate::control::{answer_configure, conclude, handshake, recv_configure, recv_start, Control, Flow};
+use crate::flow::{FlowGate, FlowGrant};
 
 /// Implemented by source plugins. The SDK drives the full lifecycle;
 /// implementors only provide data and metadata.
@@ -24,7 +26,8 @@ pub trait SourcePlugin: Send {
 
     /// Capabilities advertised during the handshake. Defaults to
     /// `["batch_read", "schema_inference"]`. An incremental source should also
-    /// advertise `incremental_state`.
+    /// advertise `incremental_state`. The SDK adds `flow_credit` itself: it
+    /// enforces the core's credits for every source.
     fn capabilities(&self) -> Vec<String> {
         vec!["batch_read".into(), "schema_inference".into()]
     }
@@ -34,6 +37,15 @@ pub trait SourcePlugin: Send {
     /// incremental source resumes reading after this value; non-incremental
     /// sources leave the default no-op.
     async fn resume_from(&mut self, _cursor_value: Option<serde_json::Value>) {}
+
+    /// Called after `start`, before `resume_from`. The core decides how far a
+    /// source may read ahead of the destination; the SDK never calls
+    /// `next_batch` past that grant. A source that fetches ahead on its own
+    /// (a fetch task, partition workers) keeps the gate and calls
+    /// [`FlowGate::wait_for`] before fetching each batch, so its buffers stay
+    /// within the grant too. A source that only fetches inside `next_batch`
+    /// leaves the default no-op.
+    fn attach_flow(&mut self, _gate: FlowGate) {}
 
     /// Called after `configure`. Plugin validates its config and prepares.
     /// Return `Err` to send `configure_ack { error }` and exit.
@@ -63,6 +75,33 @@ pub trait SourcePlugin: Send {
     async fn cancel(&mut self);
 }
 
+/// Runs `work` while answering the core, so a `cancel` stops a source even
+/// while it is busy producing (some sources buffer their whole result before
+/// the first batch) or waiting for credit. Only a stopping message drops
+/// `work`; `ping`, `resend` and `credit` are handled without touching it.
+async fn attending<W: AsyncWrite + Unpin, T>(
+    ctl: &mut Control<W>,
+    grant: &FlowGrant,
+    work: impl Future<Output = T>,
+) -> Result<T, Flow> {
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            biased;
+            inbound = ctl.next_inbound() => {
+                match ctl.process(inbound).await? {
+                    None => {}
+                    Some(Message::Credit(c)) => grant.grant(c.batch_seq),
+                    Some(other) => {
+                        tracing::warn!("ignoring unexpected control message mid-stream: {other:?}");
+                    }
+                }
+            }
+            result = &mut work => return Ok(result),
+        }
+    }
+}
+
 /// Entry point for source plugin binaries. Never returns normally.
 ///
 /// Exit code: `0` after success or a `cancel`, `1` after a failure, an
@@ -86,14 +125,11 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Un
     started: &mut bool,
 ) -> Result<(), Flow> {
     // ── Handshake + capabilities ─────────────────────────────────────────
-    handshake(
-        ctl,
-        PluginKind::Source,
-        plugin.plugin_name(),
-        plugin.plugin_version(),
-        plugin.capabilities(),
-    )
-    .await?;
+    let mut supports = plugin.capabilities();
+    if !supports.iter().any(|c| c == capabilities::FLOW_CREDIT) {
+        supports.push(capabilities::FLOW_CREDIT.into());
+    }
+    handshake(ctl, PluginKind::Source, plugin.plugin_name(), plugin.plugin_version(), supports).await?;
 
     // ── Configure ────────────────────────────────────────────────────────
     let (config, warnings) = recv_configure(ctl).await?;
@@ -107,6 +143,8 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Un
     let params = recv_start(ctl).await?;
     *started = true;
     let span = phase_span!("start");
+    let (grant, mut gate) = FlowGrant::new(params.credit);
+    plugin.attach_flow(gate.clone());
     plugin.resume_from(params.resume.map(|r| r.cursor_value)).instrument(span.clone()).await;
 
     // ── Schema ────────────────────────────────────────────────────────────
@@ -129,32 +167,11 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Un
     let mut batches_total: u64 = 0;
 
     loop {
-        // Wait for the next batch *and* the core at the same time, so a
-        // `cancel` stops a source even while it is busy producing (some
-        // sources buffer their whole result before the first batch). Only a
-        // stopping message drops the in-flight `next_batch` future; `ping` and
-        // `resend` are handled without touching it.
+        // The core's grant first: never ask for a batch past it.
+        attending(ctl, &grant, gate.wait_for(batches_total + 1)).await?;
         let span = telemetry::batch_span(batches_total + 1, "read");
         let began = Instant::now();
-        let next = {
-            let batch = plugin.next_batch().instrument(span.clone());
-            tokio::pin!(batch);
-            loop {
-                tokio::select! {
-                    biased;
-                    inbound = ctl.next_inbound() => {
-                        match ctl.process(inbound).await {
-                            Ok(None) => {}
-                            Ok(Some(other)) => {
-                                tracing::warn!("ignoring unexpected control message mid-stream: {other:?}");
-                            }
-                            Err(flow) => break Err(flow),
-                        }
-                    }
-                    result = &mut batch => break Ok(result),
-                }
-            }
-        };
+        let next = attending(ctl, &grant, plugin.next_batch().instrument(span.clone())).await;
         match next? {
             Ok(Some(batch)) => {
                 let bytes = loadsmith_arrow::batch_bytes(&batch);

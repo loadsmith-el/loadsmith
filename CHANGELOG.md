@@ -9,6 +9,19 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+### Added
+
+- **Flow control: the core decides how far a source reads ahead.** After each
+  batch it hands to the destination, the core grants the source a window of
+  batches (new control message `credit`, initial grant in `start.credit`),
+  sized from the batches it sees and the new `pipeline.flow` block
+  (`max_inflight_batches`, default 8; `memory_budget_mib`, default 256). The
+  SDK advertises the new capability `flow_credit`, never asks a source for a
+  batch past the grant, and hands the source a `FlowGate` (`attach_flow`) so
+  read-ahead inside the plugin waits on the same grant. Sources built with an
+  older SDK keep the data pipe as their only bound. The end of a run logs the
+  time the pump spent on each side of the data plane and the largest window.
+
 ## [1.0.1] - 2026-10-23
 
 ### Fixed

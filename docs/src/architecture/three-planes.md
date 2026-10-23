@@ -50,8 +50,13 @@ file descriptor — never mixed with the control channel — for several reasons
 2. **Format**: Arrow IPC is a binary format designed for zero-copy reads. Writing
    it to a dedicated fd allows direct kernel I/O with no intermediate buffering.
 3. **Backpressure**: a full pipe blocks the writer naturally. If the destination
-   is slower than the source, the pump blocks and the source slows down. No
-   explicit flow control is needed.
+   is slower than the source, the pump blocks and the source slows down. That
+   bounds a source that does one thing at a time; a source that reads ahead (a
+   fetch task, partition workers) is bounded by **credits** instead: the core
+   grants it a window of batches over the control channel (`credit`), sized
+   from the batches it sees and `pipeline.flow`, and the SDK never lets the
+   source fetch past the grant. The core controls the flow; a plugin only
+   does its job.
 
 The source plugin writes an IPC stream (schema header + record batches) to its
 fd3. The core reads this stream, relays each batch to the destination's fd3, and

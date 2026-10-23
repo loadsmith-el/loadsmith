@@ -20,6 +20,9 @@ pipeline:
     cancel_grace_seconds: int # cancel → plugin exit, then kill. Default: 30
     stall_seconds: int        # opt-in: no batch for N s fails the run. Default: 0 (off)
     first_batch_seconds: int  # with stall_seconds on: budget for the first batch. Default: 3600
+  flow:                   # optional — how far a source may read ahead of the destination
+    max_inflight_batches: int # largest window, in batches. Default: 8
+    memory_budget_mib: int    # memory the window may hold, in MiB. 0 = no limit. Default: 256
 
 providers:                # optional — provider instances for secret() templates
   <instance>:             #   name: letters, digits, '_' and '-'
@@ -101,6 +104,35 @@ environment variable and their precedence.
 | `description` | string | no | Human-readable description. Informational only |
 | `heartbeat_seconds` | integer | no | Interval of the "still running" heartbeat log emitted during the data pump. `0` disables it. Default: `30` |
 | `timeouts` | object | no | Limits on how long the core waits for plugins. See [`pipeline.timeouts`](#pipelinetimeouts) |
+| `flow` | object | no | How far a source may read ahead of the destination. See [`pipeline.flow`](#pipelineflow) |
+
+### `pipeline.flow`
+
+The core controls the flow of data: a source never reads further ahead of the
+destination than the core allows. After each batch it hands to the
+destination, the core grants the source a **window** of batches beyond it
+(the [`credit`](../protocol/messages.md#credit) message); a source that reads
+faster than the destination writes then waits, instead of holding the table in
+memory. The window starts at two batches and is sized from the largest batch
+seen so far: as many as fit in `memory_budget_mib`, at most
+`max_inflight_batches`, at least one.
+
+| Field | Default | What it bounds |
+|---|---|---|
+| `max_inflight_batches` | `8` | The largest window, in batches. Values below `1` count as `1` |
+| `memory_budget_mib` | `256` | The memory the window may hold, estimated from the Arrow size of the batches. `0` sets no memory limit |
+
+Sources built with an SDK older than flow control are bounded by their data
+pipe alone, as before. At the end of a run the core logs how long the pump
+spent on each side (`reading_s`, `writing_s`) and the largest window: a
+destination much slower than its source shows there.
+
+```yaml
+pipeline:
+  name: nightly-orders
+  flow:
+    memory_budget_mib: 64     # a small container
+```
 
 ### `pipeline.timeouts`
 

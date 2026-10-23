@@ -31,7 +31,7 @@ use arrow_array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use async_trait::async_trait;
 use loadsmith_plugin_sdk::{
-    DestinationPlugin, ObjectSourcePlugin, ParserPlugin, PluginConfig, ProviderPlugin, ResolveFailure, SourcePlugin,
+    DestinationPlugin, FlowGate, ObjectSourcePlugin, ParserPlugin, PluginConfig, ProviderPlugin, ResolveFailure, SourcePlugin,
 };
 use loadsmith_protocol::{
     CapabilitiesResponse, ConfigureAck, Finished, HandshakeAck, Message, PluginKind,
@@ -142,12 +142,14 @@ fn opt_u64(config: &serde_json::Value, key: &str) -> Option<u64> {
 /// for: `crash_after` (exit 42), `fail_after` (`next_batch` errors),
 /// `hang_after` (never returns). `incremental: true` advertises
 /// `incremental_state` and reports a watermark. `wide: true` adds a
-/// `seen_at` timestamp column (a schema change).
+/// `seen_at` timestamp column (a schema change). `journal_credit: true`
+/// journals `credit <batch>/<granted>` before each batch.
 #[derive(Default)]
 pub struct FakeSource {
     config: serde_json::Value,
     journal: Option<PathBuf>,
     produced: u64,
+    gate: Option<FlowGate>,
 }
 
 impl FakeSource {
@@ -266,8 +268,15 @@ impl SourcePlugin for FakeSource {
         note(&self.journal, "start");
         Ok(if self.wide() { wide_schema() } else { schema() }.as_ref().clone())
     }
+    fn attach_flow(&mut self, gate: FlowGate) {
+        self.gate = Some(gate);
+    }
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         let n = self.produced;
+        if self.config.get("journal_credit").and_then(|v| v.as_bool()) == Some(true) {
+            let granted = self.gate.as_ref().map_or(0, |g| g.granted());
+            note(&self.journal, &format!("credit {}/{granted}", n + 1));
+        }
         if let Some(ms) = opt_u64(&self.config, "delay_ms") {
             tokio::time::sleep(Duration::from_millis(ms)).await;
         }

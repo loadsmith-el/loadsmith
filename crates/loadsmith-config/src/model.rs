@@ -137,6 +137,38 @@ pub struct PipelineMeta {
     /// Limits on how long the core waits for plugins. Every field is optional.
     #[serde(default)]
     pub timeouts: Timeouts,
+    /// How much a source may read ahead of the destination. Every field is
+    /// optional.
+    #[serde(default)]
+    pub flow: FlowConfig,
+}
+
+/// `pipeline.flow`: the core's flow control. A source that obeys credits
+/// (`flow_credit`) may hold at most a window of batches fetched but not yet
+/// taken by the destination; the core sizes the window from the batches it
+/// sees, within these limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowConfig {
+    /// The largest window, in batches. Values below 1 count as 1.
+    #[serde(default = "default_max_inflight_batches")]
+    pub max_inflight_batches: u64,
+    /// The memory the window may hold, in MiB (estimated from the batches
+    /// seen so far). `0` sets no memory limit.
+    #[serde(default = "default_memory_budget_mib")]
+    pub memory_budget_mib: u64,
+}
+
+fn default_max_inflight_batches() -> u64 {
+    8
+}
+fn default_memory_budget_mib() -> u64 {
+    256
+}
+
+impl Default for FlowConfig {
+    fn default() -> Self {
+        Self { max_inflight_batches: default_max_inflight_batches(), memory_budget_mib: default_memory_budget_mib() }
+    }
 }
 
 fn default_heartbeat_seconds() -> u64 {

@@ -94,6 +94,20 @@ unknown_field: bad
     }
 
     #[test]
+    fn flow_is_partial_and_strict() {
+        let (config, _) = parse_pipeline_yaml(BASIC_YAML).unwrap();
+        assert_eq!(config.pipeline.flow, crate::FlowConfig::default());
+        let yaml = "pipeline:\n  name: x\n  flow:\n    max_inflight_batches: 3\nsource:\n  type: postgres\ndestination:\n  type: jsonl\n";
+        let (config, _) = parse_pipeline_yaml(yaml).unwrap();
+        assert_eq!(config.pipeline.flow.max_inflight_batches, 3);
+        assert_eq!(config.pipeline.flow.memory_budget_mib, crate::FlowConfig::default().memory_budget_mib);
+        let err = parse_pipeline_yaml(&yaml.replace("max_inflight_batches", "max_inflight"))
+            .expect_err("unknown key")
+            .to_string();
+        assert!(err.contains("pipeline.flow.max_inflight"), "{err}");
+    }
+
+    #[test]
     fn timeouts_are_partial_and_strict() {
         let yaml = r#"
 pipeline:

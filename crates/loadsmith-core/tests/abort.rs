@@ -24,6 +24,7 @@ fn main() {
 
     let tests: &[(&str, fn())] = &[
         ("happy_path_finalizes_once", happy_path_finalizes_once),
+        ("credits_bound_the_source", credits_bound_the_source),
         ("source_crash_mid_stream_cancels_destination", source_crash_mid_stream_cancels_destination),
         ("source_finished_error_cancels_destination", source_finished_error_cancels_destination),
         ("destination_crash_cancels_source", destination_crash_cancels_source),
@@ -199,6 +200,39 @@ fn happy_path_finalizes_once() {
     assert_eq!(dst.iter().filter(|l| *l == "finalize").count(), 1, "{dst:?}");
     assert!(!has(&dst, "cancel"), "{dst:?}");
     assert!(!has(&run.journal("source"), "cancel"));
+}
+
+/// Flow control: the core grants the source one batch at a time
+/// (`max_inflight_batches: 1`), and the SDK never asks for a batch past the
+/// grant — yet the run completes (no credit is lost on the way).
+fn credits_bound_the_source() {
+    let run = Run::new("credits");
+    let yaml = pipeline_yaml(
+        "credits",
+        "fake",
+        run.src_config(json!({ "batches": 20, "journal_credit": true })),
+        run.dst_config(json!({})),
+        &format!("{}  flow:\n    max_inflight_batches: 1\n", timeouts("")),
+        "",
+    );
+    let summary = run.exec(&yaml).expect("run");
+    assert_eq!(summary.status, SummaryStatus::Success);
+    assert_eq!(summary.rows_written, 200);
+    let credits: Vec<(u64, u64)> = run
+        .journal("source")
+        .iter()
+        .filter_map(|l| l.strip_prefix("credit "))
+        .map(|c| {
+            let (n, g) = c.split_once('/').unwrap();
+            (n.parse().unwrap(), g.parse().unwrap())
+        })
+        .collect();
+    assert_eq!(credits.len(), 21, "20 batches and the end: {credits:?}");
+    // With a window of one, batch n is asked for exactly when n is granted:
+    // never before (the SDK waits), never later (the core grants on time).
+    for (n, granted) in &credits {
+        assert_eq!(n, granted, "{credits:?}");
+    }
 }
 
 /// The bug: a source dying at a batch boundary looked like a clean end, the

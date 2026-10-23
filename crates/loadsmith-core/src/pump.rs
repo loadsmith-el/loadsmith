@@ -14,12 +14,20 @@
 //! source also reported `finished` with success. After any upstream failure
 //! the destination therefore never sees a clean end of input; it gets
 //! `cancel` instead, and its fd3 stays open until it has exited.
+//!
+//! **Flow control.** With a source that obeys credits, the pump owns the
+//! [`FlowWindow`]: after each batch it hands to the destination it grants the
+//! source the next batches, up to a window sized from the batches seen and
+//! the memory budget. The runner relays each grant as a `credit` message.
 
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use loadsmith_arrow::{IpcReader, IpcWriter};
+use loadsmith_config::FlowConfig;
+use tokio::sync::watch;
 
 use crate::telemetry;
 
@@ -29,6 +37,65 @@ use crate::telemetry;
 pub struct PumpStats {
     pub rows: u64,
     pub batches: u64,
+    /// Time spent reading the source's stream (waiting for it included).
+    pub reading: Duration,
+    /// Time spent writing the destination's stream (waiting for it included).
+    pub writing: Duration,
+    /// The largest flow-control window granted (0 without flow control).
+    pub peak_window: u64,
+}
+
+/// The core's flow control for one source: how many batches the source may
+/// have fetched beyond those the pump already handed to the destination.
+///
+/// The window starts at two batches and is resized after every batch to what
+/// the memory budget holds at the largest batch seen so far, within
+/// `max_inflight_batches`. Grants are cumulative and never shrink: a smaller
+/// window takes effect as the destination catches up.
+#[derive(Debug)]
+pub struct FlowWindow {
+    tx: watch::Sender<u64>,
+    max: u64,
+    budget: u64,
+    window: u64,
+    largest: u64,
+}
+
+impl FlowWindow {
+    /// A window per `config`, and the receiver of its grants. The initial
+    /// grant (for `start.credit`) is [`granted`](Self::granted).
+    pub fn new(config: &FlowConfig) -> (Self, watch::Receiver<u64>) {
+        let max = config.max_inflight_batches.max(1);
+        let window = max.min(2);
+        let (tx, rx) = watch::channel(window);
+        (Self { tx, max, budget: config.memory_budget_mib.saturating_mul(1 << 20), window, largest: 0 }, rx)
+    }
+
+    /// The highest batch ordinal granted so far.
+    pub fn granted(&self) -> u64 {
+        *self.tx.borrow()
+    }
+
+    pub fn window(&self) -> u64 {
+        self.window
+    }
+
+    /// The destination took batch `forwarded` (1-based), of `bytes`.
+    fn forwarded(&mut self, forwarded: u64, bytes: u64) {
+        self.largest = self.largest.max(bytes);
+        self.window = match (self.budget, self.largest) {
+            (0, _) | (_, 0) => self.max,
+            (budget, largest) => (budget / largest).clamp(1, self.max),
+        };
+        let grant = forwarded + self.window;
+        self.tx.send_if_modified(|granted| {
+            let grows = grant > *granted;
+            if grows {
+                *granted = grant;
+            }
+            grows
+        });
+    }
 }
 
 /// Shared between the pump thread and the runner.
@@ -89,6 +156,7 @@ pub fn pump<F>(
     mut reader: IpcReader<File>,
     write_out: File,
     control: Arc<PumpControl>,
+    mut flow: Option<FlowWindow>,
     mut on_progress: F,
 ) -> PumpOutcome
 where
@@ -107,17 +175,25 @@ where
 
     let mut next_log: u64 = 1;
     let mut read_error = None;
+    if let Some(f) = &flow {
+        stats.peak_window = f.window();
+    }
     loop {
-        match reader.read_batch() {
+        let began = Instant::now();
+        let next = reader.read_batch();
+        stats.reading += began.elapsed();
+        match next {
             Ok(Some(batch)) => {
                 let rows = batch.num_rows() as u64;
-                let bytes = if telemetry::enabled() { loadsmith_arrow::batch_bytes(&batch) } else { 0 };
+                let bytes =
+                    if telemetry::enabled() || flow.is_some() { loadsmith_arrow::batch_bytes(&batch) } else { 0 };
                 stats.rows += rows;
                 stats.batches += 1;
                 control.batches.store(stats.batches, Ordering::Relaxed);
                 telemetry::record_batch("read", rows, bytes);
                 if !control.abort.load(Ordering::Relaxed) {
                     if let Some(w) = writer.as_mut() {
+                        let began = Instant::now();
                         match w.write_batch(&batch) {
                             Ok(()) => telemetry::record_batch("written", rows, bytes),
                             Err(e) => {
@@ -125,7 +201,14 @@ where
                                 writer = None;
                             }
                         }
+                        stats.writing += began.elapsed();
                     }
+                }
+                // Granted after the write: the batch has left the core. After
+                // an abort the source is drained, so it keeps getting credit.
+                if let Some(f) = flow.as_mut() {
+                    f.forwarded(stats.batches, bytes);
+                    stats.peak_window = stats.peak_window.max(f.window());
                 }
                 if stats.batches == next_log {
                     on_progress(stats.rows, stats.batches);
@@ -196,7 +279,7 @@ mod tests {
     #[test]
     fn a_clean_source_stream_leaves_the_destination_stream_open() {
         let (dst_r, dst_w) = pipe();
-        let out = pump(source_stream(3, true), dst_w, Arc::default(), |_, _| {});
+        let out = pump(source_stream(3, true), dst_w, Arc::default(), None, |_, _| {});
         assert!(out.source_clean);
         assert_eq!(out.stats.batches, 3);
         assert!(matches!(out.output, PumpOutput::Open(_)));
@@ -217,7 +300,7 @@ mod tests {
     #[test]
     fn a_truncated_source_stream_is_not_clean_and_is_not_forwarded_as_ended() {
         let (mut dst_r, dst_w) = pipe();
-        let out = pump(source_stream(2, false), dst_w, Arc::default(), |_, _| {});
+        let out = pump(source_stream(2, false), dst_w, Arc::default(), None, |_, _| {});
         assert!(!out.source_clean);
         assert!(out.read_error.is_none());
         assert_eq!(out.stats.batches, 2);
@@ -231,12 +314,54 @@ mod tests {
         assert!(!reader.ended_cleanly());
     }
 
+    fn flow(max_inflight_batches: u64, memory_budget_mib: u64) -> (FlowWindow, watch::Receiver<u64>) {
+        FlowWindow::new(&FlowConfig { max_inflight_batches, memory_budget_mib })
+    }
+
+    #[test]
+    fn the_window_starts_at_two_batches() {
+        assert_eq!(flow(8, 256).0.granted(), 2);
+        assert_eq!(flow(1, 256).0.granted(), 1, "never past the ceiling");
+    }
+
+    #[test]
+    fn each_forwarded_batch_grants_a_window_ahead() {
+        let (mut w, rx) = flow(8, 0);
+        w.forwarded(1, 1000);
+        assert_eq!(*rx.borrow(), 9, "no memory limit: the full ceiling");
+        w.forwarded(2, 1000);
+        assert_eq!(*rx.borrow(), 10);
+    }
+
+    #[test]
+    fn the_memory_budget_sizes_the_window_from_the_largest_batch() {
+        let (mut w, rx) = flow(8, 1);
+        w.forwarded(1, 300 << 10); // 1 MiB / 300 KiB ⇒ 3 batches
+        assert_eq!((w.window(), *rx.borrow()), (3, 4));
+        w.forwarded(2, 2 << 20); // larger than the budget: still one at a time
+        assert_eq!(w.window(), 1);
+        assert_eq!(*rx.borrow(), 4, "a grant never shrinks");
+        w.forwarded(5, 10);
+        assert_eq!(*rx.borrow(), 6, "the largest batch seen still counts");
+    }
+
+    #[test]
+    fn the_pump_grants_as_it_forwards() {
+        let (_dst_r, dst_w) = pipe();
+        let (w, rx) = flow(4, 0);
+        // The destination's pipe holds these few tiny batches.
+        let out = pump(source_stream(3, true), dst_w, Arc::default(), Some(w), |_, _| {});
+        assert_eq!(out.stats.batches, 3);
+        assert_eq!(*rx.borrow(), 3 + 4);
+        assert_eq!(out.stats.peak_window, 4);
+    }
+
     #[test]
     fn abort_stops_forwarding_but_keeps_draining() {
         let (mut dst_r, dst_w) = pipe();
         let control = Arc::new(PumpControl::default());
         control.abort.store(true, Ordering::Relaxed);
-        let out = pump(source_stream(4, true), dst_w, control.clone(), |_, _| {});
+        let out = pump(source_stream(4, true), dst_w, control.clone(), None, |_, _| {});
         assert_eq!(out.stats.batches, 4, "the source is drained");
         assert_eq!(control.batches.load(Ordering::Relaxed), 4);
         drop(out);

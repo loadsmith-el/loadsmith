@@ -125,10 +125,11 @@ core                                 source plugin
                                      ← capabilities_response
 → configure
                                      ← configure_ack (ok or error)
-→ start
+→ start (credit: N with flow_credit)
                                      ← schema        [sends arrow schema on fd1]
                                      [writes arrow IPC stream on fd3]
                                      [writes events on fd4]
+→ credit (with flow_credit: after each batch the core hands on)
                                      ← finished
 
 core                                 destination plugin
@@ -162,7 +163,9 @@ Both plugins are spawned up front, but the core drives them in a fixed order:
 5. schema-drift check against the IPC schema, and the state supervisor (only
    with `state:`);
 6. `start` the destination and wait for `ready`;
-7. start the data pump.
+7. start the data pump. With a source that advertised `flow_credit`, the pump
+   grants it a window of batches after each batch it hands to the destination,
+   and the core relays each grant as [`credit`](messages.md#credit).
 
 ## Sink delivery (optional stage)
 

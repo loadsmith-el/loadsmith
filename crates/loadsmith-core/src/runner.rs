@@ -33,7 +33,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use loadsmith_arrow::ipc::IpcError;
 use loadsmith_arrow::IpcReader;
 use loadsmith_config::{validate_pipeline, ConfigError, MaskList, PipelineConfig, Timeouts};
-use loadsmith_protocol::{capabilities, error_codes, FinishedStatus, Message, PluginKind, UnknownKeys};
+use loadsmith_protocol::{capabilities, error_codes, Credit, FinishedStatus, Message, PluginKind, UnknownKeys};
 use loadsmith_transport::ControlReader;
 use tokio::io::BufReader;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -50,7 +50,7 @@ use crate::{
     },
     parser_feed::{await_parser_schema, Feed, FeedEvent},
     peer::{describe_exit, finished_failure, Event, Failure, Peer},
-    pump::{pump, PumpControl, PumpOutcome, PumpOutput},
+    pump::{pump, FlowWindow, PumpControl, PumpOutcome, PumpOutput},
     reporter::Reporter,
     shutdown::{Halt, Shutdown},
     sink_supervisor::{run_sink_supervisor, SinkLaunch},
@@ -352,6 +352,10 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     let mut sink_task = None;
     let mut state_task = None;
     let mut delivery_gate = None;
+    // Flow control, when the producer is a source that obeys credits: the
+    // pump sizes the window, the data phase relays its grants.
+    let mut flow_window: Option<FlowWindow> = None;
+    let mut credit_rx: Option<tokio::sync::watch::Receiver<u64>> = None;
     let start_time = std::time::Instant::now();
 
     // ── Setup: handshake, gates, start ────────────────────────────────────
@@ -470,7 +474,16 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         // `ready` and starts announcing files), and hand the parser every
         // file until its schema arrives.
         let declared = match prs.as_mut() {
-            None => start_source(&mut src, resume_value, &timeouts, &mut shutdown).await?,
+            None => {
+                let mut credit = None;
+                if src_info.supports.iter().any(|c| c == capabilities::FLOW_CREDIT) {
+                    let (window, rx) = FlowWindow::new(&config.pipeline.flow);
+                    credit = Some(window.granted());
+                    flow_window = Some(window);
+                    credit_rx = Some(rx);
+                }
+                start_source(&mut src, resume_value, credit, &timeouts, &mut shutdown).await?
+            }
             Some(parser) => {
                 tracing::debug!(plugin = "parser", "→ start");
                 parser.send(Message::Start(Default::default())).await?;
@@ -560,7 +573,9 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
             span.in_scope(|| {
-                pump(source_reader, out_write, control, move |rows, batches| reporter.progress(rows, batches))
+                pump(source_reader, out_write, control, flow_window, move |rows, batches| {
+                    reporter.progress(rows, batches)
+                })
             })
         })
     };
@@ -589,8 +604,15 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         _ => (&mut src, None),
     };
     let supervised =
-        supervise_data_phase(producer, upstream, &mut dst, &mut pump_join, &pump_control, &timeouts, &mut shutdown)
-            .await;
+        supervise_data_phase(
+            producer,
+            upstream,
+            &mut dst,
+            Pumping { join: &mut pump_join, control: &pump_control, credits: credit_rx },
+            &timeouts,
+            &mut shutdown,
+        )
+        .await;
     if let Some(h) = heartbeat {
         h.abort(); // pump finished — stop the heartbeat log
     }
@@ -622,6 +644,12 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     let pump_stats = pump_outcome.as_ref().map(|o| o.stats).unwrap_or_default();
     drop(pump_outcome);
     tracing::info!(rows = pump_stats.rows, batches = pump_stats.batches, "data pump completed");
+    tracing::info!(
+        reading_s = format!("{:.1}", pump_stats.reading.as_secs_f64()),
+        writing_s = format!("{:.1}", pump_stats.writing.as_secs_f64()),
+        peak_window = pump_stats.peak_window,
+        "data plane: time in the source's stream vs the destination's (a slow side shows here)"
+    );
 
     let _ = src_events.await;
     if let Some(task) = prs_events {
@@ -942,6 +970,26 @@ async fn upstream_next(upstream: &mut Option<Upstream<'_>>) -> FeedEvent {
     }
 }
 
+/// The running pump, as the data phase watches it.
+struct Pumping<'a> {
+    join: &'a mut tokio::task::JoinHandle<PumpOutcome>,
+    control: &'a PumpControl,
+    /// The flow window's grants, to relay to the source (flow control only).
+    credits: Option<tokio::sync::watch::Receiver<u64>>,
+}
+
+/// The next flow-control grant to relay to the source; `None` once the pump
+/// is done (its window is gone). Never, without flow control.
+async fn next_grant(credit_rx: &mut Option<tokio::sync::watch::Receiver<u64>>) -> Option<u64> {
+    match credit_rx {
+        Some(rx) => match rx.changed().await {
+            Ok(()) => Some(*rx.borrow_and_update()),
+            Err(_) => None,
+        },
+        None => std::future::pending().await,
+    }
+}
+
 /// Supervises the running pipeline until every plugin finished successfully
 /// (after the commit point) or something failed. Never aborts anything
 /// itself: it returns the first failure, and the caller runs the abort path.
@@ -954,11 +1002,11 @@ async fn supervise_data_phase(
     src: &mut Peer,
     mut upstream: Option<Upstream<'_>>,
     dst: &mut Peer,
-    pump_join: &mut tokio::task::JoinHandle<PumpOutcome>,
-    pump_control: &PumpControl,
+    pumping: Pumping<'_>,
     timeouts: &Timeouts,
     shutdown: &mut Shutdown,
 ) -> DataPhase {
+    let Pumping { join: pump_join, control: pump_control, credits: mut credit_rx } = pumping;
     let label = src.label();
     let mut failure: Option<Failure> = None;
     let mut pump_outcome: Option<PumpOutcome> = None;
@@ -1111,6 +1159,17 @@ async fn supervise_data_phase(
                     }
                     Ok(Some(Event::Msg(other))) => ignore_mid_stream(label, &other),
                     Ok(Some(Event::ResendRequested)) | Ok(None) => {}
+                }
+            }
+            grant = next_grant(&mut credit_rx) => {
+                match grant {
+                    // A source that is gone fails through its own branches.
+                    Some(batch_seq) => {
+                        if let Err(e) = src.send(Message::Credit(Credit { batch_seq })).await {
+                            tracing::debug!("credit not delivered to the {label}: {e}");
+                        }
+                    }
+                    None => credit_rx = None,
                 }
             }
             event = upstream_next(&mut upstream) => {

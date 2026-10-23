@@ -55,6 +55,12 @@ pub enum Message {
     /// Feeds the core's delivery ledger so a crashed sink can resume.
     ObjectDelivered(ObjectDelivered),
 
+    // Flow control (core → source)
+    /// Core → source (control plane): the source may produce batches up to
+    /// and including this batch ordinal. Sent only to a source that advertised
+    /// `flow_credit`, after a `start` that carried the initial `credit`.
+    Credit(Credit),
+
     // Parsing (raw source → core → parser)
     /// Core → parser (control plane): parse the local file at this path. The
     /// path comes from a raw source's `object_ready`. Idempotent per path.
@@ -258,6 +264,23 @@ pub enum ConfigureStatus {
 pub struct StartParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<ResumeCursor>,
+    /// Flow control: the initial grant, as in [`Credit::batch_seq`]. Present
+    /// only for a source that advertised `flow_credit`; absent means no
+    /// credits will follow and the pipe alone applies backpressure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit: Option<u64>,
+}
+
+// ── Flow control ──────────────────────────────────────────────────────────────
+
+/// `credit`: the core's grant to a source. Cumulative and monotonic: each
+/// grant replaces the previous one, so a lost or late message never shrinks
+/// what the source may produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Credit {
+    /// The highest batch ordinal (1-based, as in `checkpoint`) the source may
+    /// have fetched — across its read-ahead and workers — before it waits.
+    pub batch_seq: u64,
 }
 
 /// The opaque cursor value to resume from. The core never interprets it — it
@@ -600,6 +623,9 @@ pub mod capabilities {
     pub const SCRATCH_DIR: &str = "scratch_dir";
     /// Provider: answers `resolve` with `resolved`.
     pub const RESOLVE: &str = "resolve";
+    /// Source: obeys `credit` — it never fetches a batch past the core's
+    /// grant. The core then sends `start.credit` and `credit` messages.
+    pub const FLOW_CREDIT: &str = "flow_credit";
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -829,6 +855,7 @@ mod tests {
             resume: Some(ResumeCursor {
                 cursor_value: serde_json::json!("2026-06-09T08:00:00Z"),
             }),
+            credit: None,
         });
         if let Message::Start(p) = roundtrip(&msg) {
             assert_eq!(p.resume.unwrap().cursor_value, "2026-06-09T08:00:00Z");
@@ -861,6 +888,21 @@ mod tests {
             panic!("wrong variant");
         }
         assert!(serde_json::to_string(&msg).unwrap().contains("\"type\":\"checkpoint\""));
+    }
+
+    #[test]
+    fn credit_roundtrip() {
+        let msg = Message::Credit(Credit { batch_seq: 9 });
+        assert_eq!(serde_json::to_string(&msg).unwrap(), r#"{"type":"credit","batch_seq":9}"#);
+        assert!(matches!(roundtrip(&msg), Message::Credit(Credit { batch_seq: 9 })));
+    }
+
+    #[test]
+    fn start_credit_is_optional() {
+        let bare: Message = serde_json::from_str(r#"{"type":"start"}"#).unwrap();
+        assert!(matches!(bare, Message::Start(StartParams { credit: None, .. })));
+        let msg = Message::Start(StartParams { resume: None, credit: Some(2) });
+        assert_eq!(serde_json::to_string(&msg).unwrap(), r#"{"type":"start","credit":2}"#);
     }
 
     #[test]

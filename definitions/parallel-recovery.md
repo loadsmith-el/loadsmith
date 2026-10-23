@@ -190,28 +190,32 @@ does not bound a plugin with workers or read-ahead (3.5, 3.6): each worker
 would keep fetching into memory while the pipe is full, and a source that reads
 10× faster than the destination writes would pull the table into RAM.
 
-- **Credits (additive protocol):** the core sends `credit {batches, bytes}` to
-  the source on the control channel; a source with the capability
-  `flow_credit` may have at most that many batches (and bytes) read from the
-  database but not yet written to fd3 — across all its workers and read-ahead
-  buffers. The core grants more as the pump moves batches on ("me dá mais
-  três"), and stops granting when the destination falls behind ("peraí").
-- **The SDK enforces it**, not each plugin: the source's fetch pool asks the
-  SDK for a permit before fetching a batch, and the permit returns when the
-  batch is written. A plugin cannot read ahead on its own.
-- **The core decides the window** from the destination's drain rate and a
-  memory budget: `pipeline.flow: {max_inflight_batches, memory_budget}` with
-  safe defaults. It starts small, grows while the destination keeps up, and
-  shrinks when the pump blocks on the destination's pipe (additive increase,
-  multiplicative decrease). The run's telemetry reports the window and the time
-  each side spent waiting, so a slow side is visible.
+- **Credits (additive protocol):** the core sends `credit {batch_seq}` to the
+  source on the control channel, with the initial grant in `start.credit`; a
+  source with the capability `flow_credit` may have fetched at most up to that
+  batch ordinal — across all its workers and read-ahead buffers. Grants are
+  cumulative and never shrink (a lost or late one never takes credit back).
+  The core grants after each batch the pump hands to the destination ("me dá
+  mais três"), so a destination that falls behind stops the grants ("peraí").
+- **The SDK enforces it**, not each plugin: the SDK never calls `next_batch`
+  past the grant, advertises `flow_credit` itself, and hands the plugin a
+  `FlowGate` (`attach_flow`) whose `wait_for(seq)` every internal fetch (a
+  fetch task, a partition worker) awaits before fetching batch `seq`.
+- **The core decides the window**: `pipeline.flow: {max_inflight_batches: 8,
+  memory_budget_mib: 256}`. It starts at 2 batches and is resized after each
+  batch to what the memory budget holds at the largest batch seen, within
+  `max_inflight_batches`. The run logs the pump's time on each side
+  (`reading_s`, `writing_s`) and the peak window. *(Implemented 2026-10-23.
+  AIMD was dropped: the pump's read/write timings mix waiting with transfer
+  through the pipes, so they cannot tell "source starved of credit" from "data
+  in transit"; a memory-sized window bounds RAM, which is the requirement.)*
 - **Partition workers follow credits.** `parallel.workers` is a ceiling; with no
   credit, workers wait idle instead of buffering.
 - **Destination side** needs no grant: it pulls from fd3, and the column-parallel
   Parquet encoder works on one row group at a time.
-- **Older plugins** without `flow_credit` ignore the message (tolerant reader)
-  and keep today's pipe backpressure; the core then never grants a window larger
-  than one batch to them.
+- **Older plugins** without `flow_credit` get no credits (the core sends them
+  only to a source that advertised the capability) and keep today's pipe
+  backpressure, which bounds a source that fetches one batch at a time.
 
 ## 4. Invariants every piece must keep
 

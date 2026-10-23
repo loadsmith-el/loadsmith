@@ -7,6 +7,7 @@ pub mod object_source;
 pub mod context;
 pub mod telemetry;
 pub mod config;
+pub mod flow;
 mod control;
 
 pub use source::{SourcePlugin, run_source};
@@ -16,4 +17,5 @@ pub use provider::{ProviderPlugin, ResolveFailure, run_provider};
 pub use parser::{ParserPlugin, run_parser};
 pub use object_source::{ObjectSourcePlugin, run_object_source};
 pub use context::EventSender;
+pub use flow::FlowGate;
 pub use config::{ConfigRejection, PluginConfig, RunInfo, UnknownKeys};

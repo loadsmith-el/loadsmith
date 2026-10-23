@@ -15,6 +15,7 @@ pub trait SourcePlugin: Send {
     // Optional — defaults shown; override only for incremental sources.
     fn capabilities(&self) -> Vec<String> { /* ["batch_read","schema_inference"] */ }
     async fn resume_from(&mut self, _cursor_value: Option<serde_json::Value>) {}
+    fn attach_flow(&mut self, _gate: FlowGate) {}
     fn current_watermark(&self) -> Option<serde_json::Value> { None }
 
     async fn configure(&mut self, config: PluginConfig) -> Result<()>;
@@ -30,6 +31,7 @@ pub trait SourcePlugin: Send {
 | `plugin_version()` | During handshake | Return the semver version string |
 | `capabilities()` | During handshake | Override to add `"incremental_state"` if you support resume |
 | `configure(config)` | After protocol negotiation | Parse with `config.parse::<YourConfig>()?` (see [Configuration](#configuration)), validate, open connection |
+| `attach_flow(gate)` | After `start`, before `resume_from` | Keep the [`FlowGate`](#flow-control) if you fetch ahead outside `next_batch()`; otherwise ignore |
 | `resume_from(cursor)` | After `start`, before `schema()` | Stash the opaque resume watermark (incremental sources) |
 | `schema()` | After `start` signal | Return the Arrow schema of the rows you will emit |
 | `next_batch()` | Repeatedly, until done | Return the next `RecordBatch`, or `Ok(None)` when exhausted |
@@ -41,6 +43,31 @@ pub trait SourcePlugin: Send {
 > never builds queries), and return the running max from `current_watermark`.
 > Declare any cursor lazily — `resume_from` is delivered *after* `configure`. See
 > [Incremental State](../architecture/incremental-state.md).
+
+## Flow control
+
+The core decides how far a source may read ahead of the destination (see
+[`pipeline.flow`](../reference/pipeline-yaml.md#pipelineflow)); the SDK enforces
+it. It advertises `flow_credit` for you and never calls `next_batch()` for a
+batch past the core's grant, so a source that fetches only inside
+`next_batch()` needs nothing more.
+
+A source that fetches ahead on its own — a task that pulls the next rows while
+`next_batch()` converts the last ones, or partition workers — keeps the gate
+from `attach_flow` and waits on it before fetching each batch, in stream order:
+
+```rust
+fn attach_flow(&mut self, gate: FlowGate) {
+    self.gate = Some(gate);
+}
+
+// in the fetch task, before fetching batch number `seq` (1-based):
+gate.wait_for(seq).await;
+```
+
+Never size a read-ahead buffer yourself: without credits (an older core) the
+gate is open, and a bounded channel between the fetch task and `next_batch()`
+is the only limit; keep it small.
 
 ## Configuration
 

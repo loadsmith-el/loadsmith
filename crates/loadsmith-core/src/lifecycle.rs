@@ -177,15 +177,17 @@ pub async fn run_handshake_and_configure_with(
 ///
 /// `resume` carries the opaque watermark persisted by a previous run (when the
 /// pipeline has incremental state and prior state exists); the source uses it to
-/// resume reading. `None` means a full read.
+/// resume reading. `None` means a full read. `credit` is the initial
+/// flow-control grant, for a source that advertised `flow_credit`.
 pub async fn start_source(
     peer: &mut Peer,
     resume: Option<serde_json::Value>,
+    credit: Option<u64>,
     timeouts: &Timeouts,
     shutdown: &mut Shutdown,
 ) -> Result<loadsmith_protocol::Schema, Failure> {
     tracing::debug!(plugin = "source", has_resume = resume.is_some(), "→ start");
-    let params = StartParams { resume: resume.map(|cursor_value| ResumeCursor { cursor_value }) };
+    let params = StartParams { resume: resume.map(|cursor_value| ResumeCursor { cursor_value }), credit };
     peer.send(Message::Start(params)).await?;
     match peer.recv_expect("schema", Timeouts::limit(timeouts.start_seconds), shutdown).await? {
         Message::Schema(s) => {
