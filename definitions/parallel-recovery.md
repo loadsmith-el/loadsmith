@@ -232,6 +232,30 @@ F1/F2 (performance, plugin internals) and F3 (durability, core/SDK) touch
 different layers and can be developed in parallel worktrees after F0. F4 needs
 both: it multiplies the data rate (needs F2) and its resume needs F3.
 
+### F0 results (2026-10-23)
+
+B1 fixed and released in **1.0.1** (lab case
+`catalog/postgres-to-parquet-localcopy-outage`: run 2 read 0 rows on 1.0.0,
+100,000 with the fix).
+
+Baseline, 5M rows of `events_scale`, Loadsmith 1.0.0 + oracle 0.5.2, CPU
+seconds per thread sampled from `/proc` (DB = the database container's CPU):
+
+| Run | Wall | Source threads | Destination | DB |
+|---|---|---|---|---|
+| pg → null | 16.0 s | main 10.3 s (0.65 core) | — | 5.8 s |
+| pg → Parquet → S3 | 19.3 s | main 10.7 s | 7.3 s (0.43) | 6.4 s |
+| oracle → null | 18.2 s | **`oracle-fetch` 15.4 s (0.85)**, main 6.1 s | — | 3.9 s |
+| oracle → Parquet → S3 | 21.0 s | `oracle-fetch` 15.6 s, main 6.2 s | 7.4 s (0.39) | 3.9 s |
+
+- **Postgres:** source CPU + DB CPU ≈ wall (10.3 + 5.8 ≈ 16.0): the FETCH loop
+  is strictly serial, never overlapped. Fetch-ahead alone should bring the
+  source to max(10.3, 5.8); column-parallel decode and Parquet then leave the
+  database (~6 s) as the floor: ~3× on the Parquet run.
+- **Oracle:** the fetch thread is saturated (TNS decode + per-cell `String`),
+  and the main thread spends 6.1 s parsing those strings back. The database
+  needs only 3.9 s. Native cells (W1–W4) and parallel conversion target ≥2×.
+
 ## 6. Validation
 
 - **Byte-identical output** for F1/F2: compare Parquet against 1.0.0 on the same
