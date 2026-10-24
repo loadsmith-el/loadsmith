@@ -9,9 +9,10 @@ pub mod telemetry;
 pub mod config;
 pub mod flow;
 pub mod watermark;
+pub mod object_key;
 mod control;
 
-pub use source::{SourcePlugin, run_source};
+pub use source::{Resumption, SourcePlugin, run_source};
 pub use destination::{DestinationPlugin, ReadyObject, run_destination};
 pub use loadsmith_protocol::BatchRange;
 pub use sink::{SinkPlugin, run_sink};
@@ -21,4 +22,5 @@ pub use object_source::{ObjectSourcePlugin, run_object_source};
 pub use context::EventSender;
 pub use flow::FlowGate;
 pub use watermark::TieSafeCursor;
+pub use object_key::ObjectKey;
 pub use config::{ConfigRejection, PluginConfig, RunInfo, UnknownKeys};

@@ -269,11 +269,18 @@ pub struct StartParams {
     /// credits will follow and the pipe alone applies backpressure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credit: Option<u64>,
-    /// To a destination, when a run is retried: number the files it stages
-    /// from here on, so they never take the names of files an earlier attempt
-    /// of the same run already delivered. Absent means from the start.
+    /// To a destination, when a run is retried or resumed: number the files
+    /// it stages from here on, so they never take the names of files an
+    /// earlier attempt of the same run already delivered (and do take the
+    /// name of one it may have left half-delivered). Absent means from the
+    /// start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_object_seq: Option<u64>,
+    /// To a source, when a run that failed resumes: the last durable
+    /// [`Checkpoint::resume_token`] it reported. The source continues from it
+    /// when it can and says so in [`Schema::resumed`]. Opaque to the core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_token: Option<serde_json::Value>,
 }
 
 // ── Flow control ──────────────────────────────────────────────────────────────
@@ -300,10 +307,20 @@ pub struct ResumeCursor {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
-    /// Opaque high watermark of the cursor column produced so far.
+    /// Opaque high watermark of the cursor column produced so far; `null`
+    /// from a source with no cursor (a full load reporting only a
+    /// `resume_token`).
     pub cursor_value: serde_json::Value,
     /// Batch ordinal this watermark corresponds to (1-based, global to the run).
     pub batch_seq: u64,
+    /// Where a run that fails after `batch_seq` is durable can resume the
+    /// read — e.g. the partitions of a partitioned full load whose every
+    /// batch is at or before `batch_seq`. Opaque to the core: persisted at the
+    /// durable frontier like the watermark, handed back in
+    /// [`StartParams::resume_token`] when the run resumes, discarded when the
+    /// run succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_token: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,6 +334,12 @@ pub struct Committed {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schema {
     pub fields: Vec<Field>,
+    /// From a source that received [`StartParams::resume_token`]: `true` when
+    /// it continues from the token, `false` when it starts over (the token
+    /// can no longer be honoured). The core keeps the run's earlier objects
+    /// only in the first case. Absent: no token was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed: Option<bool>,
 }
 
 // ── Progress ──────────────────────────────────────────────────────────────────
@@ -874,6 +897,7 @@ mod tests {
             }),
             credit: None,
             first_object_seq: None,
+            resume_token: None,
         });
         if let Message::Start(p) = roundtrip(&msg) {
             assert_eq!(p.resume.unwrap().cursor_value, "2026-06-09T08:00:00Z");
@@ -898,6 +922,7 @@ mod tests {
         let msg = Message::Checkpoint(Checkpoint {
             cursor_value: serde_json::json!(123456),
             batch_seq: 42,
+            resume_token: None,
         });
         if let Message::Checkpoint(c) = roundtrip(&msg) {
             assert_eq!(c.cursor_value, 123456);
@@ -905,7 +930,27 @@ mod tests {
         } else {
             panic!("wrong variant");
         }
-        assert!(serde_json::to_string(&msg).unwrap().contains("\"type\":\"checkpoint\""));
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"checkpoint\"") && !json.contains("resume_token"), "{json}");
+    }
+
+    /// Additive in v1: a resume token on `checkpoint` and `start`, and the
+    /// source's answer on `schema`; all absent unless used.
+    #[test]
+    fn resume_tokens_roundtrip_and_stay_optional() {
+        let token = serde_json::json!({ "done": [0, 3] });
+        let msg = Message::Checkpoint(Checkpoint {
+            cursor_value: serde_json::Value::Null,
+            batch_seq: 9,
+            resume_token: Some(token.clone()),
+        });
+        assert!(matches!(roundtrip(&msg), Message::Checkpoint(c) if c.resume_token == Some(token.clone())));
+        let msg = Message::Start(StartParams { resume_token: Some(token.clone()), ..Default::default() });
+        assert!(matches!(roundtrip(&msg), Message::Start(p) if p.resume_token == Some(token.clone())));
+        let old: Message = serde_json::from_str(r#"{"type":"schema","fields":[]}"#).unwrap();
+        assert!(matches!(old, Message::Schema(s) if s.resumed.is_none()));
+        let msg = Message::Schema(Schema { fields: vec![], resumed: Some(false) });
+        assert_eq!(serde_json::to_string(&msg).unwrap(), r#"{"type":"schema","fields":[],"resumed":false}"#);
     }
 
     #[test]
@@ -919,7 +964,7 @@ mod tests {
     fn start_credit_is_optional() {
         let bare: Message = serde_json::from_str(r#"{"type":"start"}"#).unwrap();
         assert!(matches!(bare, Message::Start(StartParams { credit: None, .. })));
-        let msg = Message::Start(StartParams { resume: None, credit: Some(2), first_object_seq: None });
+        let msg = Message::Start(StartParams { resume: None, credit: Some(2), first_object_seq: None, resume_token: None });
         assert_eq!(serde_json::to_string(&msg).unwrap(), r#"{"type":"start","credit":2}"#);
     }
 
@@ -942,6 +987,7 @@ mod tests {
                 Field::new("nome", FieldType::Utf8),
                 Field::new("ativo", FieldType::Bool),
             ],
+            resumed: None,
         });
         if let Message::Schema(s) = roundtrip(&msg) {
             assert_eq!(s.fields.len(), 3);

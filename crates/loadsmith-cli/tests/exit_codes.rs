@@ -217,18 +217,42 @@ fn state_lock_held_exits_5() {
         json!({ "incremental": true }),
         &format!("state:\n  backend: local\n  path: {}\n", state.display()),
     );
-    // A freshly renewed lease held by someone else.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    std::fs::write(
-        format!("{}.lock", state.display()),
-        format!(r#"{{"holder":"another-run","renewed_at_unix_ms":{now}}}"#),
-    )
-    .unwrap();
+    // A lease held, and renewed, by another live run.
+    let _holder = LiveHolder::start(&state);
     let (code, out) = exit_code(&mut env.run(&pipeline));
     assert_eq!(code, 5, "{out}");
+}
+
+/// Another run holding the state lock: renews its lease every 200 ms until
+/// dropped. (A lease nobody renews is a crashed run's, and is taken.)
+struct LiveHolder(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl LiveHolder {
+    fn start(state: &std::path::Path) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lock = format!("{}.lock", state.display());
+        let flag = stop.clone();
+        std::thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let tmp = format!("{lock}.holder-tmp");
+                std::fs::write(&tmp, format!(r#"{{"holder":"another-run","renewed_at_unix_ms":{now}}}"#)).unwrap();
+                std::fs::rename(&tmp, &lock).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        Self(stop)
+    }
+}
+
+impl Drop for LiveHolder {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Spawns a long run with state, waits for data to flow, signals the engine
@@ -408,15 +432,7 @@ fn json_summary_on_setup_failures() {
         json!({ "incremental": true }),
         &format!("state:\n  backend: local\n  path: {}\n", state.display()),
     );
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    std::fs::write(
-        format!("{}.lock", state.display()),
-        format!(r#"{{"holder":"another-run","renewed_at_unix_ms":{now}}}"#),
-    )
-    .unwrap();
+    let _holder = LiveHolder::start(&state);
     let file = env.scratch.path("summary.json");
     let (code, _) = exit_code(env.run(&pipeline).arg("--summary-file").arg(&file));
     assert_eq!(code, 5);

@@ -36,6 +36,8 @@ pub trait SourcePlugin: Send {
 | `schema()` | After `start` signal | Return the Arrow schema of the rows you will emit |
 | `next_batch()` | Repeatedly, until done | Return the next `RecordBatch`, or `Ok(None)` when exhausted |
 | `current_watermark()` | After each batch, and once after the last | Return the tie-safe cursor value so far (`TieSafeCursor`) — the core persists it (durability-gated) |
+| `current_resume_token()` | Like `current_watermark()` | Optional (default `None`): where a continued run could resume the read if everything returned so far were durable — e.g. a partitioned full load's finished partitions. Sent with the checkpoint; the core persists the last durable one |
+| `resume_at(token)` | After `resume_from`, when a failed run is continued and this source reported a token | Return `Resumption::Continue(how)` to continue from it, `Resumption::StartOver(why)` to read everything again (the default); the message is logged to the run. The core keeps the failed run's output only after `Continue` |
 | `cancel()` | The run will not complete (after `start`): the core sent `cancel`/`error`, the core is gone, or the source itself failed | Stop producing and release the cursor/connection. On `cancel`, an in-flight `next_batch()` future may have been dropped first |
 
 > **Incremental sources.** Advertise `incremental_state`, store the value from

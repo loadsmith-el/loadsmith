@@ -66,6 +66,9 @@ pub struct RunDocument {
     /// Which attempt the outcome is from (above 1 only with
     /// `pipeline.recovery`); the row counts are that attempt's.
     pub attempts: u32,
+    /// The failed run this one continued, when it resumed one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resumed_run: Option<String>,
     pub started_at: String,
     pub finished_at: String,
     pub state: Option<StateInfo>,
@@ -180,6 +183,7 @@ pub fn build(rec: &RunRecord<'_>) -> RunDocument {
         duration_ms: duration.as_millis() as u64,
         throughput_rows_per_sec: throughput,
         attempts: summary.map_or(1, |s| s.attempts.max(1)),
+        resumed_run: summary.and_then(|s| s.resumed_run.clone()),
         started_at: rfc3339(rec.started),
         finished_at: rfc3339(rec.finished),
         state: rec.ctx.has_state.then(|| StateInfo {

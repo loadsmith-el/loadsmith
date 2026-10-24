@@ -42,6 +42,7 @@ loadsmith run pipeline.yaml --otel-endpoint http://otel-collector:4318   # expor
 | `--print-resolved-config` | off | Resolve the config (providers included), print it to stdout with every `env()`/`file()`/`secret()` value masked, and exit without starting any data plugin |
 | `--output <human\|json>` | `human` | What stdout carries: the human report, or one JSON [run summary](#machine-readable-run-summary) instead |
 | `--summary-file <path>` | — | Also write the JSON [run summary](#machine-readable-run-summary) to this file, whatever `--output` says |
+| `--no-resume` | off | Start a new run even when the state records a failed run to continue ([resume record](../architecture/incremental-state.md#resuming-a-failed-run)): a new run id, files numbered from the first; what the failed run delivered stays where it is, and the incremental watermark still applies |
 | `--ignore-unknown-keys[=<bool>]` | off | Warn about [unknown keys](#unknown-keys) and ignore them instead of failing (exit `3`). Also `LOADSMITH_IGNORE_UNKNOWN_KEYS=1`; the flag wins |
 | `--otel-endpoint <url>` | — | [Telemetry](#telemetry-flags): export traces, metrics and logs over OTLP to this endpoint (turns telemetry on) |
 | `--otel-protocol <grpc\|http-protobuf>` | `http-protobuf` | Telemetry transport |
@@ -184,6 +185,7 @@ not applicable.
 | `duration_ms` | integer | Wall-clock time of the command, `finished_at − started_at` |
 | `throughput_rows_per_sec` | integer | `rows_read` per second of `duration_ms` (`0` for an instant run) |
 | `attempts` | integer | Which attempt of the run the outcome is from: `1`, or more when [`pipeline.recovery`](pipeline-yaml.md#pipelinerecovery) retried it. The row and batch counts are that attempt's (1.2+) |
+| `resumed_run` | string | Only when the run continued a failed one: that run's id, which this run's objects carry too (1.3+). Absent otherwise |
 | `started_at`, `finished_at` | string | UTC timestamps, RFC 3339 with milliseconds (`2026-10-20T14:03:08.398Z`) |
 | `state` | object \| null | With a `state:` block: `watermark_before` (the cursor loaded at start, `null` if none) and `watermark_after` (the cursor in the state after the run: the one this run persisted, else unchanged). The values are the opaque cursors, verbatim. `null` without a `state:` block |
 | `sink` | object \| null | With a `sink:` block: `objects_delivered` (`null` if delivery did not complete). `null` without a sink |
@@ -497,7 +499,7 @@ under `1`.
 | `2` | Usage error | Unknown flag or missing argument (from the argument parser); conflicting selectors such as `plugin install mysql:source --kind destination` |
 | `3` | Configuration error | Unreadable pipeline file, invalid YAML, unknown key, failed template, validation error, a `secret()` naming an undeclared provider instance or used in `pipeline:`/`state:`/`providers:`, a provider failure (a reference it could not resolve, a crash, a protocol violation, a timeout), a plugin or provider rejected its `config` (`configure_ack` error), a capability gate (a `sink:` on a destination without `object_output`, a `state:` block with a non-incremental source, a `parser:` without a raw source or a raw source without a `parser:`), `state show` on a pipeline with no `state:` block |
 | `4` | Plugin unavailable | Plugin binary (provider binaries included) not found, cannot be started, no protocol version in common, wrong kind, a provider without the `resolve` capability, a parser without the `parse` capability |
-| `5` | State error | The state lock is held by another run, the state file is unreadable or from a newer engine, the source schema drifted (`on_schema_change: refuse`) |
+| `5` | State error | The state lock is held by another live run (its lease is being renewed; a crashed run's lease is taken after watching it for 15 s), the state file is unreadable or from a newer engine, the source schema drifted (`on_schema_change: refuse`) |
 | `130` | Interrupted (SIGINT) | Ctrl+C, after cancelling the plugins (also while providers are resolving) |
 | `143` | Terminated (SIGTERM) | `docker stop`, a Kubernetes pod shutdown, after cancelling the plugins |
 

@@ -17,6 +17,16 @@ use crate::config::PluginConfig;
 use crate::control::{answer_configure, conclude, handshake, recv_configure, recv_start, Control, Flow};
 use crate::flow::{FlowGate, FlowGrant};
 
+/// What a source does with a failed run's resume token
+/// ([`SourcePlugin::resume_at`]), and the line the run's log shows for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resumption {
+    /// Continue where the failed run stopped; logged as info.
+    Continue(String),
+    /// Read everything again, and why; logged as a warning.
+    StartOver(String),
+}
+
 /// Implemented by source plugins. The SDK drives the full lifecycle;
 /// implementors only provide data and metadata.
 #[async_trait]
@@ -37,6 +47,19 @@ pub trait SourcePlugin: Send {
     /// incremental source resumes reading after this value; non-incremental
     /// sources leave the default no-op.
     async fn resume_from(&mut self, _cursor_value: Option<serde_json::Value>) {}
+
+    /// Called after `resume_from` when the run resumes after a failure and
+    /// this source reported a [`current_resume_token`] before it: the last
+    /// token that was durable. [`Resumption::Continue`] continues from it
+    /// (e.g. skips the partitions it lists), [`Resumption::StartOver`] reads
+    /// everything again (the token can no longer be honoured); either way
+    /// the message is logged to the run. The core keeps the run's earlier
+    /// output only after a `Continue`. The default reads everything again.
+    ///
+    /// [`current_resume_token`]: SourcePlugin::current_resume_token
+    async fn resume_at(&mut self, _token: serde_json::Value) -> Resumption {
+        Resumption::StartOver("this source does not continue a failed run".into())
+    }
 
     /// Called after `start`, before `resume_from`. The core decides how far a
     /// source may read ahead of the destination; the SDK never calls
@@ -66,6 +89,18 @@ pub trait SourcePlugin: Send {
     ///
     /// [`TieSafeCursor`]: crate::TieSafeCursor
     fn current_watermark(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Where a resumed run could continue, given everything produced so far
+    /// were durable — e.g. the partitions whose every batch has been returned
+    /// by `next_batch`. Consulted like [`current_watermark`]; sent with the
+    /// checkpoint and handed back to [`resume_at`] if the run fails and
+    /// resumes. `None` (the default) ⇒ nothing to resume from.
+    ///
+    /// [`current_watermark`]: SourcePlugin::current_watermark
+    /// [`resume_at`]: SourcePlugin::resume_at
+    fn current_resume_token(&self) -> Option<serde_json::Value> {
         None
     }
 
@@ -105,6 +140,34 @@ async fn join_writer(writer: std::thread::JoinHandle<Result<DataWriter, String>>
 async fn writer_failure(writer: std::thread::JoinHandle<Result<DataWriter, String>>) -> Flow {
     let e = join_writer(writer).await.err().unwrap_or_else(|| anyhow::anyhow!("the data writer stopped"));
     Flow::fatal("IPC_WRITE_FAILED", e)
+}
+
+/// What the last checkpoint carried.
+#[derive(Default)]
+struct Reported {
+    watermark: Option<serde_json::Value>,
+    token: Option<serde_json::Value>,
+}
+
+impl Reported {
+    /// Sends a checkpoint for `batch_seq` when the watermark or the resume
+    /// token changed since the last one.
+    async fn report<E: AsyncWrite + Unpin>(
+        &mut self,
+        events: &mut EventSender<E>,
+        batch_seq: u64,
+        watermark: Option<serde_json::Value>,
+        token: Option<serde_json::Value>,
+    ) {
+        let changed = (watermark.is_some() && watermark != self.watermark) || (token.is_some() && token != self.token);
+        if !changed {
+            return;
+        }
+        let cursor = watermark.clone().or_else(|| self.watermark.clone()).unwrap_or(serde_json::Value::Null);
+        events.checkpoint_with(batch_seq, cursor, token.clone().or_else(|| self.token.clone())).await;
+        self.watermark = watermark.or(self.watermark.take());
+        self.token = token.or(self.token.take());
+    }
 }
 
 /// Runs `work` while answering the core, so a `cancel` stops a source even
@@ -178,6 +241,19 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Un
     let (grant, mut gate) = FlowGrant::new(params.credit);
     plugin.attach_flow(gate.clone());
     plugin.resume_from(params.resume.map(|r| r.cursor_value)).instrument(span.clone()).await;
+    let resumed = match params.resume_token {
+        Some(token) => Some(match plugin.resume_at(token).instrument(span.clone()).await {
+            Resumption::Continue(how) => {
+                events.info(how).await;
+                true
+            }
+            Resumption::StartOver(why) => {
+                events.warn(why).await;
+                false
+            }
+        }),
+        None => None,
+    };
 
     // ── Schema ────────────────────────────────────────────────────────────
     let schema = plugin.schema().instrument(span.clone()).await;
@@ -188,7 +264,7 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Un
     // precision, nullability, children). The IPC header written next carries
     // the same schema and is what the core treats as authoritative.
     let protocol_fields = loadsmith_arrow::protocol_fields_from_schema(&schema);
-    ctl.send(Message::Schema(loadsmith_protocol::Schema { fields: protocol_fields })).await?;
+    ctl.send(Message::Schema(loadsmith_protocol::Schema { fields: protocol_fields, resumed })).await?;
 
     // ── Data loop (Arrow IPC on fd3) ──────────────────────────────────────
     let data_fd = unsafe { std::fs::File::from_raw_fd(3) };
@@ -205,8 +281,9 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Un
 
     let mut rows_total: u64 = 0;
     let mut batches_total: u64 = 0;
-    // The last watermark sent: an unchanged one is not sent again.
-    let mut reported: Option<serde_json::Value> = None;
+    // The last watermark and resume token sent: unchanged, they are not sent
+    // again.
+    let mut reported = Reported::default();
 
     loop {
         // The core's grant first: never ask for a batch past it.
@@ -229,20 +306,13 @@ async fn drive_source<P: SourcePlugin, W: AsyncWrite + Unpin, E: AsyncWrite + Un
                 // Report the high watermark for this batch ordinal. The core
                 // pairs it with the destination's durable-commit ack before
                 // persisting, so emitting per batch is safe (and cheap on fd4).
-                if let Some(watermark) = plugin.current_watermark() {
-                    if reported.as_ref() != Some(&watermark) {
-                        events.checkpoint(batches_total, watermark.clone()).await;
-                        reported = Some(watermark);
-                    }
-                }
+                reported.report(events, batches_total, plugin.current_watermark(), plugin.current_resume_token()).await;
             }
             Ok(None) => {
                 // The stream is over: the source may now report a value it
                 // held back (the last one, which no row can follow).
-                if let Some(watermark) = plugin.current_watermark() {
-                    if batches_total > 0 && reported.as_ref() != Some(&watermark) {
-                        events.checkpoint(batches_total, watermark).await;
-                    }
+                if batches_total > 0 {
+                    reported.report(events, batches_total, plugin.current_watermark(), plugin.current_resume_token()).await;
                 }
                 break;
             }

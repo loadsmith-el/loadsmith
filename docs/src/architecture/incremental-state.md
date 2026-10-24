@@ -122,12 +122,15 @@ wasted work, never a duplicate.
 State lives behind a `StateBackend` trait. The shipped backend is **local**: a
 JSON state file written atomically (temp file + `rename`), with a sibling
 `<path>.lock` created via `O_EXCL` that holds a time-based lease, renewed every
-20s by the running pipeline from the moment it acquires the lock (so plugin
-start-up and a slow first query are covered). A second run fails fast while the
-lease is fresh (so
-two concurrent runs of one pipeline can't corrupt the watermark); a lease not
-renewed for 60s (a crashed run) is stolen with a warning. There is no
-process-liveness check — after a crash, the next run is refused for up to 60s.
+5s by the running pipeline from the moment it acquires the lock (so plugin
+start-up and a slow first query are covered). A run that finds the lock held
+watches it: a renewal means a live holder, and the run fails (exit `5`, within
+one renew interval), so two concurrent runs of one pipeline can't corrupt the
+watermark; a lease left unrenewed for 15s — by the run's own clock, so clock
+skew between hosts cannot fool it — is a crashed run's, and is taken with a
+warning. There is no process-liveness check (a run in another container or on
+another host could not be probed): after a crash, the next run waits up to
+15s, then goes on by itself (before 1.3 it was refused for up to 60s).
 Each acquisition writes a unique holder token into the lock file, and a run
 only renews or removes a lock that still carries its own token: a run whose
 lease expired and was stolen logs an error and leaves the new holder's lock
@@ -142,6 +145,42 @@ changed since the recorded run, `on_schema_change` decides whether to refuse
 of the source's IPC stream** (fd3), which the core reads before it starts the
 destination, not from the informational `schema` message. A drifted run is
 therefore refused before anything is loaded.
+
+## Resuming a failed run
+
+A run that fails after part of its output became durable leaves a **resume
+record** in the state (format 3), and the next run continues it instead of
+starting a new one — whether it is a
+[`pipeline.recovery`](../reference/pipeline-yaml.md#pipelinerecovery) attempt
+in the same process or a new process after a crash (1.3+):
+
+- **The same run.** It runs under the failed run's id and start time, so a
+  sink names its objects as the failed run did, under the same
+  `<date>/<run id>/` prefix: one run, one prefix, as if it had never failed.
+- **The next file number.** With a sink, the record holds the number of the
+  first file not known to be delivered; the destination stages its files from
+  there (`start.first_object_seq`). Files before it keep their names, and a
+  file the failed run may have left half-delivered — the upload in flight when
+  it was killed — is replaced by the new one instead of adding a second copy
+  of its rows.
+- **The source's resume token.** A source may report where a continued run
+  could resume (`checkpoint.resume_token`, e.g. a partitioned full load's
+  finished partitions); the core persists the last durable one with the
+  watermark and hands it back (`start.resume_token`). The source answers
+  whether it continues from it (`schema.resumed`); when it cannot (its
+  snapshot is gone), it reads everything again, and its files, numbered from
+  the first, replace the failed run's.
+- **Not after a change.** The record carries a fingerprint of the pipeline's
+  configuration (secrets masked): a run with a different configuration starts
+  a new run with a warning, and so does `loadsmith run --no-resume`. The
+  failed run's output stays where it is; the incremental watermark applies
+  either way.
+
+The record is written with the watermark, at the same durable frontier, and
+removed when a run succeeds. An incremental source continues at its watermark
+with no token; a full load without one reads everything again. What a
+continued run reads twice: the rows tied with the boundary watermark (see
+above), and with partitions the rows of the partitions that were in progress.
 
 ## State file format
 
@@ -161,12 +200,13 @@ part of Loadsmith's [stability promise](../reference/stability.md):
 
 | Field | Meaning |
 |---|---|
-| `version` | State format version. Current: **2**. |
+| `version` | State format version: **3** while a resume record is present, **2** otherwise. |
 | `pipeline` | Owning pipeline — a run refuses a file that belongs to another pipeline. |
 | `cursor_value` | The opaque watermark, echoed to the source verbatim on resume. |
 | `schema_hash` | Fingerprint of the source's Arrow schema, as 16 hex digits (see below). Stable across Loadsmith builds, Arrow versions and platforms. |
 | `run_id` | Run that last wrote the file (diagnostic). |
 | `updated_at_unix_ms` | Time of the last write (diagnostic). |
+| `resume` | Only while a failed run awaits its continuation (format 3): `run_id` and `started_at_unix_ms` of that run, `config_hash` (the configuration's fingerprint), `next_object_seq` (with a sink) and `token` (the source's resume token, when it reported one). `cursor_value` is `null` for a source with no cursor. |
 
 **The fingerprint** covers field order, names, nullability and exact types with
 their parameters: timestamp unit and time zone, decimal precision and scale,
@@ -193,7 +233,8 @@ Compatibility rules:
 - **Older formats are migrated.** A file in an older format is accepted: the
   cursor is honoured, the schema-drift check is skipped for that one run (with a
   warning, since its fingerprint was computed differently and cannot be
-  compared), and the next save rewrites the file as version 2. Until a run
+  compared), and the next save rewrites the file as version 2 (3 with a
+  resume record). Until a run
   saves a new watermark, the file keeps its old format. The older formats are:
   - **legacy** (Loadsmith ≤ 0.2.0): no `version` field, and a `schema_hash`
     from Rust's `DefaultHasher`, which is not stable across Rust releases;
@@ -202,6 +243,8 @@ Compatibility rules:
     most other types `utf8`, no nullability).
 - A file with a `version` **higher** than the running Loadsmith understands was
   written by a newer release; it is refused rather than silently downgraded.
+  A resume record is written as version 3 for that reason: an older engine
+  refuses a run it could not continue correctly, and reads every other file.
 - Unknown extra fields are ignored on read (and dropped on the next write).
 
 ## Operating it

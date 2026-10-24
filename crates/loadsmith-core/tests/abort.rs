@@ -594,7 +594,7 @@ fn schema_drift_is_detected_from_the_arrow_stream() {
     let summary = run.exec(&yaml(false)).expect("first run");
     assert_eq!(summary.status, SummaryStatus::Success);
     let doc = state_doc(&state);
-    assert_eq!(doc["version"], loadsmith_core::state::STATE_FORMAT_VERSION);
+    assert_eq!(doc["version"], 2, "a successful run leaves no resume record: format 2");
     let recorded = doc["schema_hash"].clone();
 
     // Same shape: accepted.
@@ -633,7 +633,7 @@ fn v1_state_file_is_migrated() {
     let summary = run.exec(&yaml).expect("an old fingerprint must not be refused");
     assert_eq!(summary.status, SummaryStatus::Success);
     let doc = state_doc(&state);
-    assert_eq!(doc["version"], loadsmith_core::state::STATE_FORMAT_VERSION);
+    assert_eq!(doc["version"], 2, "a successful run leaves no resume record: format 2");
     assert_ne!(doc["schema_hash"], "a8e4fe49824728ac");
     assert_eq!(doc["run_id"].as_str().map(|r| r != "old"), Some(true));
 }

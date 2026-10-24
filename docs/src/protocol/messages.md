@@ -203,14 +203,26 @@ To a source that advertised `flow_credit`, the core adds `credit`: the initial
 grant, as in [`credit`](#credit). Without it no credits follow, and the source
 is bounded by its data pipe alone.
 
-To a destination, when [`pipeline.recovery`](../reference/pipeline-yaml.md#pipelinerecovery)
-retries an incremental run whose earlier attempt already staged files, the core
-adds `first_object_seq`: number the files staged from here on starting at this
-value, so none takes the name of a file already delivered under the same run
-id. Absent means from the start.
+To a destination, when a failed run is continued — by a
+[`pipeline.recovery`](../reference/pipeline-yaml.md#pipelinerecovery) attempt
+or by the next run (its [resume record](../architecture/incremental-state.md#resuming-a-failed-run))
+— and its source continues where it stopped, the core adds `first_object_seq`:
+number the files staged from here on starting at this value, the first file
+not known to be delivered, so none takes the name of a file already delivered
+under the same run id, and one the failed run may have left half-delivered is
+replaced. Absent means from the start.
 
 ```json
 {"type": "start", "first_object_seq": 7}
+```
+
+To a source that reported a `resume_token` in its [`checkpoint`](#checkpoint)s,
+when the run that failed is continued, the core adds the last durable token
+(1.3+). The source continues from it when it can, and says whether it does in
+[`schema`](#schema)'s `resumed`.
+
+```json
+{"type": "start", "resume_token": {"split_by": "id", "partitions": [], "done": [0, 3]}}
 ```
 
 ---
@@ -239,6 +251,7 @@ opened the first file (the core keeps sending `parse_object` meanwhile).
 | Field | Type | Description |
 |---|---|---|
 | `fields` | array of Field | The columns, in order |
+| `resumed` | bool (optional) | Only from a source that received `start.resume_token` (1.3+): `true` when it continues from the token, `false` when it reads everything again. The core keeps the failed run's output only after `true`; after `false` the run's files are numbered from the first again and replace the failed run's |
 
 **Field object.** A JSON object with the column's `name`, its `type`, the
 type's parameters beside `type` in the same object, and `nullable`:
@@ -524,8 +537,9 @@ batch is durable — the durability gate that makes resume gap-free.
 
 | Field | Type | Description |
 |---|---|---|
-| `cursor_value` | any | Opaque high watermark (string/number/…). Stored and echoed verbatim |
+| `cursor_value` | any | Opaque high watermark (string/number/…). Stored and echoed verbatim; `null` from a source with no cursor that reports only a `resume_token` |
 | `batch_seq` | integer | Global batch ordinal (1-based) this watermark covers |
+| `resume_token` | any (optional) | Where a continued run could resume the read if everything through `batch_seq` were durable — a partitioned full load's finished partitions (1.3+). Opaque to the core: persisted at the durable frontier with the watermark, handed back in `start.resume_token` when a failed run is continued, dropped when the run succeeds |
 
 ---
 

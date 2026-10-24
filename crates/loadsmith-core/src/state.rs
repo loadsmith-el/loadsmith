@@ -34,6 +34,10 @@ use loadsmith_config::{SchemaChangePolicy, StateConfig};
 ///   was `timestamp_ms`, most other types `utf8`, no nullability).
 /// - `2`: `schema_hash` is FNV-1a over the exact Arrow schema of the source's
 ///   IPC stream (see [`schema_fingerprint`]).
+/// - `3`: adds `resume` ([`ResumeRecord`]): a run that failed, to be resumed.
+///   Written only while a record is present — a run that succeeds writes `2`
+///   again — so an older loadsmith refuses a file it could not resume
+///   correctly and reads every other one.
 ///
 /// A document older than [`FINGERPRINT_SINCE`] is migrated like a legacy one:
 /// its cursor is honoured, the drift check is skipped once with a warning
@@ -41,7 +45,10 @@ use loadsmith_config::{SchemaChangePolicy, StateConfig};
 ///
 /// A document with a version **greater** than this one was written by a newer
 /// loadsmith and is refused rather than silently downgraded.
-pub const STATE_FORMAT_VERSION: u32 = 2;
+pub const STATE_FORMAT_VERSION: u32 = 3;
+
+/// The format of a document without a resume record.
+const PLAIN_FORMAT_VERSION: u32 = 2;
 
 /// The first state format whose `schema_hash` is comparable with
 /// [`schema_fingerprint`]. Bump it (with [`STATE_FORMAT_VERSION`]) whenever
@@ -66,6 +73,33 @@ pub struct StateDoc {
     pub run_id: String,
     /// Wall-clock time of the last write, epoch milliseconds.
     pub updated_at_unix_ms: u64,
+    /// Present while the run that wrote this document has not succeeded: how
+    /// the next run continues it (format 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<ResumeRecord>,
+}
+
+/// A run that failed after part of its output became durable: the next run
+/// continues it — the same run id and start time (so a sink names its
+/// objects as this run did, in the same prefix), the destination's file
+/// numbering after the delivered files, and the source's resume token. Kept
+/// until a run succeeds; refused when the pipeline's configuration changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeRecord {
+    /// The run being continued.
+    pub run_id: String,
+    pub started_at_unix_ms: u64,
+    /// Fingerprint of the run's configuration ([`config_fingerprint`]).
+    pub config_hash: String,
+    /// With a sink: the number of the first file not known to be delivered —
+    /// the next run stages its files from here, so it replaces a file the
+    /// failed run may have left half-delivered instead of adding a second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_object_seq: Option<u64>,
+    /// The source's last durable resume token (a partitioned full load's
+    /// finished partitions), handed back to it in `start.resume_token`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<serde_json::Value>,
 }
 
 impl StateDoc {
@@ -76,13 +110,27 @@ impl StateDoc {
         run_id: impl Into<String>,
     ) -> Self {
         Self {
-            version: STATE_FORMAT_VERSION,
+            version: PLAIN_FORMAT_VERSION,
             pipeline: pipeline.into(),
             cursor_value,
             schema_hash: schema_hash.into(),
             run_id: run_id.into(),
             updated_at_unix_ms: now_unix_ms(),
+            resume: None,
         }
+    }
+
+    /// With a resume record (format 3), or without one (format 2).
+    pub fn with_resume(mut self, resume: Option<ResumeRecord>) -> Self {
+        self.version = if resume.is_some() { STATE_FORMAT_VERSION } else { PLAIN_FORMAT_VERSION };
+        self.resume = resume;
+        self
+    }
+
+    /// The incremental watermark to resume reading after: none for a source
+    /// that reports no cursor (a full load's document holds `null`).
+    pub fn watermark(&self) -> Option<&serde_json::Value> {
+        Some(&self.cursor_value).filter(|v| !v.is_null())
     }
 
     /// True for a document written before the format was versioned (≤ 0.2.0):
@@ -102,7 +150,8 @@ impl StateDoc {
 /// pipeline. The lock guards against concurrent runs corrupting the watermark.
 pub trait StateBackend: Send {
     /// Acquire an exclusive lock for `key` (the pipeline name). Fails if another
-    /// live run already holds it.
+    /// live run already holds it. Blocking: a held lock may be watched for up to
+    /// a lease TTL to tell a live holder from a crashed one.
     fn lock(&self, key: &str) -> Result<LockGuard, CoreError>;
     /// Load the stored document, if any.
     fn load(&self, key: &str) -> Result<Option<StateDoc>, CoreError>;
@@ -250,6 +299,17 @@ pub fn check_schema_drift(
     }
 }
 
+/// Fingerprint of a pipeline's configuration, for [`ResumeRecord::config_hash`]:
+/// FNV-1a over its JSON form with every resolved secret masked (a state file
+/// must not carry a hash a password could be recovered from). Any change to
+/// the pipeline — a query, a target, a batch size — makes a different run, and
+/// a failed run is resumed only by the same configuration.
+pub fn config_fingerprint(config_json: &str) -> String {
+    let mut h = Fnv1a64::new();
+    h.write_prefixed(config_json.as_bytes());
+    format!("{:016x}", h.0)
+}
+
 /// 64-bit FNV-1a (http://www.isthe.com/chongo/tech/comp/fnv/). Inline so the
 /// persisted fingerprint never depends on a hasher whose output may change.
 struct Fnv1a64(u64);
@@ -287,12 +347,16 @@ fn now_unix_ms() -> u64 {
 /// How long a lock lease is honoured without renewal. A holder must renew
 /// within this window (see [`LEASE_RENEW_INTERVAL`]) or its lock becomes
 /// stealable — this is what lets a crashed run's lock be reclaimed automatically,
-/// with no process-liveness probe (the core stays platform-agnostic).
-const LEASE_TTL: Duration = Duration::from_secs(60);
+/// with no process-liveness probe (the core stays platform-agnostic, and a run
+/// in another container or on another host could not be probed anyway).
+const LEASE_TTL: Duration = Duration::from_secs(15);
 
 /// How often a live holder should renew its lease. Comfortably below
 /// [`LEASE_TTL`] so a healthy run never has its lock stolen.
-pub const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(20);
+pub const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often a run waiting on a lock looks at it again.
+const LEASE_POLL: Duration = Duration::from_millis(250);
 
 /// On-disk lock file. The lease is purely time-based: `renewed_at_unix_ms` is
 /// what decides staleness (no liveness probing). `holder` is a token unique to
@@ -461,15 +525,20 @@ impl Drop for LockGuard {
 /// **lease**: a holder renews it periodically, and a lock whose lease has
 /// expired (no renewal within [`LEASE_TTL`]) is stealable — so a crashed run's
 /// lock is reclaimed automatically without probing process liveness (keeping the
-/// core platform-agnostic). A live, freshly-renewed lock fails a second run
-/// fast. Writes are atomic via a temp file + `rename`.
+/// core platform-agnostic). A run that finds a fresh lease watches it: a
+/// renewal means a live holder (the run fails, within one renew interval), a
+/// lease left unrenewed for a whole TTL — measured on this run's own clock, so
+/// clock skew between hosts cannot fool it — is a crashed holder's, and is
+/// taken. Writes are atomic via a temp file + `rename`.
 pub struct LocalFileBackend {
     path: PathBuf,
+    /// How long an unchanged lease is watched before it is taken.
+    observe: Duration,
 }
 
 impl LocalFileBackend {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self { path: path.into(), observe: LEASE_TTL }
     }
 
     fn lock_path(&self) -> PathBuf {
@@ -508,26 +577,45 @@ impl StateBackend for LocalFileBackend {
             Err(_) => { /* already exists — inspect the lease below */ }
         }
 
-        // Lock exists. Steal it only if its lease has expired (no renewal within
-        // LEASE_TTL). An unparseable/torn lock is treated as live (don't steal).
+        // Lock exists. Take it at once if its lease expired (no renewal within
+        // LEASE_TTL by the clock it records); otherwise watch it.
         let raw = fs::read_to_string(&lock_path).unwrap_or_default();
         let age_ms = match serde_json::from_str::<LockFile>(&raw) {
             Ok(lf) => now_unix_ms().saturating_sub(lf.renewed_at_unix_ms),
-            Err(_) => 0, // ambiguous — treat as freshly held
+            Err(_) => 0, // ambiguous (torn, unreadable) — watch it like a fresh one
         };
-
         if age_ms <= LEASE_TTL.as_millis() as u64 {
-            return Err(CoreError::State(format!(
-                "pipeline '{key}' is locked by a running process (lease renewed {age_ms}ms ago); \
-                 another run is in progress against state file '{}'",
-                self.path.display()
-            )));
+            tracing::info!(
+                path = %lock_path.display(),
+                age_ms,
+                "the state lock is held; waiting up to {}s to see whether its holder is alive",
+                self.observe.as_secs()
+            );
+            let watched_since = std::time::Instant::now();
+            loop {
+                std::thread::sleep(LEASE_POLL);
+                match fs::read_to_string(&lock_path) {
+                    // Released meanwhile: race for it like a fresh run.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return self.lock(key),
+                    Ok(now) if now != raw => {
+                        return Err(CoreError::State(format!(
+                            "pipeline '{key}' is locked by a running process (its lease is being renewed); \
+                             another run is in progress against state file '{}'",
+                            self.path.display()
+                        )));
+                    }
+                    _ => {}
+                }
+                if watched_since.elapsed() >= self.observe {
+                    break;
+                }
+            }
         }
 
         tracing::warn!(
             path = %lock_path.display(),
             age_ms,
-            "stealing expired state lock lease"
+            "stealing expired state lock lease (its holder stopped renewing it: a crashed run)"
         );
         write_lease(&lock_path, &holder)?;
         Ok(LockGuard::new(lock_path, holder))
@@ -696,10 +784,41 @@ mod tests {
         backend.store(&StateDoc::new("p1", serde_json::json!(1), "h", "r")).unwrap();
         let raw: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(raw["version"], STATE_FORMAT_VERSION);
+        assert_eq!(raw["version"], PLAIN_FORMAT_VERSION, "no resume record: format 2");
+        assert!(raw.get("resume").is_none());
         let doc = backend.load("p1").unwrap().unwrap();
         assert!(!doc.is_legacy());
         assert!(doc.fingerprint_is_comparable());
+    }
+
+    /// A document with a resume record is format 3 (an older loadsmith
+    /// refuses it); once the run succeeds it is format 2 again.
+    #[test]
+    fn a_resume_record_is_format_3_and_roundtrips() {
+        let (_tmp, path) = tmp_state_path("resume");
+        let backend = LocalFileBackend::new(&path);
+        let record = ResumeRecord {
+            run_id: "4242-1781078400000".into(),
+            started_at_unix_ms: 1_781_078_400_000,
+            config_hash: config_fingerprint("{}"),
+            next_object_seq: Some(9),
+            token: Some(serde_json::json!({ "done": [0, 1, 4] })),
+        };
+        backend.store(&StateDoc::new("p1", serde_json::Value::Null, "h", "r").with_resume(Some(record.clone()))).unwrap();
+        let doc = backend.load("p1").unwrap().unwrap();
+        assert_eq!(doc.version, 3);
+        assert_eq!(doc.resume.as_ref(), Some(&record));
+        assert_eq!(doc.watermark(), None, "a null cursor is no watermark");
+
+        backend.store(&StateDoc::new("p1", serde_json::json!(5), "h", "r").with_resume(None)).unwrap();
+        let doc = backend.load("p1").unwrap().unwrap();
+        assert_eq!((doc.version, doc.resume.clone(), doc.watermark()), (2, None, Some(&serde_json::json!(5))));
+    }
+
+    #[test]
+    fn config_fingerprints_differ_with_the_config() {
+        assert_eq!(config_fingerprint(r#"{"a":1}"#), config_fingerprint(r#"{"a":1}"#));
+        assert_ne!(config_fingerprint(r#"{"a":1}"#), config_fingerprint(r#"{"a":2}"#));
     }
 
     /// Migration: an older state file must load, keep its cursor, pass the
@@ -722,7 +841,7 @@ mod tests {
         // Next save (what the state supervisor does) rewrites it in the new format.
         backend.store(&StateDoc::new("p1", serde_json::json!("2026-06-10"), &current, "r2")).unwrap();
         let upgraded = backend.load("p1").unwrap().unwrap();
-        assert_eq!(upgraded.version, STATE_FORMAT_VERSION);
+        assert_eq!(upgraded.version, PLAIN_FORMAT_VERSION);
         assert!(upgraded.fingerprint_is_comparable());
         assert_eq!(upgraded.schema_hash, current);
         check_schema_drift(&upgraded, &current, SchemaChangePolicy::Refuse).unwrap();
@@ -798,19 +917,53 @@ mod tests {
         assert!(backend.load("p2").is_err());
     }
 
-    #[test]
-    fn lock_excludes_second_holder() {
-        let (_tmp, path) = tmp_state_path("lock-excl");
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(LocalFileBackend::new(&path).lock_path());
-        let backend = LocalFileBackend::new(&path);
+    /// A backend that watches a held lease briefly (tests can't wait a TTL).
+    fn quick(path: &Path) -> LocalFileBackend {
+        LocalFileBackend { path: path.to_path_buf(), observe: Duration::from_millis(400) }
+    }
 
-        let guard = backend.lock("p1").unwrap();
-        // A second lock attempt sees a live holder (this very process) → error.
-        assert!(backend.lock("p1").is_err());
+    /// Locks on a blocking thread, as the runner does: the watch sleeps.
+    async fn lock_async(path: &Path) -> Result<LockGuard, CoreError> {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || quick(&path).lock("p1")).await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_renewed_lease_excludes_a_second_run() {
+        let (_tmp, path) = tmp_state_path("lock-excl");
+        let backend = quick(&path);
+        let mut guard = backend.lock("p1").unwrap();
+        guard.start_renewal_every(Duration::from_millis(50));
+        let err = lock_async(&path).await.err().expect("a live holder keeps the lock").to_string();
+        assert!(err.contains("being renewed"), "{err}");
         drop(guard);
-        // After releasing, locking succeeds again.
+        // After releasing, locking succeeds again, at once.
         let _g2 = backend.lock("p1").unwrap();
+    }
+
+    /// A crashed run (SIGKILL) leaves a fresh lease that nobody renews: the
+    /// next run takes it after watching it for a TTL, instead of failing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unrenewed_lease_is_taken_after_watching_it() {
+        let (_tmp, path) = tmp_state_path("lock-crashed");
+        let backend = quick(&path);
+        let crashed = backend.lock("p1").unwrap();
+        std::mem::forget(crashed); // no renewal, no release: the process died
+        let began = std::time::Instant::now();
+        let _g = lock_async(&path).await.expect("an unrenewed lease is a dead holder's");
+        assert!(began.elapsed() >= Duration::from_millis(400), "watched for the whole window first");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lock_released_while_watched_is_taken() {
+        let (_tmp, path) = tmp_state_path("lock-released");
+        let backend = quick(&path);
+        let guard = backend.lock("p1").unwrap();
+        let watched = path.clone();
+        let waiting = tokio::spawn(async move { lock_async(&watched).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(guard);
+        assert!(waiting.await.unwrap().is_ok());
     }
 
     #[test]
@@ -821,22 +974,22 @@ mod tests {
         // Write a lock whose lease was last renewed long before LEASE_TTL ago.
         let stale = LockFile { holder: "999999".into(), renewed_at_unix_ms: 1 };
         fs::write(backend.lock_path(), serde_json::to_string(&stale).unwrap()).unwrap();
-        // Expired ⇒ stolen, not rejected. No process-liveness probe involved.
+        // Expired ⇒ stolen at once, not watched. No process-liveness probe involved.
+        let began = std::time::Instant::now();
         let _g = backend.lock("p1").unwrap();
+        assert!(began.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
-    fn renew_keeps_lock_held() {
+    fn renew_refreshes_the_lease() {
         let (_tmp, path) = tmp_state_path("lock-renew");
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(LocalFileBackend::new(&path).lock_path());
         let backend = LocalFileBackend::new(&path);
-
         let guard = backend.lock("p1").unwrap();
-        // Backdate our own lease past TTL, then renew: a second acquire must still fail.
+        // Backdate our own lease past TTL, then renew: it is fresh again.
         backdate(&backend.lock_path(), &holder_of(&guard));
         guard.renew();
-        assert!(backend.lock("p1").is_err());
+        assert!(lock_file(&backend.lock_path()).renewed_at_unix_ms > 1);
+        assert_eq!(lock_file(&backend.lock_path()).holder, holder_of(&guard));
     }
 
     fn holder_of(guard: &LockGuard) -> String {
@@ -870,8 +1023,7 @@ mod tests {
         let thief_holder = holder_of(&thief);
 
         drop(guard);
-        assert_eq!(lock_file(&backend.lock_path()).holder, thief_holder);
-        assert!(backend.lock("p1").is_err(), "the thief still holds the lock");
+        assert_eq!(lock_file(&backend.lock_path()).holder, thief_holder, "the thief still holds the lock");
         drop(thief);
         assert!(!backend.lock_path().exists());
     }
@@ -895,10 +1047,10 @@ mod tests {
     /// Regression: renewal used to start only when the state supervisor was
     /// spawned (after the source's first query returned), so a slow start let
     /// the 60s lease expire. Now it runs from acquisition.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn renewal_runs_from_acquisition() {
         let (_tmp, path) = tmp_state_path("lock-autorenew");
-        let backend = LocalFileBackend::new(&path);
+        let backend = quick(&path);
         let mut guard = backend.lock("p1").unwrap();
         guard.start_renewal_every(Duration::from_millis(10));
         backdate(&backend.lock_path(), &holder_of(&guard));
@@ -908,7 +1060,7 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "lease was never renewed");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(backend.lock("p1").is_err());
+        assert!(lock_async(&path).await.is_err());
 
         drop(guard);
         // Released, and the aborted renewal task does not recreate it.

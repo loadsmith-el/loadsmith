@@ -58,6 +58,11 @@ struct RunArgs {
     #[arg(long, help = "Override plugin directory (default: ~/.loadsmith/plugins)")]
     plugin_dir: Option<PathBuf>,
 
+    /// Start a new run even when the state records a failed run to continue
+    /// (its delivered output stays where it is; the watermark still applies)
+    #[arg(long)]
+    no_resume: bool,
+
     /// What stdout carries: the human report, or one JSON run summary
     /// (logs stay on stderr either way)
     #[arg(long, value_enum, default_value_t = OutputFormat::Human, conflicts_with = "print_resolved_config")]
@@ -514,6 +519,7 @@ async fn execute_run(
             mask: mask.clone(),
             unknown_keys,
             run_id,
+            resume: !args.no_resume,
         };
 
         Ok(Some(run_pipeline(config, opts).await?))
@@ -623,6 +629,16 @@ async fn cmd_state_show(args: StateArgs, mask: MaskList) -> Result<()> {
             println!("Schema hash:  {}", doc.schema_hash);
             println!("Run id:       {}", doc.run_id);
             println!("Updated at:   {} (unix ms)", doc.updated_at_unix_ms);
+            if let Some(r) = &doc.resume {
+                println!("Resume:       run {} failed; the next run continues it", r.run_id);
+                if let Some(seq) = r.next_object_seq {
+                    println!("  next file:  {seq} (files before it were delivered)");
+                }
+                if let Some(token) = &r.token {
+                    println!("  token:      {token}");
+                }
+                println!("  (`loadsmith run --no-resume` starts a new run instead)");
+            }
         }
     }
     Ok(())

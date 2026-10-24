@@ -176,7 +176,7 @@ impl<D: Write> Stream<D> {
         schema: Schema,
     ) -> Result<Self, Flow> {
         let fields = loadsmith_arrow::protocol_fields_from_schema(&schema);
-        ctl.send(Message::Schema(loadsmith_protocol::Schema { fields })).await?;
+        ctl.send(Message::Schema(loadsmith_protocol::Schema { fields, resumed: None })).await?;
         let open = data.take().expect("the stream is opened once");
         let sink = open().map_err(|e| Flow::fatal("IPC_WRITE_FAILED", anyhow::anyhow!("open fd3: {e}")))?;
         let writer = IpcWriter::new(sink, &schema)

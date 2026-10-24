@@ -134,17 +134,22 @@ What's shipped and what's queued next. Shipped items are documented in
 - [ ] **More plugins** — additional source/destination/sink types beyond the
       current postgres + mysql + oracle source+destination / sharepoint source / jsonl / null / parquet /
       local-copy / file set (sqlserver sources; gcs/sftp sinks).
-- [ ] **Parallel plugin I/O** — a wishlist item, not yet designed in detail.
-      Source/destination connect+fetch/write usually dominates runtime far more
-      than the pump's data-plane transfer, so plugins fanning out internally
-      (multiple connections/partitions on the source; multiple concurrent
-      writers on the destination) is an attractive perf win. The core/pump/
-      protocol stay a single ordered stream — this is plugin-internal
-      parallelism, with results reordered/buffered back to that ordering at the
-      boundary. See the "Ordering invariants for plugin-internal parallelism"
-      section in [incremental-state.md](docs/src/architecture/incremental-state.md)
-      for the constraints any such design must satisfy (cumulative ack on the
-      destination side, idempotency at every durable layer).
+- [x] **Parallel source reads** — partitioned full loads in the postgres and
+      oracle sources (`parallel: {workers, split_by}`: page/ROWID ranges, or
+      ranges of an integer key, in one snapshot), each worker fetching and
+      converting; the core's flow credits bound them all, and the data plane
+      stays one stream. Column-parallel Parquet encoding. See
+      [definitions/parallel-recovery.md](definitions/parallel-recovery.md)
+- [x] **Continuing a failed run** — the delivered prefix as the durable
+      frontier, tie-safe watermarks, `pipeline.recovery` (in-process retry),
+      and a resume record that lets the next run continue a crashed one under
+      the same run id and object numbering, partitioned full loads included
+      (resume tokens)
+- [ ] **Parallel destination writes** — several writers into one database
+      destination (one transaction per connection today). See the "Ordering
+      invariants for plugin-internal parallelism" section in
+      [incremental-state.md](docs/src/architecture/incremental-state.md) for
+      the constraints (cumulative ack, idempotency at every durable layer).
 - [ ] **Custom image builder** — a first-class `loadsmith` subcommand that
       takes a manifest of desired plugins, builds a slim custom image
       (multi-arch) containing only those, optionally validates it against

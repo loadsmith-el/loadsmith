@@ -56,8 +56,8 @@ use crate::{
     shutdown::{Halt, Shutdown},
     sink_supervisor::{run_sink_supervisor, SinkLaunch},
     spawner::{create_data_pipe, spawn_plugin, StderrRoute},
-    state::{check_schema_drift, new_run_id, open_backend, schema_fingerprint},
-    state_supervisor::{run_state_supervisor, StateRun},
+    state::{check_schema_drift, config_fingerprint, new_run_id, open_backend, schema_fingerprint, ResumeRecord},
+    state_supervisor::{run_state_supervisor, ResumeIdentity, StateInputs, StateRun},
     summary::{FactsHandle, Summary, SummaryStatus},
 };
 
@@ -104,6 +104,9 @@ pub struct RunOpts {
     pub unknown_keys: UnknownKeys,
     /// This run's id: in the persisted state and on the run's telemetry.
     pub run_id: String,
+    /// Continue a failed run recorded in the state (`--no-resume` turns it
+    /// off: the run starts fresh, under its own id).
+    pub resume: bool,
 }
 
 impl RunOpts {
@@ -120,6 +123,7 @@ impl RunOpts {
             mask: MaskList::new(),
             unknown_keys: UnknownKeys::Error,
             run_id: new_run_id(),
+            resume: true,
         }
     }
 }
@@ -155,7 +159,6 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
     let mut attempt = Attempt {
         number: 1,
         started_at_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
-        objects_staged: Arc::default(),
     };
     loop {
         let outcome = run_attempt(config.clone(), &opts, &attempt).await;
@@ -191,10 +194,35 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
 struct Attempt {
     number: u32,
     /// When the first attempt started: the run's `configure.run` (and so the
-    /// sink's object names) stays the same across attempts.
+    /// sink's object names) stays the same across attempts. A later attempt
+    /// continues through the resume record its predecessor left in the state,
+    /// like a run in a new process does.
     started_at_unix_ms: u64,
-    /// The files the destination staged so far, across attempts.
-    objects_staged: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// The failed run `record` to continue, if this run may: not with
+/// `--no-resume`, and not when the pipeline's configuration changed since
+/// (a different query or target makes a different run). A record of this
+/// very run is an earlier attempt's (`pipeline.recovery`).
+fn resumable(record: ResumeRecord, config_hash: &str, allowed: bool, run_id: &str) -> Option<ResumeRecord> {
+    if record.run_id == run_id {
+        return Some(record);
+    }
+    if !allowed {
+        tracing::warn!(run = %record.run_id, "--no-resume: not continuing the failed run; starting a new one");
+        return None;
+    }
+    if record.config_hash != config_hash {
+        tracing::warn!(
+            run = %record.run_id,
+            "the pipeline changed since run {} failed: starting a new run instead of resuming it \
+             (what it delivered stays where it is)",
+            record.run_id
+        );
+        return None;
+    }
+    tracing::info!(run = %record.run_id, "continuing run {}, which failed", record.run_id);
+    Some(record)
 }
 
 /// Whether a failure may pass on its own (a plugin failure, a timeout, a lost
@@ -234,23 +262,25 @@ async fn run_attempt(config: PipelineConfig, opts: &RunOpts, attempt: &Attempt) 
     }
     let timeouts = config.pipeline.timeouts;
     let grace = Duration::from_secs(timeouts.cancel_grace_seconds);
-    // Sent to every data plugin and the sink in `configure`.
-    let run = Some(loadsmith_protocol::RunInfo {
-        id: opts.run_id.clone(),
-        pipeline: config.pipeline.name.clone(),
-        started_at_unix_ms: attempt.started_at_unix_ms,
-    });
 
     // ── Incremental state setup ───────────────────────────────────────────
-    // With a `state:` block we lock the pipeline's state (failing fast if a
-    // concurrent run holds it), load the prior watermark to resume from, and
-    // prepare the channels the event drains feed to the state supervisor.
+    // With a `state:` block we lock the pipeline's state (failing if a live
+    // run holds it), load the prior watermark to resume from, and prepare the
+    // channels the event drains feed to the state supervisor.
     let state_enabled = config.state.is_some();
     let (mut state_backend, mut state_guard, prior_state) = match &config.state {
         Some(cfg) => {
             let backend = open_backend(cfg)?;
-            let mut guard = tracing::info_span!(target: "loadsmith::state", "lock.acquire", loadsmith.state.backend = %cfg.backend)
-                .in_scope(|| backend.lock(&config.pipeline.name))?;
+            let span = tracing::info_span!(target: "loadsmith::state", "lock.acquire", loadsmith.state.backend = %cfg.backend);
+            let name = config.pipeline.name.clone();
+            // Blocking: a held lock is watched for up to a lease TTL.
+            let (backend, locked) = tokio::task::spawn_blocking(move || {
+                let locked = span.in_scope(|| backend.lock(&name));
+                (backend, locked)
+            })
+            .await
+            .map_err(|e| CoreError::State(format!("state lock task: {e}")))?;
+            let mut guard = locked?;
             // Renew from the moment of acquisition: plugin spawn, handshake and
             // a slow first query all happen before the state supervisor exists,
             // and must not let the lease expire.
@@ -261,7 +291,26 @@ async fn run_attempt(config: PipelineConfig, opts: &RunOpts, attempt: &Attempt) 
         }
         None => (None, None, None),
     };
-    let resume_value = prior_state.as_ref().map(|d| d.cursor_value.clone());
+    // A failed run recorded in the state is continued — same run id and start
+    // time, so its objects land in the same place — unless the pipeline
+    // changed since (or `--no-resume`).
+    let config_hash = config_fingerprint(&opts.mask.apply(&serde_json::to_string(&config).unwrap_or_default()));
+    let resuming = prior_state.as_ref().and_then(|d| d.resume.clone()).and_then(|record| {
+        resumable(record, &config_hash, opts.resume, &opts.run_id)
+    });
+    let (run_id, started_at_unix_ms) = match &resuming {
+        Some(r) => (r.run_id.clone(), r.started_at_unix_ms),
+        None => (opts.run_id.clone(), attempt.started_at_unix_ms),
+    };
+    // Sent to every data plugin and the sink in `configure`.
+    let run = Some(loadsmith_protocol::RunInfo {
+        id: run_id.clone(),
+        pipeline: config.pipeline.name.clone(),
+        started_at_unix_ms,
+    });
+    let resume_value = prior_state.as_ref().and_then(|d| d.watermark().cloned());
+    let has_watermark = resume_value.is_some();
+    let resume_token = resuming.as_ref().and_then(|r| r.token.clone());
     let facts = opts.facts.clone();
     if attempt.number == 1 {
         facts.update(|f| f.watermark_before = resume_value.clone());
@@ -413,7 +462,6 @@ async fn run_attempt(config: PipelineConfig, opts: &RunOpts, attempt: &Attempt) 
             .await;
         })
     });
-    let objects_seen = Arc::clone(&attempt.objects_staged);
     let dst_events = tokio::spawn(async move {
         drain_events(
             ControlReader::new(BufReader::new(dst_event)),
@@ -421,7 +469,6 @@ async fn run_attempt(config: PipelineConfig, opts: &RunOpts, attempt: &Attempt) 
             EventForward {
                 staged_tx: object_tx,
                 committed_tx,
-                objects_seen: Some(objects_seen),
                 mask: dst_mask,
                 scope: dst_scope,
                 ..Default::default()
@@ -451,6 +498,10 @@ async fn run_attempt(config: PipelineConfig, opts: &RunOpts, attempt: &Attempt) 
     // pump sizes the window, the data phase relays its grants.
     let mut flow_window: Option<FlowWindow> = None;
     let mut credit_rx: Option<tokio::sync::watch::Receiver<u64>> = None;
+    // The run's outcome, for the state supervisor (a success clears the
+    // resume record); dropped unsent, it reads as a failure.
+    let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel::<bool>();
+    let mut outcome_rx = Some(outcome_rx);
     let start_time = std::time::Instant::now();
 
     // ── Setup: handshake, gates, start ────────────────────────────────────
@@ -581,7 +632,7 @@ async fn run_attempt(config: PipelineConfig, opts: &RunOpts, attempt: &Attempt) 
                     flow_window = Some(window);
                     credit_rx = Some(rx);
                 }
-                start_source(&mut src, resume_value, credit, &timeouts, &mut shutdown).await?
+                start_source(&mut src, resume_value, resume_token, credit, &timeouts, &mut shutdown).await?
             }
             Some(parser) => {
                 tracing::debug!(plugin = "parser", "→ start");
@@ -608,6 +659,30 @@ async fn run_attempt(config: PipelineConfig, opts: &RunOpts, attempt: &Attempt) 
             check_schema_drift(prior, &schema_hash, state_cfg.on_schema_change)?;
         }
 
+        // A resumed run goes on after the files the failed run delivered: those
+        // keep their names, and a file it may have left half-delivered is
+        // replaced. That holds when the source continues where it stopped —
+        // an incremental source (it resumes at the watermark), or a source
+        // that accepted the resume token; one that reads everything again
+        // stages its files from the first, replacing the earlier ones.
+        let continues = match (&resuming, declared.resumed) {
+            (Some(r), resumed) if r.token.is_some() => resumed == Some(true),
+            (Some(_), _) => has_watermark,
+            (None, _) => false,
+        };
+        if let Some(r) = &resuming {
+            if continues {
+                tracing::info!(run = %r.run_id, next_object = ?r.next_object_seq, "resuming the failed run where it stopped");
+            } else {
+                tracing::warn!(
+                    run = %r.run_id,
+                    "the source cannot continue the failed run where it stopped: it reads everything \
+                     again, and its files replace the failed run's"
+                );
+            }
+        }
+        let first_object_seq = resuming.as_ref().filter(|_| continues).and_then(|r| r.next_object_seq);
+
         // Spawn the state supervisor (before the pump) so it persists watermarks as
         // checkpoints/commits flow on fd4 during the run. Fed by the event drains.
         if let (Some(backend), Some(guard), Some(ck_rx), Some(cm_rx)) =
@@ -616,22 +691,25 @@ async fn run_attempt(config: PipelineConfig, opts: &RunOpts, attempt: &Attempt) 
             let run = StateRun {
                 pipeline: config.pipeline.name.clone(),
                 schema_hash,
-                run_id: opts.run_id.clone(),
+                run_id: run_id.clone(),
                 checkpoint_interval: config.state.as_ref().map(|c| c.checkpoint_interval).unwrap_or(0),
+                resume: Some(ResumeIdentity {
+                    started_at_unix_ms,
+                    config_hash: config_hash.clone(),
+                    first_object_seq,
+                }),
+                prior: prior_state.clone(),
             };
-            state_task = Some(tokio::spawn(
-                run_state_supervisor(backend, guard, run, ck_rx, cm_rx, delivery_gate.take(), delivered_prefix.take())
-                    .in_current_span(),
-            ));
-
+            let inputs = StateInputs {
+                checkpoints: ck_rx,
+                committed: cm_rx,
+                delivery: delivery_gate.take(),
+                delivered: delivered_prefix.take(),
+                outcome: outcome_rx.take(),
+            };
+            state_task = Some(tokio::spawn(run_state_supervisor(backend, guard, run, inputs).in_current_span()));
         }
 
-        // A retried incremental run goes on after the files its earlier
-        // attempts staged: those up to the watermark are delivered and must
-        // keep their names. A full load reads everything again and replaces
-        // them.
-        let staged = attempt.objects_staged.load(Ordering::Relaxed);
-        let first_object_seq = (state_enabled && staged > 0).then_some(staged + 1);
         start_with_and_await_ready(
             &mut dst,
             loadsmith_protocol::StartParams { first_object_seq, ..Default::default() },
@@ -729,6 +807,7 @@ async fn run_attempt(config: PipelineConfig, opts: &RunOpts, attempt: &Attempt) 
         h.abort(); // pump finished — stop the heartbeat log
     }
     let DataPhase { failure, mut pump_outcome } = supervised;
+    let _ = outcome_tx.send(failure.is_none());
 
     match &failure {
         Some(failure) => {
@@ -883,6 +962,7 @@ async fn run_attempt(config: PipelineConfig, opts: &RunOpts, attempt: &Attempt) 
         root_cause: root_cause.map(|c| opts.mask.apply(&c)),
         signal,
         attempts: attempt.number,
+        resumed_run: resuming.filter(|r| r.run_id != opts.run_id).map(|r| r.run_id),
     };
 
     if opts.human_report {

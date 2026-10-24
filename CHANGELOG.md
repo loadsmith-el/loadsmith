@@ -9,6 +9,42 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-24
+
+### Added
+
+- **A failed run is continued by the next one.** A run that fails after part
+  of its output became durable leaves a resume record in the state (state
+  format 3, written only while the record exists); the next run — a new
+  process after a crash, or a `pipeline.recovery` attempt — continues it under
+  the same run id and start time, so a sink's objects land in the same prefix,
+  and numbers its files from the first one not known to be delivered, so the
+  upload a SIGKILL interrupted is replaced instead of read twice. A changed
+  pipeline (configuration fingerprint, secrets masked) or `loadsmith run
+  --no-resume` starts a new run. The summary reports `Resumed: run <id>`
+  (`resumed_run` in the JSON summary); `state show` prints the record.
+- **Resume tokens (protocol v1, additive).** A source may report where a
+  continued run can resume (`checkpoint.resume_token`; `cursor_value` may be
+  `null` beside it); the core persists the last durable one with the
+  watermark, hands it back in `start.resume_token`, and the source answers in
+  `schema.resumed` whether it continues. SDK: `SourcePlugin::current_resume_token`
+  and `resume_at` (a `Resumption`: continue or start over, with the line the
+  run logs). The partitioned full loads of the postgres and oracle
+  sources use it to skip the partitions already delivered.
+- **SDK `ObjectKey`**: the sinks' `key` template (`{file}`, `{run_id}`,
+  `{run_date}`, `{run_time}`, `{pipeline}`), shared by `s3` and `local-copy`.
+
+### Changed
+
+- **A crashed run's state lock no longer refuses the next run.** The lease is
+  renewed every 5 s and lasts 15 s (was 20 s / 60 s); a run that finds the
+  lock held watches it, fails if it is renewed (a live run), and takes it once
+  it was left unrenewed for 15 s by its own clock. A rerun right after a
+  SIGKILL now waits up to 15 s and goes on, where it was refused (exit 5) for
+  up to 60 s.
+- `pipeline.recovery` attempts number their files from the delivered ones
+  (the resume record) instead of after every file the failed attempt staged.
+
 ## [1.2.1] - 2026-10-23
 
 ### Fixed
@@ -466,7 +502,8 @@ release.
 - The hermetic `Dockerfile` gains the same targets.
 - Container Images documentation page.
 
-[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/loadsmith-el/loadsmith/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.0.1...v1.1.0

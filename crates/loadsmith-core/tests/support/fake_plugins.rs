@@ -695,6 +695,7 @@ fn raw_source(scenario: &str) -> ! {
     raw.send(&Message::Schema(loadsmith_protocol::Schema {
         fields: vec![loadsmith_protocol::Field::new("id", loadsmith_protocol::FieldType::Int64)
             .with_nullable(false)],
+        resumed: None,
     }));
 
     if scenario == "noheader" {
@@ -753,6 +754,7 @@ fn eager_parser() -> ! {
     raw.send(&Message::Schema(loadsmith_protocol::Schema {
         fields: vec![loadsmith_protocol::Field::new("id", loadsmith_protocol::FieldType::Int64)
             .with_nullable(false)],
+        resumed: None,
     }));
     raw.send(&Message::Finished(Finished::success_source(10, 1)));
     std::thread::sleep(Duration::from_millis(300));

@@ -130,8 +130,8 @@ guards against an endlessly-failing sink (e.g. bad credentials), after which the
 run fails with a clear error.
 
 This in-process recovery (the core survives, the sink restarts) is distinct from
-resuming across a whole-run crash, which belongs to the future *state &
-checkpoints* work.
+resuming a run that failed as a whole, which the state's
+[resume record](./incremental-state.md#resuming-a-failed-run) does.
 
 ## Delivered means durable: the incremental watermark
 
@@ -157,10 +157,13 @@ the supervisor hands the sink nothing new and waits, up to
 `cancel_grace_seconds`, for the delivery in flight to be acknowledged: an
 object that reached the target counts as delivered, and the next run does not
 read its rows again. A crash (SIGKILL) cannot wait: the object being uploaded
-may land unacknowledged, and the next run reads that one file's rows again.
-After a crash the state lock stays leased for 60 s; a run started sooner is
-refused (exit `5`).
+may land unacknowledged. The next run continues the crashed one (its
+[resume record](./incremental-state.md#resuming-a-failed-run)): the same run
+id, and file numbers from the first undelivered one, so its file replaces the
+unacknowledged object instead of adding its rows a second time. After a crash
+the state lock stays leased until its lease runs out: the next run waits up to
+15 s for it, then goes on.
 
-Each run's objects must land under names of their own (the `s3` sink's default
-key is `{run_date}/{run_id}/{file}`): a sink that names objects by file name
-alone (`local-copy`) lets a later run's file replace an earlier run's.
+Each run's objects land under names of their own: both sinks' default `key` is
+`{run_date}/{run_id}/{file}` (`local-copy` since 0.3.0; before, it named files
+by file name alone, and a later run's file replaced an earlier run's).

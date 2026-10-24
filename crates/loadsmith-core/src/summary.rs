@@ -75,6 +75,9 @@ pub struct Summary {
     /// Which attempt of the run this is (1-based; above 1 only with
     /// `pipeline.recovery`).
     pub attempts: u32,
+    /// The failed run this one continued (its id, which this run's objects
+    /// carry too), when it resumed one.
+    pub resumed_run: Option<String>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -115,6 +118,9 @@ impl Summary {
         println!("Status:       {}", self.status.as_str());
         if self.attempts > 1 {
             println!("Attempt:      {}", self.attempts);
+        }
+        if let Some(run) = &self.resumed_run {
+            println!("Resumed:      run {run}");
         }
         if let Some(cause) = &self.root_cause {
             println!("Cause:        {cause}");

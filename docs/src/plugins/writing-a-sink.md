@@ -38,6 +38,11 @@ respawns it and **re-sends every object it had not acknowledged** — so the sam
 path can arrive again, possibly after a partial transfer. `deliver` must
 converge to the same result on a repeat. For a file copy, overwrite the target;
 for S3, overwrite the object key (or abort any orphaned multipart upload first).
+Name objects with the SDK's `ObjectKey` (a `key` template: `{file}`,
+`{run_id}`, `{run_date}`, `{run_time}`, `{pipeline}`; default
+`{run_date}/{run_id}/{file}`), as the canonical sinks do: every run gets its own
+prefix, a continued run keeps the failed run's, and a pipeline moved from one
+sink to another keeps its layout.
 
 The SDK acknowledges each successful `deliver` to the core with an
 `object_delivered` message automatically — you just return `Ok(())`.

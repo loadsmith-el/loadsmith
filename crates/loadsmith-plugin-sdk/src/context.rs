@@ -130,7 +130,17 @@ impl<W: AsyncWrite + Unpin> EventSender<W> {
     /// `batch_seq`. Sent on fd4 so it overlaps the pump; the core's event drain
     /// forwards it to the state supervisor.
     pub async fn checkpoint(&mut self, batch_seq: u64, cursor_value: serde_json::Value) {
-        let msg = Message::Checkpoint(Checkpoint { cursor_value, batch_seq });
+        self.checkpoint_with(batch_seq, cursor_value, None).await;
+    }
+
+    /// [`checkpoint`](Self::checkpoint) with the source's resume token.
+    pub async fn checkpoint_with(
+        &mut self,
+        batch_seq: u64,
+        cursor_value: serde_json::Value,
+        resume_token: Option<serde_json::Value>,
+    ) {
+        let msg = Message::Checkpoint(Checkpoint { cursor_value, batch_seq, resume_token });
         self.send(&msg).await;
     }
 

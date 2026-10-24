@@ -182,13 +182,18 @@ pub async fn run_handshake_and_configure_with(
 pub async fn start_source(
     peer: &mut Peer,
     resume: Option<serde_json::Value>,
+    resume_token: Option<serde_json::Value>,
     credit: Option<u64>,
     timeouts: &Timeouts,
     shutdown: &mut Shutdown,
 ) -> Result<loadsmith_protocol::Schema, Failure> {
-    tracing::debug!(plugin = "source", has_resume = resume.is_some(), "→ start");
-    let params =
-        StartParams { resume: resume.map(|cursor_value| ResumeCursor { cursor_value }), credit, first_object_seq: None };
+    tracing::debug!(plugin = "source", has_resume = resume.is_some(), has_token = resume_token.is_some(), "→ start");
+    let params = StartParams {
+        resume: resume.map(|cursor_value| ResumeCursor { cursor_value }),
+        credit,
+        first_object_seq: None,
+        resume_token,
+    };
     peer.send(Message::Start(params)).await?;
     match peer.recv_expect("schema", Timeouts::limit(timeouts.start_seconds), shutdown).await? {
         Message::Schema(s) => {

@@ -342,6 +342,39 @@ type probe, in ms/us/ns).
     + numbering) would make even the SIGKILL window overwrite instead of
     duplicate.
 
+### F3c + partition-set resume (2026-10-24)
+
+- **F3c resume record — done** (engine 1.3, state format 3). Written with the
+  watermark at the durable frontier, removed on success: `run_id`,
+  `started_at_unix_ms`, `config_hash` (FNV-1a of the masked config JSON),
+  `next_object_seq` (first file not known delivered: the sink ledger now
+  reports the delivered prefix's file count), `token`. The next run — new
+  process or `recovery` attempt (which now uses the record instead of
+  counting staged files) — runs under the record's id and start time and
+  stages from `next_object_seq`, so the upload a SIGKILL interrupted is
+  overwritten instead of duplicated. Refused on config drift and with
+  `--no-resume`. *Deviation from 3.4:* `attempt` not recorded.
+- **Lock lease** 60 s → 15 s TTL (renew 5 s), and a held lock is *watched*
+  instead of refused: renewed → live holder (exit 5); unchanged for a TTL on
+  the waiter's own monotonic clock → taken. A rerun right after SIGKILL waits
+  ≤15 s and continues.
+- **Resume tokens** (additive v1): `checkpoint.resume_token` (cursor may be
+  `null`), `start.resume_token`, `schema.resumed`. The core keeps the old
+  numbering only when the source continues (`resumed: true`, or an
+  incremental source with a watermark); otherwise the run restarts in the same
+  prefix from file 1, replacing the failed run's files.
+- **Partition-set resume — done** (postgres 0.7, oracle 0.8): workers send a
+  `Done(partition)` after a partition's last batch; the token is
+  `{split_by, partitions, done}` (+ `scn` on Oracle). `split_by: <integer
+  column>` added (min/max cut, open ends, a NULL partition). Oracle resumes at
+  the token's SCN when `AS OF SCN` still reads (probed), else restarts, or
+  with `resume_snapshot: new` + key takes a new SCN; Postgres restarts unless
+  `new` + key. A partition in progress at the failure is read again:
+  at-least-once (bounded by the partitions in flight), not exactly-once.
+- **Postgres source reads with `COPY … TO STDOUT`** (default; `fetch:
+  cursor` kept): 429 vs 525 MiB per 1M rows of the bench table, no round trip
+  per batch. The binary protocol was measured and rejected (~495 MiB).
+
 ## 6. Validation
 
 - **Byte-identical output** for F1/F2: compare Parquet against 1.0.0 on the same
@@ -362,6 +395,7 @@ type probe, in ms/us/ns).
    with a key `split_by` only (3.5).
 2. ~~Default `recovery.max_attempts`: keep 1 (opt-in) or default to 3?~~
    Decided 2026-10-23: default 1 (off); retry is opt-in.
-3. Object names on resume continue the numbering in the same prefix — any
-   consumer that expects one prefix per attempt instead?
+3. ~~Object names on resume continue the numbering in the same prefix?~~
+   Built that way (F3c): one prefix per run, attempts and resumed processes
+   included.
 4. ~~B1 as an immediate 1.0.1 before the rest~~ Done: released as 1.0.1.

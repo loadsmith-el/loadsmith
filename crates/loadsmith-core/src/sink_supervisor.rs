@@ -85,7 +85,7 @@ pub struct SinkLaunch {
 pub async fn run_sink_supervisor(
     launch: SinkLaunch,
     mut object_rx: UnboundedReceiver<StagedObject>,
-    delivered_tx: Option<UnboundedSender<u64>>,
+    delivered_tx: Option<UnboundedSender<Delivered>>,
     timeouts: Timeouts,
     mut shutdown: Shutdown,
 ) -> Result<SinkOutcome, CoreError> {
@@ -262,6 +262,15 @@ async fn sleep_until_halt(halting: &Option<(Halt, tokio::time::Instant)>) {
     }
 }
 
+/// How far delivery got, in order: every file holding batches `1..=through`
+/// was acknowledged by the sink, and they are the first `objects` files the
+/// destination staged this attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Delivered {
+    pub through: u64,
+    pub objects: u64,
+}
+
 /// The highest batch ordinal whose rows are all delivered: every file holding
 /// batches `1..=n` was acknowledged by the sink. Files announce their batch
 /// ranges in order; a file without a range stops the prefix (that
@@ -269,11 +278,11 @@ async fn sleep_until_halt(halting: &Option<(Halt, tokio::time::Instant)>) {
 pub(crate) struct DeliveredPrefix {
     ranges: HashMap<PathBuf, (u64, u64)>,
     through: u64,
-    tx: Option<UnboundedSender<u64>>,
+    tx: Option<UnboundedSender<Delivered>>,
 }
 
 impl DeliveredPrefix {
-    pub(crate) fn new(tx: Option<UnboundedSender<u64>>) -> Self {
+    pub(crate) fn new(tx: Option<UnboundedSender<Delivered>>) -> Self {
         Self { ranges: HashMap::new(), through: 0, tx }
     }
 
@@ -286,10 +295,12 @@ impl DeliveredPrefix {
     /// Recomputes the prefix after a delivery; reports it when it advanced.
     fn update(&mut self, emitted: &[PathBuf], delivered: &HashSet<PathBuf>) {
         let mut through = 0;
+        let mut objects = 0;
         for path in emitted {
             match self.ranges.get(path) {
                 Some(&(first, last)) if delivered.contains(path) && first <= through + 1 => {
                     through = through.max(last);
+                    objects += 1;
                 }
                 _ => break,
             }
@@ -297,7 +308,7 @@ impl DeliveredPrefix {
         if through > self.through {
             self.through = through;
             if let Some(tx) = &self.tx {
-                let _ = tx.send(through);
+                let _ = tx.send(Delivered { through, objects });
             }
         }
     }
@@ -477,14 +488,18 @@ mod tests {
         StagedObject { path: PathBuf::from(name), batches }
     }
 
-    /// Marks `name` delivered; returns the prefixes reported.
-    fn deliver(ledger: &mut Ledger, name: &str, rx: &mut UnboundedReceiver<u64>) -> Vec<u64> {
+    /// Marks `name` delivered; returns the prefixes reported (batches).
+    fn deliver(ledger: &mut Ledger, name: &str, rx: &mut UnboundedReceiver<Delivered>) -> Vec<u64> {
+        delivered(ledger, name, rx).iter().map(|d| d.through).collect()
+    }
+
+    fn delivered(ledger: &mut Ledger, name: &str, rx: &mut UnboundedReceiver<Delivered>) -> Vec<Delivered> {
         ledger.delivered.insert(PathBuf::from(name));
         ledger.prefix.update(&ledger.emitted, &ledger.delivered);
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
     }
 
-    fn ledger(objects: &[StagedObject]) -> (Ledger, UnboundedReceiver<u64>) {
+    fn ledger(objects: &[StagedObject]) -> (Ledger, UnboundedReceiver<Delivered>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut ledger =
             Ledger { emitted: Vec::new(), delivered: HashSet::new(), prefix: DeliveredPrefix::new(Some(tx)) };
@@ -501,6 +516,14 @@ mod tests {
         assert_eq!(deliver(&mut l, "b", &mut rx), Vec::<u64>::new(), "a is still pending");
         assert_eq!(deliver(&mut l, "a", &mut rx), vec![6]);
         assert_eq!(deliver(&mut l, "c", &mut rx), vec![7]);
+    }
+
+    #[test]
+    fn the_prefix_counts_its_files() {
+        let (mut l, mut rx) = ledger(&[staged("a", Some((1, 3))), staged("b", Some((4, 6))), staged("c", Some((7, 7)))]);
+        assert_eq!(delivered(&mut l, "a", &mut rx), [Delivered { through: 3, objects: 1 }]);
+        assert_eq!(delivered(&mut l, "c", &mut rx), []);
+        assert_eq!(delivered(&mut l, "b", &mut rx), [Delivered { through: 7, objects: 3 }]);
     }
 
     #[test]
