@@ -9,6 +9,21 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-10-29
+
+### Fixed
+
+- **The `-bundled` image ships postgres 0.8.1 and oracle 0.9.2**, whose
+  partitioned loads (`parallel`) no longer stall for good when a range turns
+  out empty — which large rows (an Oracle table with CLOB/BLOB columns) made
+  happen on every run. oracle 0.9.1+ also connects to Oracle 12c (driver
+  `oracledb` 26.0.0-beta.5).
+
+### Added
+
+- SDK: `FlowGate::fixed(n)`, a gate held at a fixed grant, for testing a
+  source's read-ahead against a window.
+
 ## [1.4.0] - 2026-10-29
 
 ### Fixed
@@ -519,7 +534,8 @@ release.
 - The hermetic `Dockerfile` gains the same targets.
 - Container Images documentation page.
 
-[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/loadsmith-el/loadsmith/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/loadsmith-el/loadsmith/compare/v1.2.0...v1.2.1
