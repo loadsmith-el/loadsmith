@@ -216,7 +216,10 @@ fn hash_type(h: &mut Fnv1a64, t: &loadsmith_protocol::FieldType) {
     h.write_prefixed(t.type_name().as_bytes());
     let num = |h: &mut Fnv1a64, n: i64| h.write_prefixed(n.to_string().as_bytes());
     match t {
-        T::Decimal128 { precision, scale } | T::Decimal256 { precision, scale } => {
+        T::Decimal32 { precision, scale }
+        | T::Decimal64 { precision, scale }
+        | T::Decimal128 { precision, scale }
+        | T::Decimal256 { precision, scale } => {
             num(h, i64::from(*precision));
             num(h, i64::from(*scale));
         }
@@ -742,6 +745,9 @@ mod tests {
         changed(simple(&[("id", DataType::Int32), ("nome", DataType::Utf8)]));
         changed(simple(&[("nome", DataType::Utf8), ("id", DataType::Int64)]));
         changed(simple(&[("id", DataType::Int64)]));
+        let dec = |p, s| schema_fingerprint(&simple(&[("d", DataType::Decimal64(p, s))]));
+        assert_ne!(dec(18, 2), dec(18, 4));
+        assert_ne!(dec(18, 2), dec(10, 2));
         changed(simple(&[("id", DataType::Int64), ("nome", DataType::LargeUtf8)]));
         // Nullability is part of the shape.
         changed(schema(&[("id", DataType::Int64, false), ("nome", DataType::Utf8, true)]));
