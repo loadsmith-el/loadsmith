@@ -150,6 +150,8 @@ pub enum FieldType {
     Float16,
     Float32,
     Float64,
+    Decimal32 { precision: u8, scale: i8 },
+    Decimal64 { precision: u8, scale: i8 },
     Decimal128 { precision: u8, scale: i8 },
     Decimal256 { precision: u8, scale: i8 },
     Utf8,
@@ -201,6 +203,8 @@ impl FieldType {
             FieldType::Float16 => "float16",
             FieldType::Float32 => "float32",
             FieldType::Float64 => "float64",
+            FieldType::Decimal32 { .. } => "decimal32",
+            FieldType::Decimal64 { .. } => "decimal64",
             FieldType::Decimal128 { .. } => "decimal128",
             FieldType::Decimal256 { .. } => "decimal256",
             FieldType::Utf8 => "utf8",
@@ -236,7 +240,10 @@ impl FieldType {
     fn serialize_entries<M: SerializeMap>(&self, map: &mut M) -> Result<(), M::Error> {
         map.serialize_entry("type", self.type_name())?;
         match self {
-            FieldType::Decimal128 { precision, scale } | FieldType::Decimal256 { precision, scale } => {
+            FieldType::Decimal32 { precision, scale }
+            | FieldType::Decimal64 { precision, scale }
+            | FieldType::Decimal128 { precision, scale }
+            | FieldType::Decimal256 { precision, scale } => {
                 map.serialize_entry("precision", precision)?;
                 map.serialize_entry("scale", scale)?;
             }
@@ -335,6 +342,14 @@ fn parse_type(name: &str, obj: &Map<String, Value>) -> Option<FieldType> {
         "decimal128" => {
             let (precision, scale) = decimal(38)?;
             FieldType::Decimal128 { precision, scale }
+        }
+        "decimal32" => {
+            let (precision, scale) = decimal(9)?;
+            FieldType::Decimal32 { precision, scale }
+        }
+        "decimal64" => {
+            let (precision, scale) = decimal(18)?;
+            FieldType::Decimal64 { precision, scale }
         }
         "decimal256" => {
             let (precision, scale) = decimal(76)?;
@@ -459,7 +474,10 @@ impl std::fmt::Display for FieldType {
             format!("{}{}", field.field_type, if field.nullable { "?" } else { "" })
         };
         match self {
-            FieldType::Decimal128 { precision, scale } | FieldType::Decimal256 { precision, scale } => {
+            FieldType::Decimal32 { precision, scale }
+            | FieldType::Decimal64 { precision, scale }
+            | FieldType::Decimal128 { precision, scale }
+            | FieldType::Decimal256 { precision, scale } => {
                 write!(f, "{}({precision}, {scale})", self.type_name())
             }
             FieldType::FixedSizeBinary { byte_width } => write!(f, "fixed_size_binary({byte_width})"),
@@ -525,6 +543,8 @@ mod tests {
             FieldType::Null,
             FieldType::UInt64,
             FieldType::Float16,
+            FieldType::Decimal32 { precision: 9, scale: 2 },
+            FieldType::Decimal64 { precision: 18, scale: 4 },
             FieldType::Decimal128 { precision: 38, scale: 9 },
             FieldType::Decimal256 { precision: 76, scale: -2 },
             FieldType::LargeUtf8,

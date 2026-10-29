@@ -10,7 +10,7 @@
 //! | `Boolean` | `true` / `false` |
 //! | `Int*`, `UInt*` | number (exact; `uint64` above 2^53 may lose precision in some JSON readers) |
 //! | `Float16/32/64` | number; **NaN and ±Infinity become `null`** (JSON has no such numbers) |
-//! | `Decimal128/256` | **string** with the scale applied, e.g. `"123.45"` (exact; JSON numbers would lose digits) |
+//! | `Decimal32/64/128/256` | **string** with the scale applied, e.g. `"123.45"` (exact; JSON numbers would lose digits) |
 //! | `Utf8`, `LargeUtf8`, `Utf8View` | string |
 //! | `Binary`, `LargeBinary`, `BinaryView`, `FixedSizeBinary` | standard base64 string (with padding) |
 //! | `Date32` | integer days since 1970-01-01 |
@@ -134,6 +134,14 @@ fn convert(arr: &dyn Array) -> Option<Vec<Value>> {
         DataType::Float16 => prim::<Float16Type, _>(arr, |v| float(v.to_f64()))?,
         DataType::Float32 => prim::<Float32Type, _>(arr, |v| float(f64::from(v)))?,
         DataType::Float64 => prim::<Float64Type, _>(arr, float)?,
+        DataType::Decimal32(..) => {
+            let a = arr.as_primitive_opt::<Decimal32Type>()?;
+            (0..a.len()).map(|i| Value::String(a.value_as_string(i))).collect()
+        }
+        DataType::Decimal64(..) => {
+            let a = arr.as_primitive_opt::<Decimal64Type>()?;
+            (0..a.len()).map(|i| Value::String(a.value_as_string(i))).collect()
+        }
         DataType::Decimal128(..) => {
             let a = arr.as_primitive_opt::<Decimal128Type>()?;
             (0..a.len()).map(|i| Value::String(a.value_as_string(i))).collect()

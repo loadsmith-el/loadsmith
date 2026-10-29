@@ -771,9 +771,9 @@ mod tests {
     fn schema_fingerprint_ignores_metadata() {
         let plain = simple(&[("id", DataType::Int64)]);
         let with_meta = Schema::new(vec![Field::new("id", DataType::Int64, true).with_metadata(
-            [("comment".to_string(), "primary key".to_string())].into(),
+            std::collections::HashMap::from([("comment".to_string(), "primary key".to_string())]),
         )])
-        .with_metadata([("origin".to_string(), "pg".to_string())].into());
+        .with_metadata(std::collections::HashMap::from([("origin".to_string(), "pg".to_string())]));
         assert_eq!(schema_fingerprint(&plain), schema_fingerprint(&with_meta));
     }
 

@@ -112,7 +112,7 @@ pub struct PumpControl {
 /// The destination's end of the data plane, still open.
 pub enum PumpOutput {
     /// The stream is open: schema (and batches) written, no end marker yet.
-    Open(IpcWriter<File>),
+    Open(Box<IpcWriter<File>>),
     /// Writing to the destination failed; the pipe is gone.
     Closed,
 }
@@ -235,7 +235,7 @@ where
         read_error,
         write_error,
         output: match writer {
-            Some(w) => PumpOutput::Open(w),
+            Some(w) => PumpOutput::Open(Box::new(w)),
             None => PumpOutput::Closed,
         },
     }
