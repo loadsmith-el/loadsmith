@@ -12,12 +12,22 @@ use tokio::sync::watch;
 #[derive(Debug, Clone)]
 pub struct FlowGate {
     rx: watch::Receiver<u64>,
+    /// A [`fixed`](Self::fixed) gate's own sender, kept so the channel stays
+    /// open (a closed one would let every wait through).
+    _fixed: Option<std::sync::Arc<watch::Sender<u64>>>,
 }
 
 impl FlowGate {
     /// A gate that never waits: the core sends no credits (an older core).
     pub fn open() -> Self {
         FlowGrant::new(None).1
+    }
+
+    /// A gate held at `granted` for good: no grant ever raises it. For
+    /// testing a source's read-ahead against a fixed window.
+    pub fn fixed(granted: u64) -> Self {
+        let (tx, rx) = watch::channel(granted);
+        Self { rx, _fixed: Some(std::sync::Arc::new(tx)) }
     }
 
     /// Waits until the core lets this source fetch batch `batch_seq`
@@ -45,7 +55,7 @@ impl FlowGrant {
     /// `initial` is `start.credit`; `None` opens the gate for good.
     pub(crate) fn new(initial: Option<u64>) -> (Self, FlowGate) {
         let (tx, rx) = watch::channel(initial.unwrap_or(u64::MAX));
-        (Self { tx }, FlowGate { rx })
+        (Self { tx }, FlowGate { rx, _fixed: None })
     }
 
     /// Applies a `credit`. Grants only grow: an older, smaller one is ignored.
@@ -84,6 +94,14 @@ mod tests {
         assert_eq!(gate.granted(), 5);
         grant.grant(8);
         assert_eq!(gate.granted(), 8);
+    }
+
+    #[tokio::test]
+    async fn a_fixed_gate_never_opens_further() {
+        let mut gate = FlowGate::fixed(1);
+        gate.wait_for(1).await;
+        let waited = tokio::time::timeout(Duration::from_millis(20), gate.wait_for(2)).await;
+        assert!(waited.is_err(), "batch 2 is past the fixed grant");
     }
 
     #[tokio::test]
