@@ -68,6 +68,24 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 
 // ── ClientConfig builder ──────────────────────────────────────────────────────
 
+/// A [`ClientConfig`] that verifies servers against the public web PKI (the
+/// Mozilla roots of `webpki-roots`, built in — no OS certificate store
+/// needed): for HTTPS clients of public services (AWS, Microsoft Graph).
+/// `alpn` is offered as is (`[b"h2", b"http/1.1"]` for an HTTP client that
+/// speaks both). Installs the crypto provider as needed.
+pub fn public_web_config(alpn: &[&[u8]]) -> Result<ClientConfig> {
+    install_provider();
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut config = ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .context("TLS protocol versions setup failed")?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    Ok(config)
+}
+
 /// Builds a [`rustls::ClientConfig`] for `cfg`, or `None` for [`TlsMode::Disable`]
 /// (the caller should then connect without TLS). Validates the config and
 /// installs the crypto provider as needed.
@@ -314,5 +332,11 @@ mod tests {
     fn mode_deserializes_kebab_case() {
         let m: TlsMode = serde_json::from_value(serde_json::json!("verify-full")).unwrap();
         assert_eq!(m, TlsMode::VerifyFull);
+    }
+
+    #[test]
+    fn public_web_config_trusts_the_web_pki_and_offers_alpn() {
+        let cfg = public_web_config(&[b"h2", b"http/1.1"]).unwrap();
+        assert_eq!(cfg.alpn_protocols, [b"h2".to_vec(), b"http/1.1".to_vec()]);
     }
 }

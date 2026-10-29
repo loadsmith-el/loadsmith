@@ -18,6 +18,7 @@ serde             = { workspace = true }
 rustls            = { version = "0.23", default-features = false, features = ["std", "logging", "tls12"] }
 rustls-rustcrypto = "0.0.2-alpha"
 rustls-pemfile    = "2"
+webpki-roots      = "0.26"
 
 [dev-dependencies]
 serde_json = { workspace = true }
