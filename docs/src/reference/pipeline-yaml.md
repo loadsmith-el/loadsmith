@@ -22,7 +22,7 @@ pipeline:
     first_batch_seconds: int  # with stall_seconds on: budget for the first batch. Default: 3600
   recovery:               # optional — retry a failed run in the same process (off by default)
     max_attempts: int         # attempts in total, the first included. Default: 1 (never retry)
-    backoff_seconds: int      # wait before the 2nd attempt, doubled each time (≤ 1 h). Default: 30
+    backoff_seconds: int      # wait before the 2nd attempt, doubled per attempt that wrote nothing (≤ 1 h). Default: 30
   flow:                   # optional — how far a source may read ahead of the destination
     max_inflight_batches: int # largest window, in batches. Default: 8
     memory_budget_mib: int    # memory the window may hold, in MiB. 0 = no limit. Default: 256
@@ -115,6 +115,9 @@ environment variable and their precedence.
 **Off by default.** With `max_attempts` above `1`, a run that failed for a
 reason that may pass runs again in the same process, after a wait that starts
 at `backoff_seconds` and doubles before each later attempt (at most an hour).
+The doubling counts only attempts that wrote nothing: an attempt that wrote
+rows before it failed (a flapping network, not a database that is down)
+starts it over at `backoff_seconds`.
 
 | Field | Default | Meaning |
 |---|---|---|

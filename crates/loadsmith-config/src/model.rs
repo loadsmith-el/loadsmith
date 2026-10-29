@@ -158,7 +158,8 @@ pub struct RecoveryConfig {
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
     /// The wait before the second attempt, doubled before each later one
-    /// (at most an hour).
+    /// (at most an hour) while attempts fail without writing anything; an
+    /// attempt that wrote rows starts the doubling over.
     #[serde(default = "default_backoff_seconds")]
     pub backoff_seconds: u64,
 }

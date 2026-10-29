@@ -138,7 +138,9 @@ impl RunOpts {
 ///
 /// With `pipeline.recovery.max_attempts` above 1, a run that failed for a
 /// reason that may pass ([`retryable`]) runs again, after a doubling wait,
-/// under the same run id; the result is the last attempt's.
+/// under the same run id; the result is the last attempt's. The wait doubles
+/// only across attempts that wrote nothing: one that made progress before it
+/// failed starts the doubling over.
 pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summary, CoreError> {
     validate_pipeline(&config)?;
 
@@ -160,6 +162,8 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         number: 1,
         started_at_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0),
     };
+    // Consecutive failed attempts that wrote no rows, the last one included.
+    let mut idle_failures = 0u32;
     loop {
         let outcome = run_attempt(config.clone(), &opts, &attempt).await;
         let cause = match &outcome {
@@ -171,7 +175,9 @@ pub async fn run_pipeline(config: PipelineConfig, opts: RunOpts) -> Result<Summa
         let Some(cause) = cause.filter(|_| attempt.number < max_attempts && shutdown.fired().is_none()) else {
             return outcome.map(|summary| Summary { attempts: attempt.number, ..summary });
         };
-        let wait = backoff(recovery.backoff_seconds, attempt.number);
+        let progressed = matches!(&outcome, Ok(summary) if summary.rows_written > 0);
+        idle_failures = if progressed { 1 } else { idle_failures + 1 };
+        let wait = backoff(recovery.backoff_seconds, idle_failures);
         tracing::warn!(
             attempt = attempt.number,
             max_attempts,
@@ -247,8 +253,8 @@ fn retryable(e: &CoreError) -> bool {
     }
 }
 
-/// The wait before attempt `failed + 1`: `base`, doubled for each attempt
-/// after the second, at most an hour.
+/// The wait after the `failed`-th consecutive failure without progress:
+/// `base` after the first, doubled for each one after it, at most an hour.
 fn backoff(base: u64, failed: u32) -> Duration {
     let factor = 1u64 << failed.saturating_sub(1).min(20);
     Duration::from_secs(base.saturating_mul(factor).min(3600))
@@ -1582,4 +1588,17 @@ fn allocate_scratch_dir(purpose: &str, pipeline_name: &str) -> Result<PathBuf, C
     let dir = std::env::temp_dir().join(format!("loadsmith-{purpose}-{slug}-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_doubles_per_idle_failure_up_to_an_hour() {
+        let waits: Vec<u64> = (1..=5).map(|n| backoff(30, n).as_secs()).collect();
+        assert_eq!(waits, [30, 60, 120, 240, 480]);
+        assert_eq!(backoff(30, 40).as_secs(), 3600);
+        assert_eq!(backoff(0, 9).as_secs(), 0);
+    }
 }
