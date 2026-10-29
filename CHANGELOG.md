@@ -9,6 +9,21 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`pipeline.recovery` backoff starts over after an attempt that wrote
+  rows.** The wait doubled on every failure, so a long load that kept making
+  progress through short outages ended up waiting the hour cap; it now
+  doubles only across consecutive attempts that wrote nothing.
+
+### Added
+
+- Arrow 60: the protocol vocabulary and the JSON conversion know `Decimal32`
+  and `Decimal64` (counted with their precision and scale in the schema
+  fingerprint).
+- `loadsmith_tls::public_web_config`: a rustls client config on the built-in
+  web PKI roots, for plugins' HTTPS clients (reqwest 0.13).
+
 ## [1.3.0] - 2026-10-24
 
 ### Added
