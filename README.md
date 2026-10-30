@@ -76,6 +76,7 @@ The workspace is split into focused crates:
 | `loadsmith-config` | YAML parsing, validation, templates, secret masking |
 | `loadsmith-plugin-manifest` | the `loadsmith-plugin.yaml` manifest schema + validation, used by `plugin install` |
 | `loadsmith-tls` | shared rustls + rustls-rustcrypto TLS config for network plugins |
+| `loadsmith-aws` | AWS credential chain, SigV4 signing and a minimal S3 client (core + AWS plugins) |
 | `loadsmith-core` | orchestration, the data pump, the run summary |
 | `loadsmith-cli` | the `loadsmith` binary |
 
@@ -297,14 +298,15 @@ Loadsmith is at **v0.2.0** — the architecture is proven end-to-end:
   logs, plugin stderr, errors, the run summary and `--print-resolved-config`
 - ✅ Live progress + run summary, `--log-level`, `--no-color`
 - ✅ Incremental state & checkpoints (core-owned watermark, locking, `loadsmith
-  state`); at-least-once, exactly-once with an idempotent destination
+  state`) in a local file or an S3 object (`backend: s3`, locked by conditional
+  writes); at-least-once, exactly-once with an idempotent destination
+- ✅ Pipeline files read from S3 (`loadsmith run s3://bucket/key`)
 - ✅ Parser stage: a raw source announces files, a parser turns them into
   Arrow (`ParserPlugin` / `ObjectSourcePlugin` in the SDK); a failure
   upstream never commits a partial load
-- 🔜 More providers (AWS Secrets Manager, Vault), canonical parsers (`csv`,
-  `excel`) and a `file` raw source,
-  whole-document `--config-ref` (1.x), remote (`s3`) state
-  backend, `s3` sink, more plugins — see [ROADMAP.md](ROADMAP.md)
+- 🔜 More providers (Vault, other cloud secret managers; `aws-secrets-manager`
+  ships in the canonical plugins), whole-document `--config-ref` through a
+  provider (1.x), more plugins — see [ROADMAP.md](ROADMAP.md)
 
 What a version number promises (and what 1.0 will freeze: the wire protocol,
 CLI, `pipeline.yaml`, state format, plugin manifest/index, image tags and plugin

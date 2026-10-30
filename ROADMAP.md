@@ -117,14 +117,16 @@ What's shipped and what's queued next. Shipped items are documented in
       canonical plugins a `file` raw source, a streaming `csv` parser and an
       `excel` parser. Later (1.x): `parser:` + `state:` (per-file checkpoints
       from `object_parsed.last_batch_seq`), raw-source backpressure.
-- [ ] **More providers** — the canonical `file` provider ships on the
-      `provider` kind and API; next, an `aws-secrets-manager` provider (1.x, needs SigV4 like the s3 sink);
-      Vault and other cloud secret managers.
-- [ ] **Whole-document config loading** (`--config-ref`, 1.x) — load the
-      pipeline document itself from a remote reference through a provider.
-- [ ] **Remote state backend** — an `s3` state backend (conditional PUT for a
-      distributed lock) behind the existing `StateBackend` trait, reusing the
-      s3 sink's SigV4/TLS. Local-file state with locking ships today.
+- [ ] **More providers** — the canonical `file` and `aws-secrets-manager`
+      providers ship on the `provider` kind and API (the latter on the shared
+      `loadsmith-aws` SigV4 + credential chain); next, Vault and other cloud
+      secret managers.
+- [ ] **Whole-document config loading** — shipped: `loadsmith run
+      s3://bucket/key` reads the pipeline file from S3. Later (`--config-ref`,
+      1.x): any remote reference, through a provider.
+- [x] **Remote state backend** — `state.backend: s3`: the state document is an
+      S3 object, locked by conditional `PUT`s (`If-None-Match`/`If-Match`)
+      under the same lease as the local backend.
 - [ ] **`oracle` follow-ups** — drop the build-time `aws-lc-sys` (needs
       `oracledb` to make its rustls provider optional, oracle/rust-oracledb#34);
       enforce TLS DN pinning once the driver applies it (#25); schema-qualified

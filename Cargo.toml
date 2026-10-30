@@ -9,6 +9,7 @@ members = [
     "crates/loadsmith-core",
     "crates/loadsmith-cli",
     "crates/loadsmith-tls",
+    "crates/loadsmith-aws",
 ]
 resolver = "2"
 

@@ -16,6 +16,7 @@ loadsmith-cli               ← the loadsmith binary (clap), plugin install/unin
   └─ loadsmith-config
   └─ loadsmith-plugin-manifest ← plugin manifest schema + validation for `plugin install`
   └─ loadsmith-tls          ← rustls ClientConfig + TLS modes (installer HTTPS; network plugins)
+  └─ loadsmith-aws          ← AWS credential chain, SigV4, minimal S3 client (`run s3://`, `s3` state; AWS plugins)
 
 loadsmith-plugin-sdk        ← drives plugin lifecycle; source/destination/sink/provider entry points
   └─ loadsmith-protocol
@@ -24,7 +25,7 @@ loadsmith-plugin-sdk        ← drives plugin lifecycle; source/destination/sink
 ```
 
 Plugin binaries depend on `loadsmith-plugin-sdk` (plus, optionally,
-`loadsmith-arrow` and `loadsmith-tls`). They never depend on `loadsmith-core` —
+`loadsmith-arrow`, `loadsmith-tls` and `loadsmith-aws`). They never depend on `loadsmith-core` —
 the protocol is the only coupling.
 
 ## The plugin model

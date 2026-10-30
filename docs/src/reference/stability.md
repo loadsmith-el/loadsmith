@@ -42,7 +42,8 @@ SDK version (or language) it was built with.
 These can change in any release:
 
 - **Rust crate APIs.** `loadsmith-plugin-sdk`, `loadsmith-protocol`,
-  `loadsmith-arrow`, `loadsmith-transport` and `loadsmith-tls` stay **0.x**,
+  `loadsmith-arrow`, `loadsmith-transport`, `loadsmith-tls` and `loadsmith-aws`
+  stay **0.x**,
   versioned apart from the engine. Their public APIs expose `arrow` and `rustls`
   types, so they have to follow those crates' breaking releases. Plugins pin
   them by git revision. A newer SDK may need code changes in a plugin, but the

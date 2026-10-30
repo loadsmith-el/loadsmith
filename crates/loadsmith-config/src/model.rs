@@ -336,9 +336,10 @@ impl ProviderRef {
 /// stores the opaque value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateConfig {
-    /// Where the state document lives. `local` is the only backend today.
+    /// Where the state document lives: `local` (a file) or `s3` (an object).
     pub backend: String,
-    /// Backend-specific location (a filesystem path for `local`).
+    /// Backend-specific location: a filesystem path for `local`, an object
+    /// URI (`s3://bucket/key`) for `s3`.
     pub path: String,
     /// What to do when the source schema differs from the one recorded in state.
     #[serde(default)]

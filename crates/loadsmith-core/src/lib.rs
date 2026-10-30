@@ -14,11 +14,12 @@ pub mod shutdown;
 pub mod sink_supervisor;
 pub mod spawner;
 pub mod state;
+pub mod state_s3;
 pub mod state_supervisor;
 pub mod summary;
 pub mod telemetry;
 
-pub use load::{load_pipeline, read_document, resolve_document, LoadOpts, Mode};
+pub use load::{load_pipeline, read_document, read_source, resolve_document, LoadOpts, Mode, PipelineSource};
 pub use runner::{run_pipeline, RunOpts};
 pub use summary::{FactsHandle, PluginFacts, RunFacts, Summary, SummaryStatus};
 pub use error::CoreError;

@@ -17,6 +17,7 @@ Execute a pipeline.
 
 ```bash
 loadsmith run pipeline.yaml
+loadsmith run s3://my-lake/pipelines/orders.yaml               # the pipeline file read from S3
 loadsmith run pipeline.yaml --plugin-dir /opt/loadsmith/plugins   # override the default ~/.loadsmith/plugins
 loadsmith run pipeline.yaml --dry-run
 loadsmith run pipeline.yaml --dry-run --print-resolved-config
@@ -31,7 +32,14 @@ loadsmith run pipeline.yaml --otel-endpoint http://otel-collector:4318   # expor
 
 | Argument | Description |
 |---|---|
-| `<pipeline>` | Path to the pipeline YAML file |
+| `<pipeline>` | The pipeline YAML file: a path, or an S3 object `s3://<bucket>/<key>` |
+
+A pipeline in S3 is read with the AWS credential chain (keys in the
+environment, `~/.aws/credentials`, web identity, the ECS/EKS container
+endpoint, the EC2 instance profile); the region is `AWS_REGION` (then
+`AWS_DEFAULT_REGION`, then `us-east-1`) and `AWS_ENDPOINT_URL_S3` points at an
+S3-compatible store (path-style URLs). `validate` and `state show|rm` take the
+same argument.
 
 **Flags:**
 

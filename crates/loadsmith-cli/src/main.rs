@@ -46,8 +46,8 @@ enum Commands {
 
 #[derive(Args)]
 struct RunArgs {
-    /// Path to the pipeline YAML file
-    pipeline: PathBuf,
+    /// The pipeline YAML file: a path, or an S3 object (s3://bucket/key)
+    pipeline: loadsmith_core::PipelineSource,
 
     #[arg(long, help = "Resolve and validate the config (providers included), but start no data plugin")]
     dry_run: bool,
@@ -198,8 +198,8 @@ enum OutputFormat {
 
 #[derive(Args)]
 struct ValidateArgs {
-    /// Path to the pipeline YAML file
-    pipeline: PathBuf,
+    /// The pipeline YAML file: a path, or an S3 object (s3://bucket/key)
+    pipeline: loadsmith_core::PipelineSource,
 
     /// Also resolve every template: read env()/file() values and run the
     /// provider instances the secret() calls reference (the default check
@@ -241,8 +241,9 @@ enum StateAction {
 
 #[derive(Args)]
 struct StateArgs {
-    /// Path to the pipeline YAML file (its `state:` block locates the state)
-    pipeline: PathBuf,
+    /// The pipeline YAML file — a path, or an S3 object (s3://bucket/key);
+    /// its `state:` block locates the state
+    pipeline: loadsmith_core::PipelineSource,
 
     #[command(flatten)]
     strictness: Strictness,
@@ -455,7 +456,7 @@ async fn execute_run(
 
     // Static check first (nothing runs on a malformed file), so even a run
     // that fails resolving its providers reports the pipeline it was.
-    let doc = loadsmith_core::read_document(&args.pipeline, unknown_keys)?;
+    let doc = loadsmith_core::read_source(&args.pipeline, unknown_keys).await?;
     ctx.learn(doc.config());
 
     // Telemetry first (its block resolves without providers), so that the
@@ -546,7 +547,7 @@ async fn cmd_validate(args: ValidateArgs, mask: MaskList) -> Result<()> {
     // Static by default: structure, template syntax, and every secret()
     // naming a declared provider instance. Nothing is evaluated or started.
     let unknown_keys = args.strictness.policy()?;
-    let doc = loadsmith_core::read_document(&args.pipeline, unknown_keys)?;
+    let doc = loadsmith_core::read_source(&args.pipeline, unknown_keys).await?;
     if !args.resolve {
         // The telemetry flags and environment; the block's values may hold
         // env()/file() templates, which only --resolve evaluates.
@@ -597,7 +598,7 @@ async fn load_state_cfg(
 ) -> Result<(loadsmith_config::PipelineConfig, loadsmith_config::StateConfig)> {
     let unknown_keys = args.strictness.policy()?;
     let load = LoadOpts { mask, unknown_keys, ..LoadOpts::new(discovery::default_plugin_dir()) };
-    let (config, _) = loadsmith_core::load_pipeline(&args.pipeline, Mode::Builtins, &load).await?;
+    let (config, _) = loadsmith_core::load_pipeline(args.pipeline.clone(), Mode::Builtins, &load).await?;
     let state = config.state.clone().ok_or_else(|| {
         loadsmith_config::ConfigError::Validation(format!(
             "pipeline '{}' has no state: block",

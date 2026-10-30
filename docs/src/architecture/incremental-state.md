@@ -119,7 +119,8 @@ wasted work, never a duplicate.
 
 ## Backend & locking
 
-State lives behind a `StateBackend` trait. The shipped backend is **local**: a
+State lives behind a `StateBackend` trait, with two backends: **local** and
+**s3**. The local backend is a
 JSON state file written atomically (temp file + `rename`), with a sibling
 `<path>.lock` created via `O_EXCL` that holds a time-based lease, renewed every
 5s by the running pipeline from the moment it acquires the lock (so plugin
@@ -134,10 +135,20 @@ another host could not be probed): after a crash, the next run waits up to
 Each acquisition writes a unique holder token into the lock file, and a run
 only renews or removes a lock that still carries its own token: a run whose
 lease expired and was stolen logs an error and leaves the new holder's lock
-alone. A
-remote
-`s3` backend (conditional PUT for a distributed lock) slots in behind the same
-trait later.
+alone.
+
+The **s3** backend keeps the same lease and the same rules over an S3 object
+(`state.path: s3://bucket/key`; the lock is `<key>.lock`), with S3's
+conditional writes in place of the filesystem's atomic operations: the lock is
+created with `PUT If-None-Match: *` (only one run's write succeeds), and
+renewed or stolen with `PUT If-Match: <ETag>` — a compare-and-swap, so two runs
+taking an expired lease at the same moment cannot both win, and a renewal that
+finds the ETag changed knows the lock is no longer its own. Each look at a held
+lock is a `GET` (every second while a run watches it). The state document is
+replaced by a plain `PUT`, which S3 applies atomically. A transient error while
+renewing is only a warning: the next renewal, 5s later, is still well within
+the 15s lease. Both backends share this logic (`acquire` and the lease over a
+`LockStore`), so they behave the same way.
 
 The state document also records a **schema fingerprint**; if the source shape
 changed since the recorded run, `on_schema_change` decides whether to refuse

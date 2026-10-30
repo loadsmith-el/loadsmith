@@ -55,8 +55,8 @@ sink:                     # optional — delivery stage; only valid with a
     # plugin-specific fields
 
 state:                    # optional — incremental state (core-owned watermark)
-  backend: string         #   "local" (only backend today)
-  path: string            #   state file path for this pipeline
+  backend: string         #   "local" (a file) | "s3" (an S3 object)
+  path: string            #   state file path, or s3://bucket/key with "s3"
   on_schema_change: string  # optional — "refuse" (default) | "continue"
   checkpoint_interval: int  # optional — persist at most once per N durably-
                             #   committed batches; 0 ⇒ only at end of run
@@ -317,8 +317,8 @@ interprets it** — the source decides how to use it (the cursor column lives in
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `backend` | string | yes | State backend. Only `local` exists today (a state file on disk). |
-| `path` | string | yes | Location of the state file for this pipeline. A sibling `<path>.lock` guards against concurrent runs. |
+| `backend` | string | yes | State backend: `local` (a state file on disk) or `s3` (a state object in S3 or an S3-compatible store). |
+| `path` | string | yes | Location of the state for this pipeline: a file path with `local`, an object URI `s3://<bucket>/<key>` with `s3`. A sibling `<path>.lock` guards against concurrent runs. |
 | `on_schema_change` | `refuse` / `continue` | no | What to do if the source schema (the exact Arrow schema of its stream: names, order, types with their parameters, nullability) differs from the recorded state. Default `refuse`. |
 | `checkpoint_interval` | integer | no | Persist the safe watermark at most once per this many durably-committed batches. `0` (default) ⇒ persist only at the end of a successful run. |
 
@@ -334,6 +334,25 @@ state:
   path: .loadsmith/state/orders.json
   checkpoint_interval: 50
 ```
+
+With `backend: s3` the state survives the machine that ran the load — what a
+container on ECS/Fargate or Kubernetes needs:
+
+```yaml
+state:
+  backend: s3
+  path: s3://my-lake/loadsmith/state/orders.json
+```
+
+The region, the endpoint and the credentials come from the environment, as for
+[`loadsmith run s3://…`](cli.md#loadsmith-run-pipeline): `AWS_REGION`
+(default `us-east-1`), `AWS_ENDPOINT_URL_S3` for an S3-compatible store, and the
+AWS credential chain (keys in the environment, `~/.aws/credentials`, web
+identity, the ECS/EKS container endpoint, the EC2 instance profile). The lock
+uses S3 conditional writes, so an S3-compatible store must support
+`If-None-Match`/`If-Match` on `PUT` (AWS S3 and MinIO do). The role needs
+`s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on `<key>` and
+`<key>.lock`.
 
 `loadsmith state show pipeline.yaml` prints the current watermark; `loadsmith
 state rm pipeline.yaml` clears it (the next run is a full read).

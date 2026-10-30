@@ -63,14 +63,20 @@ pub fn validate_pipeline(config: &PipelineConfig) -> Result<(), ConfigError> {
         if state.backend.trim().is_empty() {
             return Err(ConfigError::Validation("state.backend must not be empty".into()));
         }
-        if state.backend != "local" && !templated(&state.backend) {
+        if !matches!(state.backend.as_str(), "local" | "s3") && !templated(&state.backend) {
             return Err(ConfigError::Validation(format!(
-                "unsupported state.backend '{}' (only 'local' is available)",
+                "unsupported state.backend '{}' (available: 'local', 's3')",
                 state.backend
             )));
         }
         if state.path.trim().is_empty() {
             return Err(ConfigError::Validation("state.path must not be empty".into()));
+        }
+        if state.backend == "s3" && !templated(&state.path) && !state.path.starts_with("s3://") {
+            return Err(ConfigError::Validation(format!(
+                "state.path '{}' must be an S3 object URI (s3://<bucket>/<key>) with the 's3' backend",
+                state.path
+            )));
         }
     }
     Ok(())

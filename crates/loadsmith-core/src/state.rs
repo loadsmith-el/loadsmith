@@ -7,13 +7,14 @@
 //! it is an opaque `serde_json::Value` stored and echoed verbatim.
 //!
 //! The backend is pluggable behind [`StateBackend`], mirroring the
-//! config-provider / sink pattern. Only [`LocalFileBackend`] exists today; an
-//! `S3Backend` (conditional PUT for a distributed lock) slots in behind the same
-//! trait later, reusing the s3 sink's SigV4/TLS work.
+//! config-provider / sink pattern: [`LocalFileBackend`] (a file) and
+//! [`crate::state_s3::S3Backend`] (an S3 object, locked by conditional
+//! `PUT`s). Both share the lock's lease logic ([`acquire`]) through
+//! [`LockStore`].
 
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -161,12 +162,13 @@ pub trait StateBackend: Send {
     fn clear(&self, key: &str) -> Result<(), CoreError>;
 }
 
-/// Opens the backend named by `cfg`. Only `local` exists today.
+/// Opens the backend named by `cfg`: `local` (a file) or `s3` (an object).
 pub fn open_backend(cfg: &StateConfig) -> Result<Box<dyn StateBackend>, CoreError> {
     match cfg.backend.as_str() {
         "local" => Ok(Box::new(LocalFileBackend::new(&cfg.path))),
+        "s3" => Ok(Box::new(crate::state_s3::S3Backend::open(&cfg.path)?)),
         other => Err(CoreError::State(format!(
-            "unsupported state backend '{other}' (only 'local' is available)"
+            "unsupported state backend '{other}' (available: 'local', 's3')"
         ))),
     }
 }
@@ -352,23 +354,33 @@ fn now_unix_ms() -> u64 {
 /// stealable — this is what lets a crashed run's lock be reclaimed automatically,
 /// with no process-liveness probe (the core stays platform-agnostic, and a run
 /// in another container or on another host could not be probed anyway).
-const LEASE_TTL: Duration = Duration::from_secs(15);
+pub(crate) const LEASE_TTL: Duration = Duration::from_secs(15);
 
 /// How often a live holder should renew its lease. Comfortably below
 /// [`LEASE_TTL`] so a healthy run never has its lock stolen.
 pub const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How often a run waiting on a lock looks at it again.
-const LEASE_POLL: Duration = Duration::from_millis(250);
+pub(crate) const LEASE_POLL: Duration = Duration::from_millis(250);
 
-/// On-disk lock file. The lease is purely time-based: `renewed_at_unix_ms` is
+/// The lock document. The lease is purely time-based: `renewed_at_unix_ms` is
 /// what decides staleness (no liveness probing). `holder` is a token unique to
 /// one acquisition, used to tell "still mine" from "stolen by another run" —
 /// a holder never renews or deletes a lock whose token is not its own.
 #[derive(Debug, Serialize, Deserialize)]
-struct LockFile {
-    holder: String,
-    renewed_at_unix_ms: u64,
+pub(crate) struct LockFile {
+    pub(crate) holder: String,
+    pub(crate) renewed_at_unix_ms: u64,
+}
+
+impl LockFile {
+    fn fresh(holder: &str) -> Self {
+        Self { holder: holder.to_string(), renewed_at_unix_ms: now_unix_ms() }
+    }
+
+    pub(crate) fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
 }
 
 /// A holder token unique to this acquisition: pid (diagnostic — every
@@ -382,32 +394,115 @@ fn holder_id() -> String {
     format!("{}-{nanos:x}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
-/// The holder recorded in the lock file right now, if it is readable.
-fn current_holder(lock_path: &Path) -> Option<String> {
-    let raw = fs::read_to_string(lock_path).ok()?;
-    serde_json::from_str::<LockFile>(&raw).ok().map(|lf| lf.holder)
+/// One look at a lock: its lease (`None` when unreadable or torn) and a
+/// version that changes with every write — the raw content locally, the ETag
+/// on S3 — which is how a renewal is noticed.
+pub(crate) struct Seen {
+    pub(crate) version: String,
+    pub(crate) lease: Option<LockFile>,
 }
 
-/// Atomically (temp + rename) writes a fresh lease to `lock_path`.
-fn write_lease(lock_path: &Path, holder: &str) -> Result<(), CoreError> {
-    let lf = LockFile { holder: holder.to_string(), renewed_at_unix_ms: now_unix_ms() };
-    let json = serde_json::to_string(&lf)
-        .map_err(|e| CoreError::State(format!("serialize lock: {e}")))?;
-    let mut tmp = lock_path.to_path_buf().into_os_string();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    fs::write(&tmp, json.as_bytes())
-        .map_err(|e| CoreError::State(format!("write lock tmp: {e}")))?;
-    fs::rename(&tmp, lock_path)
-        .map_err(|e| CoreError::State(format!("rename lock file: {e}")))?;
-    Ok(())
+impl Seen {
+    pub(crate) fn parse(version: String, raw: &str) -> Self {
+        Self { version, lease: serde_json::from_str(raw).ok() }
+    }
+
+    fn holder(&self) -> Option<&str> {
+        self.lease.as_ref().map(|l| l.holder.as_str())
+    }
+}
+
+/// Where a backend keeps its lock. The lease logic ([`acquire`], [`Lease`])
+/// is shared; a store only has to make `create` atomic, and makes `replace`
+/// a compare-and-swap where it can.
+pub(crate) trait LockStore: Send + Sync {
+    /// The lock's location, for messages.
+    fn describe(&self) -> String;
+    /// Creates the lock holding `lease` if there is none: `false` when one
+    /// already exists.
+    fn create(&self, lease: &LockFile) -> Result<bool, CoreError>;
+    /// The lock as it is now; `None` when there is none.
+    fn read(&self) -> Result<Option<Seen>, CoreError>;
+    /// Writes `lease` if the lock is still the one `seen` (`false` when it
+    /// changed in between).
+    fn replace(&self, seen: &Seen, lease: &LockFile) -> Result<bool, CoreError>;
+    /// Removes the lock.
+    fn remove(&self) -> Result<(), CoreError>;
+}
+
+/// Takes the lock in `store` for pipeline `key`.
+///
+/// The first run to create it holds it. A run that finds one takes it at
+/// once if its lease expired (no renewal within [`LEASE_TTL`] by the clock it
+/// records); otherwise it watches it for `observe`: a renewal means a live
+/// holder (the run fails, within one renew interval), a lease left unrenewed
+/// for that long — measured on this run's own clock, so clock skew between
+/// hosts cannot fool it — is a crashed holder's, and is taken.
+pub(crate) fn acquire(
+    store: Arc<dyn LockStore>,
+    key: &str,
+    observe: Duration,
+    poll: Duration,
+) -> Result<LockGuard, CoreError> {
+    let holder = holder_id();
+    let busy = |store: &dyn LockStore| {
+        CoreError::State(format!(
+            "pipeline '{key}' is locked by a running process (its lease is being renewed); \
+             another run is in progress against {}",
+            store.describe()
+        ))
+    };
+    'race: loop {
+        if store.create(&LockFile::fresh(&holder))? {
+            return Ok(LockGuard::new(store, holder));
+        }
+        let Some(seen) = store.read()? else {
+            continue 'race; // released meanwhile: race for it again
+        };
+        let age_ms = match &seen.lease {
+            Some(lf) => now_unix_ms().saturating_sub(lf.renewed_at_unix_ms),
+            None => 0, // ambiguous (torn, unreadable) — watch it like a fresh one
+        };
+        if age_ms <= LEASE_TTL.as_millis() as u64 {
+            tracing::info!(
+                lock = %store.describe(),
+                age_ms,
+                "the state lock is held; waiting up to {}s to see whether its holder is alive",
+                observe.as_secs()
+            );
+            let watched_since = std::time::Instant::now();
+            loop {
+                std::thread::sleep(poll);
+                match store.read() {
+                    Ok(None) => continue 'race,
+                    Ok(Some(now)) if now.version != seen.version => return Err(busy(&*store)),
+                    // Unchanged, or not readable this time (try again).
+                    _ => {}
+                }
+                if watched_since.elapsed() >= observe {
+                    break;
+                }
+            }
+        }
+
+        tracing::warn!(
+            lock = %store.describe(),
+            age_ms,
+            "stealing expired state lock lease (its holder stopped renewing it: a crashed run)"
+        );
+        if store.replace(&seen, &LockFile::fresh(&holder))? {
+            return Ok(LockGuard::new(store, holder));
+        }
+        // Renewed or taken by another run at the last moment: it is live.
+        return Err(busy(&*store));
+    }
 }
 
 /// The lease as seen by its holder. Shared (behind a mutex) between the
 /// [`LockGuard`] and its background renewal task, so a renewal can never run
 /// concurrently with — or after — the release.
 struct Lease {
-    lock_path: PathBuf,
+    store: Arc<dyn LockStore>,
     holder: String,
     released: bool,
     /// Set once a renewal found another holder's token: stop renewing.
@@ -419,46 +514,60 @@ impl Lease {
         if self.released || self.lost {
             return;
         }
-        match current_holder(&self.lock_path) {
-            Some(h) if h == self.holder => {
-                if let Err(e) = write_lease(&self.lock_path, &self.holder) {
-                    tracing::warn!(path = %self.lock_path.display(), "could not renew state lock lease: {e}");
+        let seen = match self.store.read() {
+            Ok(seen) => seen,
+            // Transient (a network error): the next renewal tries again,
+            // well within LEASE_TTL.
+            Err(e) => {
+                tracing::warn!(lock = %self.store.describe(), "could not read the state lock to renew it: {e}");
+                return;
+            }
+        };
+        let now_held_by = match seen {
+            Some(seen) if seen.holder() == Some(self.holder.as_str()) => {
+                match self.store.replace(&seen, &LockFile::fresh(&self.holder)) {
+                    Ok(true) => return,
+                    Ok(false) => "another run".to_string(),
+                    Err(e) => {
+                        tracing::warn!(lock = %self.store.describe(), "could not renew state lock lease: {e}");
+                        return;
+                    }
                 }
             }
-            other => {
-                // Stolen (our lease expired and another run took it) or removed.
-                // Never overwrite it: the other run owns the state now.
-                self.lost = true;
-                tracing::error!(
-                    path = %self.lock_path.display(),
-                    now_held_by = other.as_deref().unwrap_or("nobody"),
-                    "state lock lease was lost to another run; no longer renewing it"
-                );
-            }
-        }
+            Some(seen) => seen.holder().unwrap_or("an unreadable lease").to_string(),
+            None => "nobody".to_string(),
+        };
+        // Stolen (our lease expired and another run took it) or removed.
+        // Never overwrite it: the other run owns the state now.
+        self.lost = true;
+        tracing::error!(
+            lock = %self.store.describe(),
+            now_held_by = %now_held_by,
+            "state lock lease was lost to another run; no longer renewing it"
+        );
     }
 
     fn release(&mut self) {
         self.released = true;
-        match current_holder(&self.lock_path) {
-            Some(h) if h == self.holder => {
-                if let Err(e) = fs::remove_file(&self.lock_path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(path = %self.lock_path.display(), "could not remove state lock: {e}");
-                    }
+        match self.store.read() {
+            Ok(Some(seen)) if seen.holder() == Some(self.holder.as_str()) => {
+                if let Err(e) = self.store.remove() {
+                    tracing::warn!(lock = %self.store.describe(), "could not remove state lock: {e}");
                 }
             }
-            Some(other) => tracing::warn!(
-                path = %self.lock_path.display(),
-                now_held_by = %other,
+            Ok(Some(seen)) => tracing::warn!(
+                lock = %self.store.describe(),
+                now_held_by = seen.holder().unwrap_or("an unreadable lease"),
                 "state lock is held by another run; leaving it in place"
             ),
-            None => {} // already gone (or unreadable — leave it for its owner)
+            Ok(None) => {} // already gone
+            // Unreadable: leave it; its lease expires on its own.
+            Err(e) => tracing::warn!(lock = %self.store.describe(), "could not read the state lock to release it: {e}"),
         }
     }
 }
 
-/// Held for the duration of a run; releasing it (drop) removes the lock file —
+/// Held for the duration of a run; releasing it (drop) removes the lock —
 /// but only if it is still ours (a lock stolen after our lease expired belongs
 /// to the run that stole it). While held, the lease must be renewed: call
 /// [`LockGuard::start_renewal`] right after acquiring.
@@ -468,8 +577,8 @@ pub struct LockGuard {
 }
 
 impl LockGuard {
-    fn new(lock_path: PathBuf, holder: String) -> Self {
-        let lease = Lease { lock_path, holder, released: false, lost: false };
+    fn new(store: Arc<dyn LockStore>, holder: String) -> Self {
+        let lease = Lease { store, holder, released: false, lost: false };
         Self { lease: Arc::new(Mutex::new(lease)), renewal: None }
     }
 
@@ -488,7 +597,7 @@ impl LockGuard {
         self.start_renewal_every(LEASE_RENEW_INTERVAL);
     }
 
-    fn start_renewal_every(&mut self, every: Duration) {
+    pub(crate) fn start_renewal_every(&mut self, every: Duration) {
         if let Some(old) = self.renewal.take() {
             old.abort();
         }
@@ -521,18 +630,86 @@ impl Drop for LockGuard {
     }
 }
 
+/// Checks a state document read from `location` for pipeline `key`.
+pub(crate) fn parse_doc(raw: &str, key: &str, location: &str) -> Result<StateDoc, CoreError> {
+    let doc: StateDoc = serde_json::from_str(raw)
+        .map_err(|e| CoreError::State(format!("parse state file: {e}")))?;
+    if doc.version > STATE_FORMAT_VERSION {
+        return Err(CoreError::State(format!(
+            "state file '{location}' has format version {}, but this loadsmith only understands \
+             up to {STATE_FORMAT_VERSION}; it was written by a newer loadsmith — upgrade",
+            doc.version
+        )));
+    }
+    if doc.pipeline != key {
+        return Err(CoreError::State(format!(
+            "state file '{location}' belongs to pipeline '{}', not '{key}'",
+            doc.pipeline
+        )));
+    }
+    Ok(doc)
+}
+
+/// The local lock: a file created with `O_EXCL` (atomic), renewed by an
+/// atomic temp file + `rename`.
+struct LocalLock {
+    path: PathBuf,
+}
+
+impl LockStore for LocalLock {
+    fn describe(&self) -> String {
+        format!("state lock file '{}'", self.path.display())
+    }
+
+    fn create(&self, lease: &LockFile) -> Result<bool, CoreError> {
+        match fs::OpenOptions::new().write(true).create_new(true).open(&self.path) {
+            Ok(mut f) => {
+                let _ = f.write_all(lease.to_json().as_bytes());
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(CoreError::State(format!("acquire state lock: {e}"))),
+        }
+    }
+
+    fn read(&self) -> Result<Option<Seen>, CoreError> {
+        match fs::read_to_string(&self.path) {
+            Ok(raw) => Ok(Some(Seen::parse(raw.clone(), &raw))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(CoreError::State(format!("read state lock: {e}"))),
+        }
+    }
+
+    /// Not a compare-and-swap: a local filesystem has none. The window
+    /// between the caller's read and this write is a few microseconds.
+    fn replace(&self, _seen: &Seen, lease: &LockFile) -> Result<bool, CoreError> {
+        let mut tmp = self.path.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        fs::write(&tmp, lease.to_json().as_bytes())
+            .map_err(|e| CoreError::State(format!("write lock tmp: {e}")))?;
+        fs::rename(&tmp, &self.path)
+            .map_err(|e| CoreError::State(format!("rename lock file: {e}")))?;
+        Ok(true)
+    }
+
+    fn remove(&self) -> Result<(), CoreError> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(CoreError::State(format!("remove state lock: {e}"))),
+        }
+    }
+}
+
 /// Local-filesystem backend.
 ///
 /// `path` is the state **file** for this pipeline; the lock is a sibling
-/// `<path>.lock` created with `O_EXCL` (atomic). The lock carries a time-based
-/// **lease**: a holder renews it periodically, and a lock whose lease has
-/// expired (no renewal within [`LEASE_TTL`]) is stealable — so a crashed run's
-/// lock is reclaimed automatically without probing process liveness (keeping the
-/// core platform-agnostic). A run that finds a fresh lease watches it: a
-/// renewal means a live holder (the run fails, within one renew interval), a
-/// lease left unrenewed for a whole TTL — measured on this run's own clock, so
-/// clock skew between hosts cannot fool it — is a crashed holder's, and is
-/// taken. Writes are atomic via a temp file + `rename`.
+/// `<path>.lock` ([`LocalLock`]) carrying a time-based **lease** (see
+/// [`acquire`]): a holder renews it periodically, and a lock whose lease has
+/// expired is stealable — so a crashed run's lock is reclaimed automatically
+/// without probing process liveness (keeping the core platform-agnostic).
+/// Writes are atomic via a temp file + `rename`.
 pub struct LocalFileBackend {
     path: PathBuf,
     /// How long an unchanged lease is watched before it is taken.
@@ -564,64 +741,7 @@ impl LocalFileBackend {
 impl StateBackend for LocalFileBackend {
     fn lock(&self, key: &str) -> Result<LockGuard, CoreError> {
         self.ensure_parent()?;
-        let lock_path = self.lock_path();
-        let holder = holder_id();
-
-        // First attempt: atomic exclusive create wins the race to hold the lock.
-        match fs::OpenOptions::new().write(true).create_new(true).open(&lock_path) {
-            Ok(mut f) => {
-                let lf = LockFile { holder: holder.clone(), renewed_at_unix_ms: now_unix_ms() };
-                let _ = f.write_all(serde_json::to_string(&lf).unwrap_or_default().as_bytes());
-                return Ok(LockGuard::new(lock_path, holder));
-            }
-            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
-                return Err(CoreError::State(format!("acquire state lock: {e}")));
-            }
-            Err(_) => { /* already exists — inspect the lease below */ }
-        }
-
-        // Lock exists. Take it at once if its lease expired (no renewal within
-        // LEASE_TTL by the clock it records); otherwise watch it.
-        let raw = fs::read_to_string(&lock_path).unwrap_or_default();
-        let age_ms = match serde_json::from_str::<LockFile>(&raw) {
-            Ok(lf) => now_unix_ms().saturating_sub(lf.renewed_at_unix_ms),
-            Err(_) => 0, // ambiguous (torn, unreadable) — watch it like a fresh one
-        };
-        if age_ms <= LEASE_TTL.as_millis() as u64 {
-            tracing::info!(
-                path = %lock_path.display(),
-                age_ms,
-                "the state lock is held; waiting up to {}s to see whether its holder is alive",
-                self.observe.as_secs()
-            );
-            let watched_since = std::time::Instant::now();
-            loop {
-                std::thread::sleep(LEASE_POLL);
-                match fs::read_to_string(&lock_path) {
-                    // Released meanwhile: race for it like a fresh run.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return self.lock(key),
-                    Ok(now) if now != raw => {
-                        return Err(CoreError::State(format!(
-                            "pipeline '{key}' is locked by a running process (its lease is being renewed); \
-                             another run is in progress against state file '{}'",
-                            self.path.display()
-                        )));
-                    }
-                    _ => {}
-                }
-                if watched_since.elapsed() >= self.observe {
-                    break;
-                }
-            }
-        }
-
-        tracing::warn!(
-            path = %lock_path.display(),
-            age_ms,
-            "stealing expired state lock lease (its holder stopped renewing it: a crashed run)"
-        );
-        write_lease(&lock_path, &holder)?;
-        Ok(LockGuard::new(lock_path, holder))
+        acquire(Arc::new(LocalLock { path: self.lock_path() }), key, self.observe, LEASE_POLL)
     }
 
     fn load(&self, key: &str) -> Result<Option<StateDoc>, CoreError> {
@@ -630,24 +750,7 @@ impl StateBackend for LocalFileBackend {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(CoreError::State(format!("read state file: {e}"))),
         };
-        let doc: StateDoc = serde_json::from_str(&raw)
-            .map_err(|e| CoreError::State(format!("parse state file: {e}")))?;
-        if doc.version > STATE_FORMAT_VERSION {
-            return Err(CoreError::State(format!(
-                "state file '{}' has format version {}, but this loadsmith only understands \
-                 up to {STATE_FORMAT_VERSION}; it was written by a newer loadsmith — upgrade",
-                self.path.display(),
-                doc.version
-            )));
-        }
-        if doc.pipeline != key {
-            return Err(CoreError::State(format!(
-                "state file '{}' belongs to pipeline '{}', not '{key}'",
-                self.path.display(),
-                doc.pipeline
-            )));
-        }
-        Ok(Some(doc))
+        parse_doc(&raw, key, &self.path.display().to_string()).map(Some)
     }
 
     fn store(&self, doc: &StateDoc) -> Result<(), CoreError> {
@@ -678,6 +781,7 @@ impl StateBackend for LocalFileBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// Removes the test's temp dir when dropped (so `cargo test` leaves no
     /// `/tmp/loadsmith-*-test-*` behind).

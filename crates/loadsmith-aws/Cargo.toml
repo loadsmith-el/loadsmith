@@ -1,0 +1,27 @@
+[package]
+name    = "loadsmith-aws"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+# 0.x, consumed by git revision; not published (see docs/src/reference/stability.md).
+publish = false
+
+# AWS plumbing shared by the core (`run s3://`, the `s3` state backend) and the
+# AWS plugins (s3 sink, aws-secrets-manager provider): the credential chain,
+# SigV4 request signing and a minimal S3 object client. Pure Rust — RustCrypto
+# hmac/sha2 and rustls with the installed `rustls-rustcrypto` provider (see
+# docs/src/architecture/multi-arch-and-tls.md). No AWS SDK.
+
+[dependencies]
+anyhow           = { workspace = true }
+tokio            = { workspace = true }
+tracing          = { workspace = true }
+serde_json       = { workspace = true }
+loadsmith-tls    = { path = "../loadsmith-tls" }
+hmac             = "0.12"
+sha2             = "0.10"
+chrono           = { version = "0.4", default-features = false, features = ["std", "clock"] }
+reqwest          = { version = "0.13", default-features = false, features = ["http2", "query", "rustls-no-provider"] }
+
+[dev-dependencies]
+httpmock = "0.7"

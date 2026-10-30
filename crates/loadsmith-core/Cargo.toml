@@ -24,6 +24,7 @@ loadsmith-config    = { path = "../loadsmith-config" }
 loadsmith-arrow     = { path = "../loadsmith-arrow" }
 arrow-schema        = { workspace = true }
 loadsmith-tls       = { path = "../loadsmith-tls" }
+loadsmith-aws       = { path = "../loadsmith-aws" }
 
 # OpenTelemetry: the core is the only exporter (OTLP over http/protobuf and
 # gRPC). No default features anywhere: no internal-logs (exporter errors are
@@ -52,6 +53,7 @@ arrow-array          = { workspace = true }
 async-trait          = { workspace = true }
 loadsmith-plugin-sdk = { path = "../loadsmith-plugin-sdk" }
 opentelemetry_sdk    = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs", "testing"] }
+httpmock             = "0.7"
 opentelemetry        = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
 tracing-subscriber   = { workspace = true }
 

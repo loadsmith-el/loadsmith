@@ -9,6 +9,28 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+### Added
+
+- **`loadsmith run s3://bucket/key`** — the pipeline file can be an S3 object
+  (also for `validate` and `state show|rm`), read with the AWS credential
+  chain; `AWS_REGION` and `AWS_ENDPOINT_URL_S3` (an S3-compatible store) pick
+  where.
+- **`state.backend: s3`** — incremental state in an S3 object
+  (`state.path: s3://bucket/key`), for runs on ephemeral machines (ECS/Fargate,
+  Kubernetes). The lock is the local backend's lease over S3 conditional
+  writes: `If-None-Match: *` to create it, `If-Match: <ETag>` to renew or steal
+  it, so two runs can never both hold it.
+- **`loadsmith-aws`**, a new 0.x crate for plugins: the AWS credential chain
+  (moved from the s3 sink), SigV4 request signing and a minimal S3 object
+  client. Pure Rust (RustCrypto + rustls), no AWS SDK. The canonical
+  `aws-secrets-manager` provider and the s3 sink use it.
+
+### Changed
+
+- A transient error while renewing the state lock (an unreadable lock file, a
+  network error) is now only a warning; before, a local lock that could not be
+  read was given up as lost.
+
 ## [1.4.1] - 2026-10-29
 
 ### Fixed
