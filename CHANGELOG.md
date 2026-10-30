@@ -9,6 +9,8 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-30
+
 ### Added
 
 - **Published config schemas.** A plugin returns the JSON Schema (draft
@@ -22,6 +24,11 @@ release notes in their repositories.
   config schema.
 - Plugin manifest: an optional `provides[].config_schema: {url, sha256}`,
   where a release publishes that binary's schema. Older engines ignore it.
+- **The `-bundled` image ships every canonical plugin at its first version
+  that publishes a config schema**: aws-secrets-manager 0.1.1, csv 0.1.1,
+  excel 0.1.1, file 0.2.1, jsonl 0.3.1, local-copy 0.3.1, mysql 0.3.1, null
+  0.2.1, oracle 0.9.3, parquet 0.5.1, postgres 0.8.2, s3 0.2.2, sharepoint
+  0.2.2.
 
 ## [1.5.0] - 2026-10-30
 
@@ -574,7 +581,8 @@ release.
 - The hermetic `Dockerfile` gains the same targets.
 - Container Images documentation page.
 
-[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/loadsmith-el/loadsmith/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.3.0...v1.4.0

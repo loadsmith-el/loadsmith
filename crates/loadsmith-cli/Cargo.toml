@@ -1,6 +1,6 @@
 [package]
 name    = "loadsmith-cli"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 license.workspace = true
 # The engine binary ships as release archives and images, not via crates.io.
