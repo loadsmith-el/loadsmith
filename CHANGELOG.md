@@ -9,6 +9,8 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-30
+
 ### Added
 
 - **`loadsmith run s3://bucket/key`** — the pipeline file can be an S3 object
@@ -24,6 +26,8 @@ release notes in their repositories.
   (moved from the s3 sink), SigV4 request signing and a minimal S3 object
   client. Pure Rust (RustCrypto + rustls), no AWS SDK. The canonical
   `aws-secrets-manager` provider and the s3 sink use it.
+- **The `-bundled` image ships the new `aws-secrets-manager` provider 0.1.0**
+  (`{{ secret('<instance>', 'secret-id#json.key') }}`) and s3 0.2.1.
 
 ### Changed
 
@@ -556,7 +560,8 @@ release.
 - The hermetic `Dockerfile` gains the same targets.
 - Container Images documentation page.
 
-[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.4.1...HEAD
+[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/loadsmith-el/loadsmith/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.2.1...v1.3.0
