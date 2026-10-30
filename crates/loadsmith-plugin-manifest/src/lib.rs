@@ -15,7 +15,8 @@
 //! protocol: "^1"
 //! provides:
 //!   - { kind: source,      bin: loadsmith-source-postgres }
-//!   - { kind: destination, bin: loadsmith-destination-postgres }
+//!   - { kind: destination, bin: loadsmith-destination-postgres,
+//!       config_schema: { url: "...", sha256: "..." } }
 //! runtime:
 //!   type: binary
 //!   artifacts:
@@ -80,6 +81,18 @@ pub struct Provide {
     pub kind: String,
     /// The binary filename to place in the plugin dir (e.g. `loadsmith-source-postgres`).
     pub bin: String,
+    /// The JSON Schema (draft 2020-12) of this binary's `config:` block, what
+    /// `<bin> --config-schema` prints. Optional: older plugins publish none.
+    #[serde(default)]
+    pub config_schema: Option<ConfigSchema>,
+}
+
+/// Where a provided binary's config schema is published.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigSchema {
+    pub url: String,
+    /// Lowercase hex sha256 of the schema document.
+    pub sha256: String,
 }
 
 /// How to obtain/run the plugin. Tagged by `type`; only `binary` is implemented.
@@ -134,6 +147,14 @@ impl PluginManifest {
             }
             if p.bin.is_empty() {
                 return Err(ManifestError::Empty("provides[].bin"));
+            }
+            if let Some(schema) = &p.config_schema {
+                if schema.url.is_empty() {
+                    return Err(ManifestError::Empty("provides[].config_schema.url"));
+                }
+                if !is_sha256(&schema.sha256) {
+                    return Err(ManifestError::Sha256(schema.sha256.clone()));
+                }
             }
         }
 
@@ -324,6 +345,20 @@ runtime:
             m.bins_for_kinds(Some(&["sink"])),
             Err(ManifestError::KindNotProvided { .. })
         ));
+    }
+
+    #[test]
+    fn config_schema_is_optional_and_checked() {
+        let m = PluginManifest::parse(OK).unwrap();
+        assert!(m.provides.iter().all(|p| p.config_schema.is_none()));
+        let with = OK.replace(
+            "bin: loadsmith-source-postgres }",
+            "bin: loadsmith-source-postgres, config_schema: { url: \"https://example/source.schema.json\", sha256: \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\" } }",
+        );
+        let m = PluginManifest::parse(&with).unwrap();
+        assert_eq!(m.provides[0].config_schema.as_ref().unwrap().url, "https://example/source.schema.json");
+        let bad = with.replace(&"c".repeat(64), "c");
+        assert!(matches!(PluginManifest::parse(&bad), Err(ManifestError::Sha256(_))));
     }
 
     #[test]

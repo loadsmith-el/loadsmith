@@ -26,6 +26,16 @@ pub struct ReadyObject {
 /// Implemented by destination plugins.
 #[async_trait]
 pub trait DestinationPlugin: Send {
+    /// The JSON Schema of this plugin's `config:` block, printed by
+    /// `<binary> --config-schema` and published with the release: usually
+    /// `Some(config_schema::schema_for::<MyConfig>())`. Default: none.
+    fn config_schema() -> Option<serde_json::Value>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
     fn plugin_name(&self) -> &str;
     fn plugin_version(&self) -> &str;
 
@@ -106,6 +116,7 @@ pub trait DestinationPlugin: Send {
 /// Exit code: `0` after success or a `cancel`, `1` after a failure, an
 /// `error` from the core, or a lost core.
 pub async fn run_destination<P: DestinationPlugin + 'static>(mut plugin: P) -> ! {
+    crate::config_schema::serve_flag(P::config_schema, &["path"]);
     telemetry::install();
     let mut ctl = Control::stdio();
     let mut events = EventSender::fd4();

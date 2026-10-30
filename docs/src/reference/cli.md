@@ -397,6 +397,27 @@ loadsmith plugin uninstall mysql --kind source # same, via the flag
 An `@<version>` is rejected (`uninstall takes no @version`): only one version is
 installed at a time.
 
+## `loadsmith plugin schema <name>[:<kind>]`
+
+Print the JSON Schema (draft 2020-12) of an installed plugin's `config:`
+block, as the plugin binary reports it (`<binary> --config-schema`). The kind
+may be left out when only one kind of the package is installed.
+
+```bash
+loadsmith plugin schema postgres:source
+loadsmith plugin schema parquet           # only the destination exists
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--plugin-dir <path>` | `~/.loadsmith/plugins/` | Directory to look in |
+
+The canonical plugins also publish each schema with their release, referenced
+from the manifest's `provides[].config_schema`; see
+[Publishing the config schema](../plugins/writing-a-source.md#publishing-the-config-schema).
+A plugin built on an SDK older than 1.6 publishes none, and the command says
+so.
+
 ---
 
 ## `loadsmith state show <pipeline>`

@@ -44,6 +44,7 @@ fn main() {
         ("telemetry_exporter_down_never_fails_the_run", telemetry_exporter_down_never_fails_the_run),
         ("telemetry_flags_are_checked", telemetry_flags_are_checked),
         ("print_resolved_config_shows_effective_telemetry", print_resolved_config_shows_effective_telemetry),
+        ("plugin_schema_prints_an_installed_plugins_schema", plugin_schema_prints_an_installed_plugins_schema),
     ];
 
     let filter: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
@@ -829,4 +830,34 @@ fn print_resolved_config_shows_effective_telemetry() {
     assert!(out.contains("endpoint: http://collector:4317") && out.contains("protocol: grpc"), "{out}");
     assert!(out.contains("service.name: etl"), "{out}");
     assert!(!out.contains("tok-123456") && !out.contains("data"), "header values are masked: {out}");
+}
+
+fn plugin_schema_prints_an_installed_plugins_schema() {
+    let env = Env::new("schema");
+    let schema = |spec: &str| {
+        let mut cmd = env.command(&["plugin", "schema", spec]);
+        cmd.arg("--plugin-dir").arg(&env.plugins);
+        cmd.output().expect("run loadsmith")
+    };
+    let out = schema("fake:source");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let printed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(printed["properties"]["journal"]["type"], "string");
+
+    // Several kinds installed: the kind must be named.
+    let (code, text) = exit_code(&mut {
+        let mut cmd = env.command(&["plugin", "schema", "fake"]);
+        cmd.arg("--plugin-dir").arg(&env.plugins);
+        cmd
+    });
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("pick one"), "{text}");
+
+    let out = schema("fake:destination");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("publishes no config schema"));
+
+    let out = schema("absent:source");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("is not installed"));
 }

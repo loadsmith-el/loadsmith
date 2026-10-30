@@ -7,6 +7,7 @@ pub mod object_source;
 pub mod context;
 pub mod telemetry;
 pub mod config;
+pub mod config_schema;
 pub mod flow;
 pub mod watermark;
 pub mod object_key;

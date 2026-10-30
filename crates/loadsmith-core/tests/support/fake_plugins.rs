@@ -243,6 +243,10 @@ impl SourcePlugin for FakeSource {
     fn plugin_name(&self) -> &str {
         "fake-source"
     }
+    // The destination publishes none: `plugin schema` covers both.
+    fn config_schema() -> Option<serde_json::Value> {
+        Some(serde_json::json!({ "type": "object", "properties": { "journal": { "type": "string" } } }))
+    }
     fn plugin_version(&self) -> &str {
         "0.0.0"
     }

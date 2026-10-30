@@ -16,8 +16,13 @@ tracing            = { workspace = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 serde_json         = { workspace = true }
 serde              = { workspace = true }
+# The published config schema (config_schema.rs).
+schemars           = "1"
 loadsmith-protocol = { path = "../loadsmith-protocol" }
 loadsmith-transport = { path = "../loadsmith-transport" }
 loadsmith-arrow    = { path = "../loadsmith-arrow" }
 arrow-array        = { workspace = true }
 arrow-schema       = { workspace = true }
+
+[dev-dependencies]
+jsonschema = { version = "0.60", default-features = false }

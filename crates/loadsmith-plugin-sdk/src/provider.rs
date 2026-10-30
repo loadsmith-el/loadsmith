@@ -58,6 +58,16 @@ impl std::error::Error for ResolveFailure {}
 /// implementors validate their config and resolve one reference at a time.
 #[async_trait]
 pub trait ProviderPlugin: Send {
+    /// The JSON Schema of this plugin's `config:` block, printed by
+    /// `<binary> --config-schema` and published with the release: usually
+    /// `Some(config_schema::schema_for::<MyConfig>())`. Default: none.
+    fn config_schema() -> Option<serde_json::Value>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
     fn plugin_name(&self) -> &str;
     fn plugin_version(&self) -> &str;
 
@@ -92,6 +102,7 @@ pub trait ProviderPlugin: Send {
 /// Exit code: `0` after success or a `cancel`, `1` after a failure, an
 /// `error` from the core, or a lost core.
 pub async fn run_provider<P: ProviderPlugin + 'static>(mut plugin: P) -> ! {
+    crate::config_schema::serve_flag(P::config_schema, &[]);
     telemetry::install();
     let mut ctl = Control::stdio();
     let mut started = false;

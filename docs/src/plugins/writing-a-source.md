@@ -129,6 +129,48 @@ Rules for config types:
   it derefs to `serde_json::Value`) the raw block; `loadsmith_plugin_sdk::config::parse`
   is the same check as a free function, returning the ignored keys.
 
+### Publishing the config schema
+
+Derive `schemars::JsonSchema` next to `Deserialize` on the config types and
+return the schema from your trait's `config_schema` (every plugin trait has
+it; the default is none):
+
+```rust
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct MyConfig {
+    /// The server's host name. Doc comments become `description`s.
+    host: String,
+    #[serde(default)]
+    port: Option<u16>,
+}
+
+impl SourcePlugin for MySource {
+    fn config_schema() -> Option<serde_json::Value> {
+        Some(loadsmith_plugin_sdk::config_schema::schema_for::<MyConfig>())
+    }
+    // …
+}
+```
+
+`<binary> --config-schema` then prints it (the SDK answers before the
+handshake; exit `2` when the plugin publishes none), `loadsmith plugin schema
+<name>:<kind>` prints an installed plugin's, and the canonical release
+publishes it as an asset referenced from the manifest
+(`provides[].config_schema: {url, sha256}`). Tools that write pipelines
+validate a `config:` block against it without running the plugin.
+
+The schema is JSON Schema draft 2020-12 generated from the very types `parse`
+uses, so names, types and required fields agree. Objects are closed
+(`unevaluatedProperties: false`), matching the default unknown-keys policy;
+free-form parts stay open. Keys the core fills in are optional in the printed
+schema: a destination's `path` (the staging directory under a sink) and an
+object source's `scratch_dir`. A type with a hand-written `Deserialize` needs
+a matching hand-written `JsonSchema`.
+
+Templates only ever appear inside strings, and strings stay strings once
+rendered, so an unresolved block validates too, except a templated value in a
+field limited to fixed spellings (an enum).
+
 ## Step-by-step example: MySQL source
 
 > A full MySQL connector already ships in

@@ -27,6 +27,16 @@ use crate::control::{
 /// after a partial delivery). Re-delivering must converge to the same result.
 #[async_trait]
 pub trait SinkPlugin: Send {
+    /// The JSON Schema of this plugin's `config:` block, printed by
+    /// `<binary> --config-schema` and published with the release: usually
+    /// `Some(config_schema::schema_for::<MyConfig>())`. Default: none.
+    fn config_schema() -> Option<serde_json::Value>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
     fn plugin_name(&self) -> &str;
     fn plugin_version(&self) -> &str;
 
@@ -60,6 +70,7 @@ pub trait SinkPlugin: Send {
 /// Exit code: `0` after success or a `cancel`, `1` after a failure or an
 /// `error` from the core.
 pub async fn run_sink<P: SinkPlugin + 'static>(mut plugin: P) -> ! {
+    crate::config_schema::serve_flag(P::config_schema, &[]);
     telemetry::install();
     let mut ctl = Control::stdio();
     let mut events = EventSender::fd4();

@@ -9,6 +9,20 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+### Added
+
+- **Published config schemas.** A plugin returns the JSON Schema (draft
+  2020-12) of its `config:` block from its trait's new `config_schema`,
+  usually `config_schema::schema_for::<MyConfig>()` over a type deriving
+  `schemars::JsonSchema`: the same type `PluginConfig::parse` uses, with
+  objects closed so an unknown key fails validation, and the keys the core
+  fills in (a destination's staging `path`) optional. `<binary>
+  --config-schema` prints it, answered by the SDK before the handshake.
+- **`loadsmith plugin schema <name>[:<kind>]`** prints an installed plugin's
+  config schema.
+- Plugin manifest: an optional `provides[].config_schema: {url, sha256}`,
+  where a release publishes that binary's schema. Older engines ignore it.
+
 ## [1.5.0] - 2026-10-30
 
 ### Added

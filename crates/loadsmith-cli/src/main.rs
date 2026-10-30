@@ -257,6 +257,8 @@ enum PluginAction {
     Install(PluginInstallArgs),
     /// Remove an installed plugin's binaries (by type name, e.g. `postgres`)
     Uninstall(PluginUninstallArgs),
+    /// Print the JSON Schema of an installed plugin's `config:` block
+    Schema(PluginSchemaArgs),
 }
 
 #[derive(Args)]
@@ -315,6 +317,16 @@ struct PluginUninstallArgs {
     plugin_dir: Option<PathBuf>,
 }
 
+#[derive(Args)]
+struct PluginSchemaArgs {
+    /// Installed plugin, as `<name>[:<kind>]` (e.g. `postgres:source`). The
+    /// kind may be left out when only one kind of the package is installed.
+    name: String,
+
+    #[arg(long, help = "Plugin directory to look in")]
+    plugin_dir: Option<PathBuf>,
+}
+
 // mimalloc: release binaries are static musl, whose default allocator is slow
 // under the many small allocations of Arrow IPC framing.
 #[global_allocator]
@@ -347,6 +359,7 @@ async fn run(cli: Cli, color: bool, mask: MaskList) -> Result<()> {
             PluginAction::List(args) => cmd_plugin_list(args),
             PluginAction::Install(args) => cmd_plugin_install(args),
             PluginAction::Uninstall(args) => cmd_plugin_uninstall(args),
+            PluginAction::Schema(args) => cmd_plugin_schema(args),
         },
         Commands::State(cmd) => match cmd.action {
             StateAction::Show(args) => cmd_state_show(args, mask).await,
@@ -791,6 +804,54 @@ fn cmd_plugin_uninstall(args: PluginUninstallArgs) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn cmd_plugin_schema(args: PluginSchemaArgs) -> Result<()> {
+    let plugin_dir = args.plugin_dir.unwrap_or_else(discovery::default_plugin_dir);
+    let (pkg, kind, version) = plugin_install::parse_install_spec(&args.name)?;
+    if version.is_some() {
+        return Err(UsageError("schema takes no @version (it reads the installed plugin)".into()).into());
+    }
+    let kinds: Vec<&str> = match &kind {
+        Some(k) => {
+            plugin_install::validate_kind(k)?;
+            vec![k.as_str()]
+        }
+        None => loadsmith_plugin_manifest::KNOWN_KINDS.to_vec(),
+    };
+    let installed: Vec<(&str, PathBuf)> = kinds
+        .into_iter()
+        .map(|k| (k, plugin_dir.join(format!("loadsmith-{k}-{pkg}"))))
+        .filter(|(_, path)| path.is_file())
+        .collect();
+    let (kind, binary) = match installed.as_slice() {
+        [one] => one,
+        [] => anyhow::bail!("plugin '{}' is not installed in {}", args.name, plugin_dir.display()),
+        many => {
+            let kinds: Vec<&str> = many.iter().map(|(k, _)| *k).collect();
+            return Err(UsageError(format!(
+                "'{pkg}' is installed as {}: pick one, e.g. {pkg}:{}",
+                kinds.join(", "),
+                kinds[0]
+            ))
+            .into());
+        }
+    };
+    let out = std::process::Command::new(binary)
+        .arg("--config-schema")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| anyhow::anyhow!("running {}: {e}", binary.display()))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "{pkg}:{kind} publishes no config schema (a plugin built on an SDK older than loadsmith 1.6 does not): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let schema: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| anyhow::anyhow!("{pkg}:{kind} printed an invalid schema: {e}"))?;
+    println!("{}", serde_json::to_string_pretty(&schema)?);
     Ok(())
 }
 
