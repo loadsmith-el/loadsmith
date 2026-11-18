@@ -9,6 +9,18 @@ release notes in their repositories.
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-11-18
+
+### Changed
+
+- Dependencies refreshed to their latest compatible releases (clap, prost /
+  tonic, regex, flate2, …); no behaviour change.
+- **The `-bundled` image ships** oracle 0.9.4 (driver `oracledb`
+  26.0.0-beta.6: 11G password verifier, driver errors keep their cause),
+  postgres 0.8.3, mysql 0.3.2, s3 0.2.3, sharepoint 0.2.3 and
+  aws-secrets-manager 0.1.2 (dependency refresh); the other plugins are
+  unchanged.
+
 ## [1.6.0] - 2026-10-30
 
 ### Added
@@ -581,7 +593,8 @@ release.
 - The hermetic `Dockerfile` gains the same targets.
 - Container Images documentation page.
 
-[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/loadsmith-el/loadsmith/compare/v1.6.1...HEAD
+[1.6.1]: https://github.com/loadsmith-el/loadsmith/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/loadsmith-el/loadsmith/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/loadsmith-el/loadsmith/compare/v1.4.0...v1.4.1
